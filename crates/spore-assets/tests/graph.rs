@@ -340,30 +340,51 @@ fn a_models_reference_table_becomes_edges_with_the_target_type_read_from_the_rec
     assert_ne!(REF_A.type_id, MODEL_A.type_id);
 }
 
+/// The byte order is settled by the corpus, and now BOTH readers agree.
+///
+/// This test used to be named `..._and_spore_gmdl_does_not` and asserted that
+/// `spore_gmdl` read the key table little-endian while the graph read it
+/// big-endian. That divergence was real for one commit and is now FIXED: the
+/// `refCount` *count* word was already big-endian while the three key words
+/// behind it were not, so `spore_gmdl::GmdlModel::referenced_files` carried
+/// byte-swapped keys on all 1 510 records that have a reference table.
+///
+/// Measured on `Spore_Content.package`: read big-endian, 7 989 of 7 989 declared
+/// keys resolve to index rows that exist. Read little-endian, 0 of 7 989.
+///
+/// So the test inverted rather than being deleted. A deleted test would have left
+/// the byte order unpinned, and the little-endian reading is the plausible-looking
+/// one that would come back.
 #[test]
-fn the_graph_reads_the_reference_table_big_endian_and_spore_gmdl_does_not() {
+fn the_graph_and_spore_gmdl_now_read_the_reference_table_the_same_way() {
     // A record whose reference table holds one key with three byte-reversal
-    // distinct words. The graph resolves it; the neighbouring crate's decoder
-    // reads the same bytes little-endian and cannot.
+    // distinct words, so a wrong order cannot accidentally agree.
     let bytes = build_gmdl(
         &[(0xA1B2_C3D4, 0x1122_3344, 0xAABB_CCDD)],
         &[(TEX_A0.instance_id, TEX_A0.group_id)],
     );
     let expected = ResourceKey::new(0xA1B2_C3D4, 0x1122_3344, 0xAABB_CCDD);
+
     assert_eq!(read_reference_table(&bytes).unwrap(), vec![expected]);
 
-    // What `spore_gmdl` reads for the same bytes: three words each byte-reversed.
-    let le = spore_gmdl::parse_recovering(&bytes).unwrap().model;
+    let model = spore_gmdl::parse_recovering(&bytes).unwrap().model;
     assert_eq!(
-        le.referenced_files,
-        vec![ResourceKey::new(
+        model.referenced_files,
+        vec![expected],
+        "spore-gmdl reads the key table big-endian, like the graph and like the corpus"
+    );
+
+    // And the byte-reversed reading is still recorded as what it is, so the
+    // historical divergence stays visible instead of becoming folk memory.
+    assert_ne!(
+        model.referenced_files[0],
+        ResourceKey::new(
             u32::from_le_bytes(0xA1B2_C3D4u32.to_be_bytes()),
             u32::from_le_bytes(0x1122_3344u32.to_be_bytes()),
             u32::from_le_bytes(0xAABB_CCDDu32.to_be_bytes()),
-        )],
-        "this crate cannot fix spore-gmdl's file, so the divergence is pinned here"
+        ),
+        "the little-endian reading is the one that resolved 0 of 7 989 real keys"
     );
-    assert_ne!(le.referenced_files[0], expected);
 }
 
 #[test]

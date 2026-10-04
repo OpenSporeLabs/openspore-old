@@ -1,0 +1,76 @@
+
+osptool - inspect Spore DBPF packages offline
+
+USAGE:
+    osptool <SUBCOMMAND> [ARGS]
+
+SUBCOMMANDS:
+    list <package> [--type 0x..] [--group 0x..] [--limit N] [--json] [--names]
+         Index rows in DBPF file order. `--limit` defaults to 50; 0 means unlimited.
+         `--names` adds the canonical type and group name columns.
+    find <package> <T:G:I> [--json]
+         Resolve one identity: which package answered, its extent, and whether it decodes.
+    describe <package> <T:G:I>
+         Decode a record according to its type id and print a structural summary.
+         A type with no decoder prints the index extent and says so; it never prints a summary
+         that looks decoded.
+    extract <package> <T:G:I> --out <dir>
+         Write one record's bytes to <dir>/<sanitised name>. The package is only ever read.
+    manifest <package...> [--out <file>] [--json] [--stats]
+         Canonical manifest over one or more packages, rows ascending by (type, group, instance).
+         Two runs over the same inputs are byte-identical. `--out` writes JSON Lines and reports
+         the write on stderr, so stdout carries only the document `--json` asked for.
+    verify <package> [--type 0x..] [--explain <T:G:I>]
+         Walk every record and count decoded / container / failed / no-decoder.
+         Streams: one record is decoded at a time and nothing accumulates. Progress goes to
+         stderr every 10000 records, and only when stderr is a terminal.
+    types [--group] [--package <p>]
+         Print the canonical type table; `--group` (a flag, no value) adds the canonical group
+         table; `--package <p>` adds a per-package histogram merged with that package's own
+         0x01C7AC81:0x01C7AC81 prop directory, which maps TYPE IDS TO NAMES.
+    texture <package> <T:G:I> --out <file.png> [--layer N] [--mip N] [--channels auto|stored] [--json]
+         Decode one raster record and write a real PNG: RGBA8, filter 0, deflate stored blocks.
+         The 0x15 family is stored Z, X, Y, mask and is swizzled to R=X, G=Y, B=Z by default;
+         `--channels stored` writes the file order unchanged and says so. The report always
+         states which was applied, because a swizzled-wrong PNG looks perfectly plausible.
+         `--out` is required and is refused when it resolves inside this repository.
+         The decode report goes to stderr; stdout carries only `--json`.
+    graph <T:G:I> --package <p> [--package <p>...] [--depth N] [--kinds a,b,...] [--dependants] [--limit N] [--json]
+         Print the resource dependency graph around one record. Edges come from
+         spore-assets' ResourceGraph with their evidence grades; `--kinds` selects what is
+         BUILT, not only what is followed. Dangling references are reported per edge kind
+         with counts, because a dangling edge is the normal case when the referring package
+         is not loaded. Records that could not be read are listed with their reason.
+    stats <package...> [--type 0x..] [--limit N] [--json]
+         Corpus statistics: type and group histograms, raster fourcc and geometry censuses,
+         per-record decode outcomes, gmdl walk outcomes (including the 0x218 stops) and
+         texture-set sizes. Deterministic and sorted; an empty section says it is not a
+         measurement of zero.
+    diff <packageA> <packageB> [--bytes] [--limit N] [--json]
+         Record-level differences by T:G:I. Compares revision SETS, so two revisions of one
+         identity inside one package are not reported as identical. Index rows by default;
+         `--bytes` also compares decompressed content and reports records the index calls
+         identical whose bytes differ. Differences are the output, so the exit code is 0.
+    -h, --help           Print this text
+
+EXIT CODES:
+    0  ok
+    2  bad command line
+    3  record not found, or no package loaded
+    4  a record or package was found but the container layer refused it
+    5  an I/O failure
+
+NOTES:
+    A type with no decoder in this build exits 0 from `describe` and from
+    `verify --explain`: the record was found and its extent read, which is a complete answer
+    to the question asked. `verify`, `stats`, `graph` and `diff` also exit 0 when they
+    count failures or differences, because they are measurements: the numbers are the output.
+    `find` exits 0 when the record was located even if the record does not decode; the verdict
+    is printed. Use `describe` when a decode failure should be fatal.
+    `texture` exits 4 when the requested `--layer` or `--mip` does not exist in the
+    record, naming the range that does: the record was read and the layer asked for is not in
+    it. `graph` walks every gmdl record of the loaded packages, which is the slow part of a
+    `--package`-heavy run; narrow it with `--kinds`.
+    Every id field in a `--json` document is a 0x-prefixed hex string, so a value copied out of
+    one is directly usable as a `T:G:I` argument.
+osptool: `--kinds` got `model-`, expected a comma-separated list of `gmdl->texture`, `gmdl->reference`, `model->texture-set`, `group-sibling`

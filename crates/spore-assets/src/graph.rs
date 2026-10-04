@@ -58,11 +58,16 @@
 //!
 //! A byte order that produces three exact `(type, group, instance)` matches per
 //! entry, thousands of times, against real rows, is not an inference. So this
-//! module reads the table itself, big-endian, and records the divergence in
-//! [`claims::REFERENCE_TABLE_ENDIANNESS`] rather than quietly working around a
-//! neighbouring crate's bug. `spore_gmdl::GmdlModel::referenced_files` currently
-//! carries byte-swapped keys on every one of those records; this crate cannot fix
-//! that (it does not own the file), and it will not pretend the keys were fine.
+//! module reads the table itself, big-endian.
+//!
+//! **The divergence is closed.** This paragraph used to say that
+//! `spore_gmdl::GmdlModel::referenced_files` carried byte-swapped keys because
+//! that crate read the *count* word big-endian but the three *key* words
+//! little-endian -- a second, quieter bug in the same structure, since the walk
+//! consumed the right byte count and produced plausible keys addressing nothing.
+//! `spore-gmdl` now reads the whole table big-endian and both readers agree. The
+//! byte-reversed reading is pinned by a test rather than merely described, so the
+//! plausible-looking wrong order cannot come back unnoticed.
 //!
 //! Note the asymmetry this creates, because it is real and not a slip: the
 //! *reference* table is big-endian while the *texture-set* table in the same
