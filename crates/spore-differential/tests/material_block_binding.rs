@@ -546,10 +546,15 @@ fn every_record_whose_material_info_closes_has_blocks_equal_to_its_mesh_count() 
 
         if let Some(id) = walk.stopped_on {
             stopped_early += 1;
-            // Every record that stops here yields whatever references it collected so
-            // far, and `partition_texture_refs` will happily divide THOSE. So the
-            // scope it reports is `PerMeshBlock` from a list that is provably
-            // not the record's whole texture set.
+            // Every record that stops here yields whatever references it
+            // collected so far, and that list DIVIDES. So the hazard this file
+            // measures is a list the division accepts and the record contradicts:
+            // the two counts below are computed from this file's own walk, not
+            // from `partition_texture_refs`, which since commit 228a701 also
+            // asks the record whether each slot's derived ordinal equals the
+            // ordinal its group id states. The names `partial_list_cut_as_per_mesh`
+            // and the FINDING messages below therefore describe the PRE-FIX
+            // behaviour, and the arithmetic they assert is unchanged.
             let meshes = recovered.model.meshes.len();
             let total: usize = walk.per_block.iter().sum();
             if meshes > 0 && total > 0 && total % meshes == 0 {
@@ -709,17 +714,29 @@ fn every_record_whose_material_info_closes_has_blocks_equal_to_its_mesh_count() 
     );
     assert_eq!(
         stopped_mid_but_cut_succeeds, stopped_mid_record,
-        "FINDING: every one of those records has a reference count that divides evenly by its \
-         mesh count, so `partition_texture_refs` returns a `PerMeshBlock` scope from a PARTIAL \
-         list and nothing reports it. The per-mesh binding for these records is computed over \
-         references that do not include every block."
+        "FINDING, measured with this file's own arithmetic: every one of those records has a \
+         reference count that divides evenly by its mesh count even though the list is PARTIAL -- \
+         it does not cover every declared block. The arithmetic is the hazard, not a report of \
+         what `partition_texture_refs` currently does: since commit 228a701 that function also \
+         cross-checks each slot's derived ordinal against the ordinal its group id states, and \
+         these 100 records are the ones it refuses as `Undetermined`. An older version of this \
+         message said the function 'returns a PerMeshBlock scope from a PARTIAL list', which \
+         described the pre-fix behaviour and is no longer true. The per-mesh binding for these \
+         records was computed over references that do not include every block."
     );
     assert_eq!(
         partial_list_cut_as_per_mesh, stopped_early,
-        "FINDING: EVERY record whose material-info walk stops on 0x218 still reports a \
-         `PerMeshBlock` scope, so the engine binds textures per mesh from a reference list the \
-         walk did not finish reading. `WholeModel` -- the scope that would have said 'we could \
-         not cut this' -- is produced by none of them."
+        "FINDING, measured with this file's own arithmetic: EVERY record whose material-info walk \
+         stops on 0x218 has a reference list that divides evenly by its mesh count, so the \
+         division alone cannot tell the sound 519 from the 100 whose list is missing whole blocks. \
+         `partition_texture_refs` now tells them apart by asking the RECORD rather than the \
+         arithmetic -- `BindingScope::Undetermined` for the 100, `PerMeshBlock` for the rest -- \
+         so no engine binds textures per mesh from a truncated list. An older version of this \
+         message said every one of the 619 'still reports a PerMeshBlock scope' and that \
+         `WholeModel` was produced by none of them; that described the pre-fix behaviour. \
+         `WholeModel` is still produced by none of them, which is deliberate: an uneven list and \
+         a list the record contradicts are different facts, and folding them together is how a \
+         wrong binding hides inside an honest-sounding fallback."
     );
     assert_eq!(
         stopped_in_last_block_uneven, 0,

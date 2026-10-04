@@ -1,29 +1,65 @@
-//! Comparison 5: the raster envelope and the DXT5 base mip.
+//! Comparison 5: the raster envelope, the layer count, and the base mip.
 //!
 //! Rust `spore_texture::parse_envelope` / `spore_texture::decode_raster` against
-//! `tools/spore/raster/raster.py::parse_envelope` / `::decode` and
+//! `tools/spore/raster/raster.py::parse_envelope` / `::layer_count` / `::decode` and
 //! `tools/spore/dxt5/dxt5.py::decode_image`, for a deterministic bounded sample.
 //!
-//! # Two comparisons, two confidences
+//! # Three comparisons, three confidences
 //!
 //! * The 32-byte envelope is compared field by field (eight `u32`s). Both sides
 //!   read the envelope without validating it, so this is a clean field
-//!   comparison.
+//!   comparison, and it is the one arm that still means "do these two
+//!   implementations read the same bytes".
+//! * The **layer count** is compared. `raster.py::layer_count` derives it by
+//!   dividing `(record_size - 32)` by `16 + chain`, where `chain` charges **8**
+//!   bytes per 4x4 block. A byte count over 4386 of 4386 raster records in the
+//!   two content packages settles that this is wrong: a 256² `DXT5` base level
+//!   occupies 65 536 bytes, which is 4096 blocks of *16*, and every recorded
+//!   level prefix says 16. See `docs/RASTER-FRAMING.md` §2.
 //! * The decoded base mip is compared by `sha256(rgba)[:16]`, which is exactly
 //!   what `raster.py`'s own CLI prints. A hash is the right instrument here: the
 //!   decoded image is megabytes, and "are these the same bytes" is the only
 //!   question that matters. Only a small number of records are decoded, because
 //!   decoding is the expensive part.
 //!
-//! # The `0x15xx` luminance family is an expected refusal
+//! # What the last two arms now measure: a refuted oracle, not a defect
 //!
-//! `spore-texture` refuses any `fourcc` other than `DXT5` **by name**, and says
-//! in its own error text that the `0x15xx` family is a different format rather
-//! than an unrecognised one. `raster.py::parse_envelope` accepts any `fourcc`
-//! (it does not validate) but `raster.py::decode` refuses a non-DXT5 fourcc
-//! too. So a `0x15xx` record produces a field-for-field envelope comparison
-//! that agrees, plus a decode refusal on both sides -- which is
-//! [`Agreement::BothFailed`], never a divergence.
+//! **The raster oracles on this side of the boundary implement a framing the
+//! corpus refuted**, so every layer-count and base-mip disagreement here has the
+//! same cause and the same verdict, and the report says so per record:
+//!
+//! * `raster.py` reports **2 layers** for a 512² `DXT5` record and refuses the
+//!   256² ones outright ("payload bytes not a multiple of ..."). Under the
+//!   measured framing there is exactly **one** chain in every record of all
+//!   three formats -- 2954 of 2954 in `Spore_Content.package` and 1432 of 1432
+//!   in `Spore_EP1_Content_01.package` -- and the record's length is exactly
+//!   what its own envelope implies.
+//! * `dxt5.py` decodes an 8-byte "Spore block". The records hold standard BC3.
+//!   So a `DXT5` base-mip digest disagreement is the *expected* outcome, not a
+//!   port defect, and the codec itself remains `spore-texture`'s `Inferred`
+//!   claim: no decode of a real record has been compared against the game's own
+//!   output.
+//! * `raster.py::decode` refuses `fourcc` other than `DXT5`, so the 901 `0x15`
+//!   and 306 `DXT1` records of this package produce an envelope comparison that
+//!   agrees and a **one-sided** decode: the Rust side has a second
+//!   implementation of the framing (the driver's `rasterframe` walk, which
+//!   agrees over 4386 of 4386 records in `tests/luminance_corpus.rs`) and the
+//!   oracle has none.
+//!
+//! None of that is worked around, and none of it is asserted clean. The
+//! `ValueMismatch` class is kept for the digest disagreements because it is the
+//! honest label -- two sides answering one question differently, one of them
+//! wrong -- and the note on each divergence says which side the byte count
+//! supports. The framing itself is checked against a *second transcription* of
+//! the measured layout rather than against a refuted oracle; that check is
+//! `tests/luminance_corpus.rs`, and it is where a framing claim belongs.
+//!
+//! # The old `0x15xx` guess, refuted
+//!
+//! This module used to define the family as the *range* `0x1500..=0x15FF` and
+//! carry a `is_luminance` predicate over it. No record in the corpus is in that
+//! range: the family's format word is the single value `0x00000015`. The range
+//! came from a design document and from a Python comment, and it is gone.
 
 use spore_assets::Package;
 use spore_core::record::type_id;
@@ -38,13 +74,20 @@ use crate::sample::{describe_sample, sample_indices};
 use super::{primary_package, skipped};
 
 /// Report name for this comparison.
-pub const NAME: &str = "raster-envelope-dxt5";
+///
+/// Renamed from `raster-envelope-dxt5`: the name used to promise agreement with
+/// `dxt5.py`, and the corpus settled that this half of the comparison measures a
+/// disagreement instead.
+pub const NAME: &str = "raster-envelope-layer-count-and-base-mip";
 
 /// How the oracle is invoked.
 pub const INVOCATION: &str = "persistent `python3 -c` driver, one session per package; one \
                               NDJSON {cmd:\"raster\", i:N} request per sampled record, answered \
-                              from raster.py::parse_envelope and raster.py::decode \
-                              (which calls dxt5.py::decode_image)";
+                              from raster.py::parse_envelope, raster.py::layer_count and \
+                              raster.py::decode (which calls dxt5.py::decode_image). NOTE: the \
+                              layer count and the block codec raster.py uses are the framing a \
+                              byte count over 4386 of 4386 raster records REFUTED -- see this \
+                              module's documentation and docs/RASTER-FRAMING.md section 2";
 
 /// How many records the default sample draws for the envelope comparison.
 pub const DEFAULT_SAMPLE: usize = 150;
@@ -52,15 +95,28 @@ pub const DEFAULT_SAMPLE: usize = 150;
 /// How many of the sampled records are also decoded and hashed.
 pub const DEFAULT_DECODE_SAMPLE: usize = 12;
 
-/// The `0x15xx` luminance family, as the two sides each spell it.
-pub const LUMINANCE_LOW: u32 = 0x1500;
-/// Upper bound of the refused luminance family.
-pub const LUMINANCE_HIGH: u32 = 0x15FF;
+/// Format word of the `DXT5` family, as the two sides each spell it.
+pub const DXT5_FOURCC: u32 = 0x3554_5844;
+/// Format word of the `DXT1` family.
+pub const DXT1_FOURCC: u32 = 0x3154_5844;
+/// Format word of the uncompressed four-lane family, `0x00000015`.
+///
+/// Not a FOURCC: the record carries one byte of format enum and three bytes of
+/// padding. The old `0x1500..=0x15FF` guess for this family matched nothing in
+/// the corpus.
+pub const LUMINANCE_FOURCC: u32 = 0x0000_0015;
 
-/// True when `fourcc` is in the luminance family Rust refuses by name.
+/// The three format words the corpus measures.
+pub const MEASURED_FOURCCS: [u32; 3] = [DXT5_FOURCC, DXT1_FOURCC, LUMINANCE_FOURCC];
+
+/// True when the corpus measures a framing for `fourcc`.
+///
+/// Absence is not a verdict: a `fourcc` outside this set would mean a family
+/// nobody has characterised, and the caller should say so rather than refuse it
+/// as malformed.
 #[must_use]
-pub fn is_luminance(fourcc: u32) -> bool {
-    (LUMINANCE_LOW..=LUMINANCE_HIGH).contains(&fourcc)
+pub fn has_measured_framing(fourcc: u32) -> bool {
+    MEASURED_FOURCCS.contains(&fourcc)
 }
 
 /// Runs the raster comparison over the corpus's primary package.
@@ -98,8 +154,11 @@ pub fn compare_package(
 ) -> Result<DifferentialReport, OracleError> {
     let mut builder = ReportBuilder::new(NAME, INVOCATION);
     builder.note(format!(
-        "package {}; Rust side: spore_texture::parse_envelope and decode_dxt5_mip; oracle: \
-         raster.py::parse_envelope and raster.py::decode (dxt5.py::decode_image)",
+        "package {}; Rust side: spore_texture::parse_envelope, framing::record_size and \
+         decode_raster; oracle: raster.py::parse_envelope, raster.py::layer_count and \
+         raster.py::decode (dxt5.py::decode_image). The oracle's layer count and block codec are \
+         the framing the corpus REFUTED: expect one-layer and two-layer to disagree on every \
+         record it can divide, and expect DXT5 base-mip digests to disagree",
         package.name
     ));
 
@@ -140,7 +199,14 @@ pub fn compare_package(
 
     let mut session = OracleSession::spawn(config)?;
     let info = session.open(&package.path)?;
-    let mut luminance_refusals = 0usize;
+    let mut layers_agreed = 0usize;
+    let mut layers_disagreed = 0usize;
+    let mut layers_refused = 0usize;
+    let mut layers_unstated = 0usize;
+    let mut base_mip_agreed = 0usize;
+    let mut base_mip_disagreed = 0usize;
+    let mut base_mip_one_sided = 0usize;
+    let mut framing_refuted = 0usize;
 
     for sample in &sampled {
         let Some((package_index, entry)) = targets.get(*sample) else {
@@ -201,6 +267,18 @@ pub fn compare_package(
         };
 
         compare_envelope_fields(&mut builder, &identity, &oracle_envelope, &envelope);
+        match compare_layer_count(
+            &mut builder,
+            &identity,
+            oracle.as_ref().ok(),
+            &bytes,
+            &envelope,
+        ) {
+            LayerVerdict::Agreed => layers_agreed += 1,
+            LayerVerdict::Disagreed => layers_disagreed += 1,
+            LayerVerdict::OracleRefusedItsOwnDivision => layers_refused += 1,
+            LayerVerdict::Unstated => layers_unstated += 1,
+        }
 
         if !decoded.contains(sample) {
             continue;
@@ -213,14 +291,11 @@ pub fn compare_package(
             .and_then(|reply| reply.get("mip0_sha16"))
             .and_then(Json::as_str)
             .map_or_else(
-                || Err(oracle_reason(oracle.as_ref())),
+                || Err(oracle_reason_text(oracle.as_ref().ok())),
                 |sha| Ok(sha.to_owned()),
             );
 
         if let Some(rust_error) = rust_decode.as_ref().err() {
-            if is_luminance(fourcc) {
-                luminance_refusals += 1;
-            }
             let agreement = classify_refusal(
                 oracle_sha.clone().map(|_| ()),
                 rust_decode
@@ -235,13 +310,11 @@ pub fn compare_package(
                      rust={rust:?}"
                 ));
             }
-            if is_luminance(fourcc) {
+            if !has_measured_framing(fourcc) {
                 builder.note(format!(
-                    "{identity}: fourcc 0x{fourcc:08x} is in the 0x15xx luminance family, which \
-                     spore-texture refuses by name because it is a different format rather than an \
-                     unrecognised one. This refusal is expected and is classified as both-failed, \
-                     not as a divergence. Rust said: {}",
-                    rust_error
+                    "{identity}: fourcc 0x{fourcc:08x} has no measured framing, so the Rust side \
+                     refused it by name while the oracle did not validate the format word at all; \
+                     Rust said: {rust_error}"
                 ));
             }
             continue;
@@ -252,20 +325,46 @@ pub fn compare_package(
         match (rust_sha.clone(), oracle_sha.clone()) {
             (Some(rust_hex), Ok(oracle_hex)) => {
                 if rust_hex == oracle_hex {
+                    base_mip_agreed += 1;
                     builder.record(Agreement::Equal);
                 } else {
+                    base_mip_disagreed += 1;
+                    framing_refuted += 1;
                     builder.divergence(
                         Divergence::value(identity, "mip0.sha256[:16]", oracle_hex, rust_hex)
                             .with_note(format!(
-                                "{}x{} base mip, RGBA8, hashed after decode; the oracle prints \
-                             exactly this digest in raster.py's own CLI output",
+                                "{}x{} base mip, RGBA8, hashed after decode. The two sides read \
+                                 the same envelope and disagree on the PIXELS, and the byte count \
+                                 says which one is wrong: this record is {bytes_len} bytes, which \
+                                 is exactly header {header} + a {base}-byte base level (16 bytes \
+                                 per 4x4 block) + one u32 count per level past level 1, with \
+                                 nothing left over, so the oracle's 8-byte-block chain and its \
+                                 derived layer headers address bytes that are not there. The \
+                                 codec inside the block is still spore-texture's INFERRED claim: \
+                                 no decode of a real record has been compared against the game's \
+                                 own output. Oracle decode path: raster.py::decode -> \
+                                 dxt5.py::decode_image",
                                 first.map_or(0, |mip| mip.width),
-                                first.map_or(0, |mip| mip.height)
+                                first.map_or(0, |mip| mip.height),
+                                bytes_len = bytes.len(),
+                                header = spore_texture::framing::frame_for(fourcc)
+                                    .map_or(0, |frame| frame.header_size),
+                                base = spore_texture::framing::level_size(
+                                    spore_texture::framing::frame_for(fourcc)
+                                        .unwrap_or(spore_texture::framing::DXT5_FRAME),
+                                    envelope.width,
+                                    envelope.height,
+                                    0,
+                                ),
                             )),
                     );
                 }
             }
             _ => {
+                base_mip_one_sided += 1;
+                // Quoted here rather than above, because it is only meaningful
+                // when the oracle produced no digest to disagree with.
+                let why = oracle_reason_text(oracle.as_ref().ok());
                 builder.divergence(
                     Divergence::value(
                         identity,
@@ -277,19 +376,126 @@ pub fn compare_package(
                         rust_sha.unwrap_or_else(|| "<no digest>".to_owned()),
                     )
                     .with_class(DivergenceClass::OneSidedDecode)
-                    .with_note("only one side produced a digest for the base mip"),
+                    .with_note(format!(
+                        "fourcc 0x{fourcc:08x}: only one side produced a digest for the base mip. \
+                         raster.py::decode refuses every fourcc but DXT5 and derives its layer \
+                         count by a division the corpus refuted, so the oracle has no answer here \
+                         while the Rust side does. The Rust framing is not taken on trust: it is \
+                         checked against a second transcription in Python over every raster \
+                         record of both content packages (tests/luminance_corpus.rs, 4386 of \
+                         4386). {why}",
+                    )),
                 );
             }
         }
     }
 
-    if luminance_refusals > 0 {
-        builder.note(format!(
-            "{luminance_refusals} sampled raster(s) were in the 0x15xx luminance family and were \
-             refused by name on both sides; see the per-record notes"
-        ));
-    }
+    builder.note(format!(
+        "layer count over {sampled_len} sampled record(s): {layers_agreed} agreed, \
+         {layers_disagreed} disagreed, {layers_refused} refused by the oracle's own division, \
+         {layers_unstated} stated nothing. Every disagreement is raster.py deriving \
+         8-byte-block layers against the measured one-chain framing \
+         (docs/RASTER-FRAMING.md section 2), and a refusal is the same rule refusing a payload \
+         it cannot divide -- not an absence of measurement",
+        sampled_len = sampled.len()
+    ));
+    builder.note(format!(
+        "base mip digest: {base_mip_agreed} agreed, {base_mip_disagreed} disagreed, \
+         {base_mip_one_sided} one-sided; {framing_refuted} of those are a DXT5 decode on both \
+         sides reading different bytes out of the same record"
+    ));
     Ok(builder.finish())
+}
+
+/// Compares the derived layer count, and reports the oracle's own arithmetic when
+/// it disagrees.
+///
+/// The framing is an identity, not a division: `record_size == header + base +
+/// SUM(4 + level)`, over 4386 of 4386 raster records in the two content
+/// packages. `raster.py::layer_count` divides `(record_size - 32)` by
+/// `16 + chain_at_8_bytes_per_block` and reported 2 for every 512² DXT5 record
+/// it could divide at all. Both numbers are quoted on the divergence so a reader
+/// can check the claim rather than take it: the payload the oracle divided, and
+/// the stride it divided by, both come from `raster.py`'s own constants and are
+/// reported by the driver.
+fn compare_layer_count(
+    builder: &mut ReportBuilder,
+    identity: &crate::report::RecordIdentity,
+    reply: Option<&Json>,
+    bytes: &[u8],
+    envelope: &spore_texture::RasterEnvelope,
+) -> LayerVerdict {
+    let Some(reply) = reply else {
+        builder.note(format!(
+            "{identity}: no oracle reply, so its layer count was not compared"
+        ));
+        return LayerVerdict::Unstated;
+    };
+    if let Some(reason) = reply.get("layers_error").and_then(Json::as_str) {
+        builder.note(format!(
+            "{identity}: raster.py::layer_count refused its own division here ({reason}); a \
+             refusal is not a layer count, so there is nothing to compare and no disagreement is \
+             recorded for this record. The Rust side read this record's envelope and framing"
+        ));
+        return LayerVerdict::OracleRefusedItsOwnDivision;
+    }
+    let Some(oracle_layers) = reply.get("layers").and_then(Json::as_u32) else {
+        builder.note(format!(
+            "{identity}: the oracle stated no layer count and no reason for not stating one"
+        ));
+        return LayerVerdict::Unstated;
+    };
+    if oracle_layers == 1 {
+        return LayerVerdict::Agreed;
+    }
+    let payload = reply.get("payload").and_then(Json::as_u32).unwrap_or(0);
+    let stride = reply.get("stride").and_then(Json::as_u32).unwrap_or(0);
+    let frame = spore_texture::framing::frame_for(envelope.fourcc);
+    let expected = frame.map_or(0, |frame| {
+        spore_texture::framing::record_size(
+            frame,
+            envelope.width,
+            envelope.height,
+            envelope.mip_count,
+        )
+    });
+    let base = frame.map_or(0, |frame| {
+        spore_texture::framing::level_size(frame, envelope.width, envelope.height, 0)
+    });
+    builder.divergence(
+        Divergence::value(
+            identity.clone(),
+            "layer count",
+            format!("{oracle_layers} layers ({payload} payload bytes / {stride}-byte stride)"),
+            format!("1 chain (record is exactly {expected} bytes: header + a {base}-byte base level + one u32 count per level)"),
+        )
+        .with_class(DivergenceClass::Structural)
+        .with_note(format!(
+            "REFUTED ORACLE, not a port defect. The record is {} bytes and its own envelope \
+             implies exactly {expected}, so there is nothing left over for a second layer; the \
+             oracle's stride comes from charging 8 bytes per 4x4 block where the record holds 16 \
+             (measured: field_18 states {base} = the base level at 16 bytes per block), and its \
+             16-byte 'layer header' is the first two blocks of the base level. Verified over 4386 \
+             of 4386 raster records in Spore_Content.package and Spore_EP1_Content_01.package; \
+             see docs/RASTER-FRAMING.md section 2",
+            bytes.len()
+        )),
+    );
+    LayerVerdict::Disagreed
+}
+
+/// What one record's layer-count comparison found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LayerVerdict {
+    /// Both sides derived one chain.
+    Agreed,
+    /// The oracle derived more than one, and a structural divergence was recorded.
+    Disagreed,
+    /// `raster.py::layer_count` refused its own division: it read a count of
+    /// nothing, which is a fact about the rule and not about the record.
+    OracleRefusedItsOwnDivision,
+    /// There was no count to compare and no reason for its absence.
+    Unstated,
 }
 
 /// The eight envelope words, field by field.
@@ -327,10 +533,27 @@ fn compare_envelope_fields(
     builder.record(Agreement::Equal);
 }
 
-fn oracle_reason(oracle: Result<&Json, &OracleError>) -> String {
-    match oracle {
-        Ok(_) => "the oracle reply carried no digest".to_owned(),
-        Err(error) => format!("the oracle refused or failed: {}", error.message()),
+/// The oracle's own words for why it has no digest, quoted rather than
+/// paraphrased: `layers_error` when its division refused, `decode_error` when
+/// `raster.py::decode` refused (which it does for every `fourcc` but `DXT5`), and
+/// the driver's own error otherwise.
+fn oracle_reason_text(reply: Option<&Json>) -> String {
+    match reply {
+        None => "The driver returned no reply for this record.".to_owned(),
+        Some(reply) => {
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(reason) = reply.get("layers_error").and_then(Json::as_str) {
+                parts.push(format!("raster.py::layer_count said: {reason}"));
+            }
+            if let Some(reason) = reply.get("decode_error").and_then(Json::as_str) {
+                parts.push(format!("raster.py::decode said: {reason}"));
+            }
+            if parts.is_empty() {
+                "The oracle's reply carried no digest and no reason for carrying none.".to_owned()
+            } else {
+                parts.join("; ")
+            }
+        }
     }
 }
 
@@ -582,11 +805,72 @@ mod tests {
     }
 
     #[test]
-    fn the_luminance_family_is_the_one_the_crate_says_it_is() {
-        assert!(is_luminance(0x1500));
-        assert!(is_luminance(0x15FF));
-        assert!(!is_luminance(0x14FF));
-        assert!(!is_luminance(0x1600));
-        assert!(!is_luminance(spore_texture::DXT5_FOURCC));
+    fn the_measured_fourccs_are_three_words_and_the_old_range_matched_nothing() {
+        // The old predicate took `0x1500..=0x15FF` for the uncompressed family,
+        // on the strength of a design document and a Python comment. The corpus
+        // says the family's format word is the single value `0x00000015`, and no
+        // record in either package carries a word in that range -- so the
+        // predicate silently classified nothing and the range is deleted rather
+        // than kept as a second, wrong answer.
+        assert!(has_measured_framing(0x0000_0015));
+        assert!(has_measured_framing(0x3554_5844));
+        assert!(has_measured_framing(0x3154_5844));
+        for never in [
+            0u32,
+            0x1500,
+            0x15FF,
+            0x14FF,
+            0x1600,
+            0x3554_5843,
+            0xDEAD_BEEF,
+        ] {
+            assert!(
+                !has_measured_framing(never),
+                "0x{never:08x} must not be treated as a measured family"
+            );
+        }
+        // The crate and this module must agree on the words themselves, or the
+        // "no measured framing" note above would name a format the crate reads.
+        assert_eq!(LUMINANCE_FOURCC, spore_texture::LUMINANCE_FOURCC);
+        assert_eq!(DXT5_FOURCC, spore_texture::DXT5_FOURCC);
+        assert_eq!(DXT1_FOURCC, spore_texture::DXT1_FOURCC);
+        for fourcc in MEASURED_FOURCCS {
+            assert!(
+                spore_texture::framing::frame_for(fourcc).is_some(),
+                "0x{fourcc:08x} has no frame in the crate under test"
+            );
+        }
+    }
+
+    #[test]
+    fn the_oracle_reason_is_quoted_not_paraphrased() {
+        // A note that says "the oracle refused" without saying why is the shape
+        // of a finding that cannot be checked, so the driver's own words are
+        // carried through verbatim.
+        let both = crate::json::object(vec![
+            (
+                "layers_error",
+                Json::Str(
+                    "ValueError: raster: 87436 payload bytes not a multiple of 43720".to_owned(),
+                ),
+            ),
+            (
+                "decode_error",
+                Json::Str("ValueError: raster: unsupported fourcc 0x00000015".to_owned()),
+            ),
+        ]);
+        let reason = oracle_reason_text(Some(&both));
+        assert!(reason.contains("87436 payload bytes"), "{reason}");
+        assert!(reason.contains("unsupported fourcc 0x00000015"), "{reason}");
+        let neither = crate::json::object(vec![]);
+        assert!(
+            oracle_reason_text(Some(&neither)).contains("no digest"),
+            "{}",
+            oracle_reason_text(Some(&neither))
+        );
+        assert!(
+            oracle_reason_text(None).contains("no reply"),
+            "a missing reply is an absence, not an empty reason"
+        );
     }
 }

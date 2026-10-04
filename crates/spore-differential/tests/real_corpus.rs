@@ -227,10 +227,40 @@ fn gmdl_walk_over_a_deterministic_sample() {
 
 // ------------------------------------------------------------------ 5. raster
 
-/// The raster envelope field by field, plus the DXT5 base mip by digest.
+/// The raster envelope, the layer count, and the base mip -- over a
+/// deterministic bounded sample.
+///
+/// # This arm used to assert zero divergences. It now asserts a measured
+/// disagreement and says whose fault it is.
+///
+/// The oracle side of this comparison is `tools/spore/raster/raster.py` and
+/// `tools/spore/dxt5/dxt5.py`, and both implement the **refuted** framing: a
+/// derived layer count dividing a payload by `16 + chain` with `chain` charging
+/// 8 bytes per 4x4 block, a 16-byte "layer header" in front of every layer, and
+/// an 8-byte "Spore block" codec. A byte count over 4386 of 4386 raster records
+/// in the two content packages settled that the records hold one mip chain, a
+/// 16-byte BC3 block for `DXT5` and an 8-byte BC1 block for `DXT1`
+/// (`docs/RASTER-FRAMING.md` §2). So the envelope arm still agrees field for
+/// field and the other two arms cannot, and pretending otherwise would mean
+/// either refusing `DXT1` or reverting the framing to keep a test green.
+///
+/// The numbers below are the measurement, asserted exactly so a silent change
+/// in any of the three arms shows up:
+///
+/// | arm | measured |
+/// |---|---|
+/// | envelope, 150 sampled | 150 agree, 0 disagree |
+/// | layer count | 68 disagreements, 82 refusals by the oracle's own division, 0 agreements |
+/// | base mip digest (12 decoded) | 8 disagreements, 4 one-sided, 0 agreements |
+///
+/// What is asserted about the framing itself is **not** here: it is
+/// `tests/luminance_corpus.rs`, which checks every raster record of both
+/// packages against a second transcription of the measured layout in Python
+/// (4386 of 4386) because the oracle this comparison used to trust has no
+/// second opinion to give.
 #[test]
 #[ignore = "needs the git-ignored SPORE/ tree (~5 GB)"]
-fn raster_envelope_and_dxt5_mip() {
+fn raster_envelope_layer_count_and_base_mip() {
     let corpus = corpus();
     require("raster", &corpus);
     let report = compare::raster::compare(&corpus, &config());
@@ -245,11 +275,139 @@ fn raster_envelope_and_dxt5_mip() {
         "{}",
         report.summary()
     );
-    assert_eq!(
-        report.outcome("diverged"),
-        0,
-        "the envelope must agree field for field and the base mip by digest:\n{}",
+
+    // --- the envelope arm: still a clean field-for-field comparison.
+    assert!(
+        report
+            .divergences
+            .iter()
+            .all(|d| !d.field.starts_with("envelope.")),
+        "the envelope is eight words read by both sides without validation, so every sampled \
+         record must agree on all eight:\n{}",
         report.summary()
+    );
+
+    // --- the three arms, measured. The retained divergence list is capped, so the
+    //     breakdown is asserted through the report's own tally notes, which are
+    //     not.
+    for (what, expected) in [
+        (
+            "layer count",
+            "layer count over 150 sampled record(s): 0 agreed, 68 disagreed, 82 refused by the \
+             oracle's own division, 0 stated nothing",
+        ),
+        (
+            "base mip digest",
+            "base mip digest: 0 agreed, 8 disagreed, 4 one-sided; 8 of those are a DXT5 decode \
+             on both sides reading different bytes out of the same record",
+        ),
+    ] {
+        assert!(
+            report.notes.iter().any(|note| note.contains(expected)),
+            "the {what} tally must read exactly this, because it is the measurement: \
+             expected a note containing {expected:?}\n{}",
+            report.summary()
+        );
+    }
+
+    // --- and nothing else diverges. Three field paths, no fourth: a divergence
+    //     outside this set would be a new disagreement nobody has looked at.
+    for divergence in &report.divergences {
+        assert!(
+            matches!(
+                divergence.field.as_str(),
+                "layer count" | "mip0.sha256[:16]"
+            ),
+            "unexpected divergence field {}\n{}",
+            divergence.field,
+            report.summary()
+        );
+    }
+
+    // --- a layer-count disagreement must quote BOTH numbers, because the claim
+    //     "the oracle is wrong" is only checkable if the reader can see the
+    //     payload it divided and the stride it divided by.
+    let layer_divergences: Vec<_> = report
+        .divergences
+        .iter()
+        .filter(|d| d.field == "layer count")
+        .collect();
+    assert!(
+        !layer_divergences.is_empty(),
+        "no layer-count disagreement is retained, so the refutation is not being reported:\n{}",
+        report.summary()
+    );
+    for divergence in &layer_divergences {
+        assert!(
+            divergence.oracle.contains("layers") && divergence.oracle.contains("stride"),
+            "the oracle side must quote its own arithmetic, not a paraphrase: {}",
+            divergence
+        );
+        // The Rust side states the measured identity: the record's own length,
+        // the length its envelope implies, and the base level's byte count.
+        assert!(
+            divergence
+                .rust
+                .starts_with("1 chain (record is exactly 349616 bytes: header + a"),
+            "the Rust side must state the record's own length and the length its envelope \
+             implies: {divergence}"
+        );
+        assert!(
+            divergence.rust.contains("262144-byte"),
+            "the Rust side must quote the base level's byte count, which is where the 8-versus-16 \
+             byte block disagreement shows up as a number: {divergence}"
+        );
+        assert!(
+            divergence.rust.contains("one u32 count per level"),
+            "the Rust side must name the per-level counts the record carries: {divergence}"
+        );
+        assert!(
+            divergence
+                .note
+                .as_deref()
+                .is_some_and(|note| note.contains("REFUTED ORACLE")),
+            "a layer-count divergence must say whose rule was refuted: {divergence}"
+        );
+    }
+
+    // --- and the digest disagreements must be labelled as a codec disagreement
+    //     rather than counted as a port defect, with the codec's grade stated.
+    let digest_divergences: Vec<_> = report
+        .divergences
+        .iter()
+        .filter(|d| d.field == "mip0.sha256[:16]")
+        .collect();
+    assert!(
+        !digest_divergences.is_empty(),
+        "no base-mip disagreement is retained:\n{}",
+        report.summary()
+    );
+    for divergence in &digest_divergences {
+        let note = divergence.note.as_deref().unwrap_or_default();
+        match divergence.class {
+            // Both sides produced a digest and they differ: that IS a codec
+            // disagreement, so the note must say the codec is INFERRED.
+            spore_differential::DivergenceClass::ValueMismatch => assert!(
+                note.contains("INFERRED"),
+                "a codec disagreement must state that the codec is INFERRED, not verified: \
+                 {divergence}"
+            ),
+            // One side produced a digest: there is no codec to grade, and the
+            // note has to say which side is silent and why.
+            spore_differential::DivergenceClass::OneSidedDecode => assert!(
+                note.contains("fourcc 0x") && note.contains("4386"),
+                "a one-sided decode must name the format word and say where the Rust framing is \
+                 checked instead of being taken on trust: {divergence}"
+            ),
+            other => panic!("unexpected class {other} on a digest comparison: {divergence}"),
+        }
+    }
+
+    println!(
+        "raster: envelope 150/150 agree; layer count 68 disagreements + 82 oracle refusals, 0 \
+         agreements; base mip 8 disagreements + 4 one-sided, 0 agreements. Every disagreement \
+         is the refuted 8-byte-block oracle; the framing itself is checked over 4386 of 4386 \
+         records in tests/luminance_corpus.rs"
     );
 }
 

@@ -13,23 +13,34 @@
 //!
 //! # Why one command is NOT an oracle at all
 //! #
-//! # The `0x15` raster family has no reference implementation. `raster.py::decode`
-//! # refuses any fourcc other than DXT5, so after `spore-texture` learned to decode
-//! # `0x15` there was nothing on this side of the boundary to compare it against --
-//! # 901 real records with no second implementation. `cmd_raster15` below closes
-//! # that gap, and it is deliberately NOT filed as an oracle:
+//! # The raster framing has **no** reference implementation left. `raster.py::decode`
+//! # refuses any fourcc other than DXT5, and `raster.py::layer_count` and
+//! # `dxt5.py` still derive the layer count by dividing a payload by an
+//! # 8-byte-block stride -- the framing a byte count over 4386 of 4386 raster
+//! # records **refuted** (see `docs/RASTER-FRAMING.md` section 2). So for
+//! # `raster` records there is nothing on this side of the boundary to compare
+//! # against, in either language. `cmd_rasterframe` below closes that gap, and it
+//! # is deliberately NOT filed as an oracle:
 //! #
-//! # * it re-derives the framing identity from the format description in a second
-//! #   language, with no call into `raster.py` or `dxt5.py`, so a shared mistake in
-//! #   one language cannot hide in both;
+//! # * it re-derives the framing identity from the **measured** layout
+//! #   (`docs/RASTER-FRAMING.md` section 2) in a second language, with no call
+//! #   into `raster.py` or `dxt5.py` and no shared constant, so a mistake in one
+//! #   language cannot hide in both and importing the refuted rule cannot make the
+//! #   check vacuous;
 //! # * it is checked against the crate's own answer and a disagreement is REPORTED,
 //! #   never reconciled -- the same discipline `mirror_index` follows;
-//! # * the crate under test and this function were written from the same document
-//! #   (`docs/LUMINANCE-RASTER.md`), so their agreement raises confidence in the
-//! #   *arithmetic* and says nothing about whether the document describes Spore.
-//! #   That last question is settled only by the corpus, over 901 of 901 records
-//! #   consuming exactly. Anything stronger would be a claim this harness cannot
-//! #   make.
+//! # * the crate under test and this function share a *document*, not code, so
+//! #   their agreement is a statement about the arithmetic of two independent
+//! #   transcriptions. The framing itself is settled by the corpus: this walk
+//! #   consumes **4386 of 4386** records in the two content packages exactly.
+//! #   That is what "independent agreement is the point" means here -- the
+//! #   agreement is evidence about transcription, and the corpus is the evidence
+//! #   about the format.
+//! #
+//! # What it does NOT check, and cannot: the **codec inside a block**. It compares
+//! # geometry, offsets, lengths and digests of the *stored* bytes; whether those
+//! # bytes are BC3 or BC1 is `spore-texture`'s `INFERRED` claim, and this command
+//! # has no opinion on it.
 //! #
 //! # Why the driver is allowed to look at bytes `dbpf.read` does not return
 //!
@@ -46,7 +57,10 @@
 //! reported as a failure rather than believed. That way a bug in the mirror
 //! cannot masquerade as a bug in the Rust parser.
 //!
-//! Nothing else is reimplemented. Every decode is a call into the oracle module.
+//! Nothing else is reimplemented. Every other decode is a call into the oracle
+//! module. The single exception is the raster framing above, and the reason is
+//! stated there: the raster oracles implement a framing the corpus refuted, so
+//! calling them would have produced agreement about a rule that is wrong.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -308,6 +322,11 @@ def cmd_raster(req):
         out['err'] = '%s: %s' % (type(exc).__name__, exc)
         return out
     out['env'] = env
+    # The oracle's own arithmetic, reported so a disagreement can quote it rather
+    # than paraphrase it: `payload` bytes after the envelope, and the per-layer
+    # stride it divides them by. Both come from raster.py's OWN constants.
+    out['payload'] = len(blob) - raster.ENV_SIZE
+    out['stride'] = raster.LAYER_HDR + raster.chain_size(env)
     try:
         out['layers'] = raster.layer_count(blob, env)
     except Exception as exc:  # noqa: BLE001
@@ -324,50 +343,85 @@ def cmd_raster(req):
 
 
 LUMINANCE_FOURCC = 0x00000015
-LUM_HEADER = 28
-LUM_PREFIX = 4
-LUM_TEXEL = 4
+DXT5_FOURCC = 0x35545844
+DXT1_FOURCC = 0x31545844
+ENV_BYTES = 32
+MIP_FLOOR = 32
+LEVEL_PREFIX = 4
+TEXEL_BYTES = 4
+
+# fourcc -> (header bytes, bytes per 4x4 block, first prefixed level).
+#
+# A None in the second slot means the format has no blocks at all: it is four
+# bytes per TEXEL. The three rows are the measured per-format table in
+# docs/RASTER-FRAMING.md section 2, transcribed here independently of
+# spore_texture::framing. `first_prefixed_level` differs between the block
+# formats and the uncompressed family, and WHY is UNKNOWN; this file states the
+# measurement, not a cause.
+FRAMES = {
+    DXT5_FOURCC: (32, 16, 2),
+    DXT1_FOURCC: (32, 8, 2),
+    LUMINANCE_FOURCC: (28, None, 1),
+}
 
 
-def _lum_dim(base, mip):
+def frame_for(fourcc):
+    """The measured framing of `fourcc`, or None: no rule, not a verdict."""
+    return FRAMES.get(fourcc)
+
+
+def _frame_dim(base, mip):
     """max(1, base >> mip), with every mip at or beyond 32 clamped to 1."""
-    if mip >= 32:
+    if mip >= MIP_FLOOR:
         return 1
     return max(1, base >> mip)
 
 
-def _lum_payload(width, height, mip):
-    return _lum_dim(width, mip) * _lum_dim(height, mip) * LUM_TEXEL
+def _frame_payload(frame, width, height, mip):
+    """Payload bytes of one level under `frame`."""
+    block = frame[1]
+    w = _frame_dim(width, mip)
+    h = _frame_dim(height, mip)
+    if block is None:
+        return w * h * TEXEL_BYTES
+    return ((w + 3) // 4) * ((h + 3) // 4) * block
 
 
-def luminance_identity(width, height, mip_count):
-    """The one record size this family's framing allows.
+def frame_identity(frame, width, height, mip_count):
+    """The one record size this framing allows.
 
-    28-byte header, then the base level's payload, then for every mip past the
-    base level a little-endian u32 byte count and that level's payload.
+    header, then the base level bare, then for every level at or beyond the
+    frame's `first_prefixed_level` a little-endian u32 byte count and that
+    level's payload. Levels at or beyond MIP_FLOOR are 1x1 and are charged a
+    prefix plus one texel/block each, which is what makes the identity close for
+    a mip count the corpus never contains.
     """
-    total = LUM_HEADER
-    bounded = min(mip_count, 32)
+    header, block, first_prefixed = frame
+    del block
+    total = header
+    bounded = min(mip_count, MIP_FLOOR)
     for mip in range(bounded):
-        if mip > 0:
-            total += LUM_PREFIX
-        total += _lum_payload(width, height, mip)
-    total += max(0, mip_count - bounded) * (LUM_PREFIX + LUM_TEXEL)
+        if mip >= first_prefixed:
+            total += LEVEL_PREFIX
+        total += _frame_payload(frame, width, height, mip)
+    total += max(0, mip_count - bounded) * (
+        LEVEL_PREFIX + _frame_payload(frame, width, height, MIP_FLOOR))
     return total
 
 
-def cmd_raster15(req):
-    """An independent framing walk over a `0x15` record. See the module docs.
+def cmd_rasterframe(req):
+    """An independent framing walk over ANY raster record. See the module docs.
 
-    Returns the derived identity, the byte window and digest of every mip, and
+    Returns the derived identity, the byte window and digest of every level, and
     whether the walk consumed the record exactly. Refusals are reported as
-    refusals with a reason, never as an empty success.
+    refusals with a reason, never as an empty success. No codec is applied: the
+    digest is of the bytes as stored, because the framing is what this checks.
     """
     _item, blob = extract(req['i'])
     out = {'ok': True, 'len': len(blob)}
-    if len(blob) < LUM_HEADER:
+    if len(blob) < ENV_BYTES:
         out['ok'] = False
-        out['err'] = 'shorter than the 28-byte header'
+        out['err'] = 'shorter than the %d-byte envelope' % ENV_BYTES
         return out
     # 0x04 width, 0x08 height, 0x0c mipCount, 0x14 fourcc. The four words at
     # 0x04..0x14 are NOT consecutive with the format word: 0x10 is field_10, the
@@ -377,46 +431,62 @@ def cmd_raster15(req):
     width, height, mip_count = struct.unpack_from('<3I', blob, 4)
     fourcc = struct.unpack_from('<I', blob, 0x14)[0]
     field_10 = struct.unpack_from('<I', blob, 0x10)[0]
+    field_18 = struct.unpack_from('<I', blob, 0x18)[0]
     out.update({'width': width, 'height': height, 'mipCount': mip_count,
-                'fourcc': fourcc, 'field_10': field_10})
-    if fourcc != LUMINANCE_FOURCC:
+                'fourcc': fourcc, 'field_10': field_10, 'field_18': field_18})
+    frame = frame_for(fourcc)
+    if frame is None:
         out['ok'] = False
-        out['err'] = 'fourcc 0x%08X is not the 0x15 family' % fourcc
+        out['err'] = 'fourcc 0x%08X has no measured framing rule' % fourcc
         return out
+    header, block_bytes, first_prefixed = frame
+    out['header'] = header
+    out['block_bytes'] = block_bytes
+    out['first_prefixed_level'] = first_prefixed
     if mip_count == 0:
         out['ok'] = False
         out['err'] = 'mipCount 0'
         return out
-    identity = luminance_identity(width, height, mip_count)
+    if width == 0 or height == 0:
+        out['ok'] = False
+        out['err'] = 'zero dimension %dx%d' % (width, height)
+        return out
+    identity = frame_identity(frame, width, height, mip_count)
     out['identity'] = identity
     out['identity_holds'] = (identity == len(blob))
     if not out['identity_holds']:
         out['ok'] = False
         out['err'] = 'identity says %d bytes, record is %d' % (identity, len(blob))
         return out
+    # field_18 is the base level's own byte count in all three formats. Reported
+    # as a boolean, not asserted here: the harness compares it against the crate
+    # so a disagreement between the two readings is visible as one.
+    base_geom = _frame_payload(frame, width, height, 0)
+    out['base_geom'] = base_geom
+    out['field_18_is_base_geom'] = (field_18 == base_geom)
     mips = []
-    at = LUM_HEADER
+    at = header
     bad = None
     for mip in range(mip_count):
         declared = None
-        if mip > 0:
+        if mip >= first_prefixed:
             declared = struct.unpack_from('<I', blob, at)[0]
-            at += LUM_PREFIX
-        geom = _lum_payload(width, height, mip)
+            at += LEVEL_PREFIX
+        geom = _frame_payload(frame, width, height, mip)
         window = blob[at:at + geom]
         if len(window) != geom:
-            bad = 'mip %d window runs past the record' % mip
+            bad = 'level %d window runs past the record' % mip
             break
         if declared is not None and declared != geom:
-            bad = 'mip %d declares %d bytes, geometry says %d' % (mip, declared, geom)
+            bad = 'level %d declares %d bytes, geometry says %d' % (mip, declared, geom)
             break
         mips.append({
             'mip': mip,
             'offset': at,
             'declared': declared,
             'geom': geom,
-            'width': _lum_dim(width, mip),
-            'height': _lum_dim(height, mip),
+            'width': _frame_dim(width, mip),
+            'height': _frame_dim(height, mip),
             'sha16': hashlib.sha256(window).hexdigest()[:16],
         })
         at += geom
@@ -427,7 +497,7 @@ def cmd_raster15(req):
         out['ok'] = False
         out['err'] = bad
         return out
-    out['first_texel'] = list(blob[LUM_HEADER:LUM_HEADER + 4])
+    out['first_payload_word'] = list(blob[header:header + 4])
     out['base_sha16'] = mips[0]['sha16']
     return out
 
@@ -555,7 +625,7 @@ HANDLERS = {
     'rw4': cmd_rw4,
     'gmdl': cmd_gmdl,
     'raster': cmd_raster,
-    'raster15': cmd_raster15,
+    'rasterframe': cmd_rasterframe,
     'manifest': cmd_manifest,
     'worldobj': cmd_worldobj,
     'rw4_file': cmd_rw4_file,
@@ -891,14 +961,16 @@ impl OracleSession {
         self.exchange(&request.to_string())
     }
 
-    /// Asks the driver for its independent `0x15` framing walk over index
-    /// `index`.
+    /// Asks the driver for its independent framing walk over the raster record
+    /// at index `index`, for any of the three measured `fourcc` values.
     ///
     /// Not an oracle -- see the module documentation, "Why one command is NOT
-    /// an oracle at all". It is a second implementation of the framing identity
-    /// in another language, and a disagreement with the crate is a finding.
-    pub fn request_luminance(&mut self, index: usize) -> Result<Json, OracleError> {
-        self.request_record("raster15", index)
+    /// an oracle at all". It is a second transcription of the *measured*
+    /// framing in another language, sharing no constant with `spore-texture`,
+    /// and a disagreement with the crate is a finding rather than something to
+    /// reconcile. It says nothing about the block codec.
+    pub fn request_raster_frame(&mut self, index: usize) -> Result<Json, OracleError> {
+        self.request_record("rasterframe", index)
     }
 
     /// Asks for the whole-file manifest rows.

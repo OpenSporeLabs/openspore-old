@@ -22,13 +22,22 @@
 //! | [`compare::record_bytes`] | do we decompress to the same bytes? | `spore_dbpf::extract_record` | `dbpf.py::getdata` |
 //! | [`compare::rw4`] | do we print the same section-walk line? | `spore_rw4::Rw4::describe` | `rw4.py::describe` |
 //! | [`compare::gmdl`] | do we walk a model the same way? | `spore_gmdl::parse` | `gmdl.py::Gmdl` |
-//! | [`compare::raster`] | do we read the same envelope and pixels? | `spore_texture` | `raster.py`, `dxt5.py` |
+//! | [`compare::raster`] | do we read the same envelope, the same layer count and the same pixels? (the raster oracle's framing is **refuted** — see that module) | `spore_texture` | `raster.py`, `dxt5.py` |
 //! | [`compare::manifest`] | do we build the same rows, and what do we mean by "decodable"? | `ManifestBuilder::from_store` | `manifest.py` |
 //! | [`compare::worldobj`] | what does the oracle see where we have no decoder? | *(none)* | `worldobj.py` |
 //!
 //! The Python oracles are the specification. **They are never modified to make
 //! them agree.** If two implementations disagree, that disagreement is the
 //! deliverable.
+//!
+//! One oracle has since been *refuted by the corpus* rather than by this crate:
+//! `raster.py`'s derived layer count and `dxt5.py`'s 8-byte block both encode a
+//! raster framing that a byte count over 4 386 of 4 386 records rejects (see
+//! `docs/RASTER-FRAMING.md` §2 and [`compare::raster`]). The rule above still
+//! holds — the files are not edited — so the disagreement is now the reported
+//! result of that comparison, classified and attributed per record. The framing
+//! itself is checked against a second transcription of the measured table in
+//! Python instead ([`oracle`], "Why one command is NOT an oracle at all").
 //!
 //! # Running it
 //!
