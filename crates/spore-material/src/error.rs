@@ -9,8 +9,10 @@
 //! * the record **is there but this crate will not decode it as a texture** —
 //!   `png`- and `rw4`-typed records are real records that are not raster
 //!   records, and conflating them is precisely the bug this type prevents;
-//! * the record **is a raster of a format this build does not decode** — the
-//!   `0x15xx` luminance family, which is refused by name.
+//! * the record **is a raster of a format this build has no frame for** — a
+//!   `fourcc` outside the three the corpus contains. All three known raster
+//!   formats decode, so this is a genuinely open case rather than one of the
+//!   families below.
 //!
 //! Each variant names the [`ResourceKey`] it is about, so "while loading X" can
 //! be logged without matching every arm. [`MaterialError::key`] does that.
@@ -82,16 +84,20 @@ pub enum MaterialError {
     /// The record is a raster, and its `fourcc` is a format this build does not
     /// decode.
     ///
-    /// The `0x15xx` family is **luminance**, not BC3: it is a different format,
-    /// not an unrecognised one, and it is refused by name rather than fed to the
-    /// block codec. This is a live case, not a hypothetical one: the documented
-    /// asset `0x00e6bce5:0x40637e03:0x067a07f0` references
-    /// `0x2f4e681c:0x40632902:0x067a07f0`, whose envelope `fourcc` is
-    /// `0x00000015`.
+    /// **Three** raster formats exist in the measured corpus and all three are
+    /// decoded by `spore-texture`: `DXT5` (BC3), `DXT1` (BC1) and `0x15`. So this
+    /// variant is for a record whose format word is *outside* the known set, and
+    /// the message says so with the three that are known rather than naming one.
+    ///
+    /// It used to name `0x15` as the out-of-scope family. That was true when the
+    /// `0x15` family was refused, and the corpus refuted that: 901 of 901 records
+    /// decode. A message that calls a decodable format out of scope sends a
+    /// caller looking for a bug that is not there.
     #[error(
         "material: record `{key}` is a raster with fourcc 0x{fourcc:08x}, which this \
-         build does not decode (want 0x35545844 = 'DXT5'; the 0x15xx luminance family is \
-         a different format and is out of scope)"
+         build has no frame for; the known raster formats are 0x35545844 = 'DXT5' (BC3), \
+         0x31545844 = 'DXT1' (BC1) and 0x00000015 (the uncompressed normal-map family, \
+         all three decoded)"
     )]
     UnsupportedFourcc {
         /// The identity of the refused record.
@@ -102,9 +108,16 @@ pub enum MaterialError {
 
     /// The raster record was reached but refused by the texture layer.
     ///
-    /// Truncation, a zero dimension, a zero mip count, a payload that does not
-    /// divide by the layer stride and every block-codec refusal all land here,
-    /// with `source` naming which.
+    /// Truncation, a zero dimension, a zero mip count, a `field_18` that is not
+    /// the base level's own byte count, a record length that is not the one its
+    /// envelope implies, a level length prefix that disagrees with its level's
+    /// geometry, and every block-codec refusal all land here, with `source`
+    /// naming which.
+    ///
+    /// The old list mentioned "a payload that does not divide by the layer
+    /// stride", which no longer exists: there are no layers, so there is no
+    /// stride to divide by. `TextureError::PayloadNotMultiple` is gone from
+    /// `spore-texture` with it.
     #[error("material: record `{key}`: texture: {source}")]
     Decode {
         /// The identity of the refused record.
@@ -197,7 +210,7 @@ impl MaterialError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use spore_texture::DXT5_FOURCC;
+    use spore_texture::{DXT1_FOURCC, DXT5_FOURCC};
 
     const KEY: ResourceKey = ResourceKey::new(RASTER_TYPE, 0x4063_2900, 0x067A_07F0);
 
@@ -218,9 +231,12 @@ mod tests {
         assert_eq!(wrong_type.key(), Some(KEY));
         assert!(wrong_type.is_unsupported_format());
 
+        // A fourcc outside the three the corpus contains. It is deliberately NOT
+        // `0x00000015`: that family decodes, so naming it here would be the
+        // refuted premise this crate stopped asserting.
         let fourcc = MaterialError::UnsupportedFourcc {
             key: KEY,
-            fourcc: 0x0000_0015,
+            fourcc: 0x1234_5678,
         };
         assert_eq!(fourcc.key(), Some(KEY));
         assert!(fourcc.is_unsupported_format());
@@ -259,17 +275,32 @@ mod tests {
     }
 
     #[test]
-    fn a_refused_fourcc_names_the_word_the_wanted_word_and_the_family() {
+    fn a_refused_fourcc_names_the_word_and_every_format_this_build_does_read() {
+        // The message used to name `DXT5` as the only wanted word and call the
+        // `0x15` family "out of scope". Both were refuted: the `0x15` family
+        // decodes (901/901 records) and `DXT1` decodes too. A refusal message
+        // that misreports what IS supported sends a caller hunting a bug that is
+        // not there, so all three are named and the test pins them.
         let text = MaterialError::UnsupportedFourcc {
             key: KEY,
-            fourcc: 0x15,
+            fourcc: 0x1234_5678,
         }
         .to_string();
-        assert!(text.contains("0x00000015"), "got {text:?}");
-        assert!(text.contains("luminance"), "got {text:?}");
+        assert!(text.contains("0x12345678"), "got {text:?}");
+        for (fourcc, spelling) in [
+            (DXT5_FOURCC, "0x35545844"),
+            (DXT1_FOURCC, "0x31545844"),
+            (spore_texture::LUMINANCE_FOURCC, "0x00000015"),
+        ] {
+            assert!(
+                text.contains(spelling),
+                "the message must name {spelling} (0x{fourcc:08x}) as a format this build \
+                 reads; got {text:?}"
+            );
+        }
         assert!(
-            text.contains(&format!("0x{:08x}", DXT5_FOURCC)),
-            "got {text:?}"
+            text.contains("all three decoded"),
+            "and must say they are decoded rather than merely known; got {text:?}"
         );
     }
 }

@@ -16,30 +16,34 @@
 //! # What it pins, and what it stopped pinning
 //!
 //! This test used to assert that the documented model's three texture
-//! references resolve to **two** 512x512 DXT5 images and **one** typed
-//! `UnsupportedFourcc` refusal, on the stated grounds that
+//! references resolve to **two** 512x512 DXT5 images with **two layers each**
+//! and **one** typed `UnsupportedFourcc` refusal, on the stated grounds that
 //! `0x2f4e681c:0x40632902:0x067a07f0` is a *1024x1024* `0x15` record.
 //!
-//! **Both halves of that were wrong, and the corpus corrected them.**
+//! **All three halves of that were wrong, and the corpus corrected them.**
 //! `spore-texture` established the `0x15` family's framing over 901 of 901
-//! records and now decodes it, so the third reference resolves; and the record
-//! is **512x512**, not 1024x1024 — `Spore_Content.package` contains no 1024²
-//! raster of either format. All three references now resolve.
+//! records and now decodes it, so the third reference resolves; the record is
+//! **512x512**, not 1024x1024 — `Spore_Content.package` contains no 1024² raster
+//! of either format; and the two `DXT5` records hold **one chain each**, because
+//! the 8-byte block stride that produced a second layer was refuted. They carry
+//! **real colour**: 92 / 121 / 73 and 184 / 238 / 198 distinct values in lanes
+//! 0 / 1 / 2, and 4 436 distinct RGB triples in the first one's base mip.
 //!
-//! The test is updated rather than deleted, and the old expectation is recorded
+//! The test is updated rather than deleted, and the old expectations are recorded
 //! as refuted in `docs/MATERIAL-ROLES.md` §8. A test asserting a specification
 //! the real data refutes is exactly the "stale claim contradicting its own
 //! decoder" defect, and it is worse than no test.
 //!
-//! What it pins now: three 512x512 images — two 2-layer DXT5 and one 1-layer
-//! `0x15` — with roles `(mask, mask, normal)`, an even per-mesh cut, and 3 of 3
+//! What it pins now: three 512x512 images — two `colour-and-mask` `DXT5` and one
+//! `tangent-space-normal` `0x15`, **one chain each** — with roles
+//! `(colour-and-mask, colour-and-mask, normal)`, an even per-mesh cut, and 3 of 3
 //! ordinal agreements. See also `tests/real_corpus_roles.rs`, which measures the
 //! same asset over the whole package.
 
 use spore_assets::ContentStore;
 use spore_core::ResourceKey;
 use spore_gmdl::GMDL_TYPE;
-use spore_material::{claims, resolve_model_record, resolve_texture};
+use spore_material::{claims, resolve_model_record, resolve_texture, Lane, TextureRole};
 use spore_texture::RASTER_TYPE;
 
 /// The documented asset.
@@ -108,10 +112,41 @@ fn the_documented_asset_resolves_three_images_with_measured_roles() {
         );
         assert_eq!(texture.mip_count, 10, "the real records carry ten mips");
         assert_eq!(
-            texture.layer_count, 2,
-            "the derived layer count is 2 on every real 512x512 record"
+            texture.layer_count, 1,
+            "ONE chain. The old expectation of 2 came from charging 8 bytes per \
+             4x4 block, which split one base mip into two half-pictures."
+        );
+        assert_eq!(texture.layers.len(), 1);
+        assert_eq!(texture.layer(1), None, "there is no second chain");
+        assert_eq!(
+            texture.channels().len(),
+            4,
+            "one chain of four lanes; the old 'eight' was two records x two layers"
         );
         assert_eq!(texture.pixel_len(), 512 * 512 * 4);
+
+        // **The colour is real.** This is the refutation, asserted on the asset
+        // this repository documents end to end. Every lane takes many values and
+        // green and blue are not the constants the old codec produced.
+        assert_eq!(texture.role, TextureRole::ColourAndMask);
+        assert!(
+            texture.statistics.distinct[Lane::Green.index()] > 1,
+            "green is not a constant lane: {}",
+            texture.statistics.distinct[Lane::Green.index()]
+        );
+        assert!(
+            texture.statistics.distinct[Lane::Blue.index()] > 1,
+            "blue is not a constant lane"
+        );
+        assert!(texture
+            .mask_plane_varies()
+            .expect("a decoded record has an answer"));
+        // And the four channel spellings, none of which may say "degenerate".
+        let channels = texture.channels();
+        assert!(channels[..3]
+            .iter()
+            .all(|c| c.role == spore_material::ChannelRole::ColourPlane));
+        assert!(channels.iter().all(|c| !c.role.purpose_established()));
     }
 
     // The third reference is the `0x15` family: a tangent-space normal map,
@@ -133,13 +168,18 @@ fn the_documented_asset_resolves_three_images_with_measured_roles() {
     assert_eq!(normal.mip_count, 10);
     assert_eq!(
         normal.layer_count, 1,
-        "the 0x15 family has one layer and no layer headers"
+        "the 0x15 family has one chain and no layer headers"
     );
-    assert_eq!(normal.role, spore_material::TextureRole::TangentSpaceNormal);
+    assert_eq!(normal.role, TextureRole::TangentSpaceNormal);
     assert_eq!(
         normal.channels()[0].role,
         spore_material::ChannelRole::NormalZ,
         "file byte 0 is Z"
+    );
+    assert_eq!(
+        normal.mask_plane_varies(),
+        None,
+        "the 0x15 family's fourth lane is a different question, and it is unknown"
     );
     assert!(normal.pixels_decoded());
 
@@ -148,9 +188,9 @@ fn the_documented_asset_resolves_three_images_with_measured_roles() {
     assert_eq!(
         resolved.roles(),
         vec![vec![
-            spore_material::TextureRole::LayeredAlphaMask,
-            spore_material::TextureRole::LayeredAlphaMask,
-            spore_material::TextureRole::TangentSpaceNormal,
+            TextureRole::ColourAndMask,
+            TextureRole::ColourAndMask,
+            TextureRole::TangentSpaceNormal,
         ]]
     );
     assert_eq!(
@@ -159,25 +199,76 @@ fn the_documented_asset_resolves_three_images_with_measured_roles() {
     );
     assert_eq!(
         resolved.observed_shape,
-        spore_material::TexSetShape::MaskMaskNormal
+        spore_material::TexSetShape::ColourAndMaskTwiceThenNormal
+    );
+    assert_eq!(
+        resolved.observed_shape.as_str(),
+        "(colour-and-mask, colour-and-mask, normal)"
     );
     assert!(resolved.ordinal_agreement.all_agree());
     assert_eq!(resolved.ordinal_agreement.compared, 3);
 
-    // One mesh, unnamed, with five non-findings. A slot carries no role at all:
-    // a role is a property of the resolved record, and this is measured per
-    // record -- see `ResolvedTexture::role` and the role_census below.
+    // One mesh, unnamed, with SIX non-findings. A slot carries no role at all: a
+    // role is a property of the resolved record, and this is measured per record
+    // -- see `ResolvedTexture::role` and the role_census below.
+    //
+    // **This count was wrong here and is now enumerated.** It used to say 5,
+    // which was a floor written before the third `BindingScope` arm existed:
+    // `per_mesh_cut_contradicted_by_record_ordinals` became a sixth non-finding on
+    // the `PerMeshBlock` path — "no slot contradicted the cut" — and a bare
+    // number cannot notice a subject being added. The subject list is the
+    // assertion now; the count follows from it.
     assert_eq!(resolved.meshes.len(), 1);
     let material = &resolved.meshes[0];
     assert_eq!(material.material_id, 0x407D_FDDB);
     assert_eq!(material.name, None, "no registry names this id");
     assert_eq!(material.slots.len(), 3);
-    assert_eq!(material.unknowns().count(), 5);
+    let material_unknowns: Vec<&str> = material
+        .unknowns()
+        .map(|claim| claim.subject.as_str())
+        .collect();
+    assert_eq!(
+        material_unknowns,
+        vec![
+            claims::MATERIAL_NAME,
+            claims::MATERIAL_ID_MEANING,
+            claims::SAMPLER_ROLE,
+            claims::MATERIAL_TEXTURE_OWNERSHIP,
+            claims::MATERIAL_BLOCK_IS_MESH,
+            claims::CUT_CONTRADICTED_BY_RECORD,
+        ],
+        "six non-findings, enumerated: a floor could not notice the sixth"
+    );
+    // The sixth is the *non-finding* arm: the record was asked whether the cut was
+    // its block boundaries and it agreed, which is not the same as nobody asking.
+    let contradiction = material
+        .claim(claims::CUT_CONTRADICTED_BY_RECORD)
+        .expect("subject");
+    assert!(contradiction.fact.is_unavailable());
+    assert_eq!(
+        contradiction.fact.reason(),
+        Some(claims::NO_CUT_CONTRADICTION)
+    );
     let material_name = material.claim(claims::MATERIAL_NAME).expect("subject");
     assert!(material_name.fact.is_unavailable());
     assert_eq!(
         material_name.fact.reason(),
         Some(claims::NO_MATERIAL_REGISTRY)
+    );
+
+    // The refutations are recorded as values on a real record, not only in the
+    // table: a caller reading one `ResolvedTexture` learns what changed.
+    let refutation = resolved.roles()[0][0];
+    assert_eq!(refutation, TextureRole::ColourAndMask);
+    let texture = resolved.textures[0].as_ref().expect("resolves");
+    assert!(
+        texture
+            .claim(claims::DXT5_CARRIES_NO_COLOUR)
+            .expect("subject")
+            .fact
+            .is_available(),
+        "'these records carry no colour' is recorded as a REFUTATION, which carries \
+         a value; a non-finding would be indistinguishable from never having looked"
     );
 
     // And the same record read through the single-reference entry point behaves

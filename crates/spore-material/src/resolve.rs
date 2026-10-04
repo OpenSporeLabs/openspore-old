@@ -12,9 +12,11 @@
 //!    something other than [`spore_texture::RASTER_TYPE`] is refused *by type*,
 //!    even when the record exists there: `png`-typed records are raw PNG and
 //!    `rw4`-typed records are RenderWare containers, and neither is a raster.
-//! 3. **The base image is published**, together with the mip and layer counts and
-//!    the claim set. A record with more than one layer, or with a mip chain, is
-//!    not flattened into a guess about which layer is which role.
+//! 3. **The base image is published**, together with the mip count and the claim
+//!    set. There is exactly **one** chain of mip levels per record — see
+//!    [`claims::LAYER_COUNT_IS_DERIVED`], whose recorded value is the refutation
+//!    of the old two-layer model — so nothing is flattened into a guess about
+//!    which layer is which role.
 //!
 //! # Failures are per reference, never per batch
 //!
@@ -22,11 +24,8 @@
 //! order, and a failing reference never removes a succeeding one. That is not a
 //! convenience: it is what the documented asset requires. `osptool describe` on
 //! `0x00e6bce5:0x40637e03:0x067a07f0` (2026-10-04) reports three texture
-//! references, and `osptool describe` on
-//! `0x2f4e681c:0x40632902:0x067a07f0` refuses it with
-//! `unsupported fourcc 0x00000015`. A resolver that stopped at the first failure
-//! would return **no textures at all** for the one asset this repository
-//! documents end to end.
+//! references, and a resolver that stopped at the first failure would return
+//! **no textures at all** for the one asset this repository documents end to end.
 
 use spore_assets::ContentStore;
 use spore_core::evidence::Fact;
@@ -35,28 +34,29 @@ use spore_core::ResourceKey;
 use spore_gmdl::{GmdlModel, GmdlTextureRef, GMDL_TYPE};
 use spore_texture::{
     decode_raster, parse_envelope, MipImage, RasterEnvelope, RasterImage, TextureError,
-    DXT5_FOURCC, RASTER_TYPE,
+    DXT5_FOURCC, LUMINANCE_FOURCC, RASTER_TYPE,
 };
 
 use crate::claims;
 use crate::error::MaterialError;
 use crate::material::{model_materials, BindingScope, MaterialClaim, MeshMaterial};
-use crate::role::{self, ChannelBinding, MipStatistics, TextureRole};
+use crate::role::{self, ChannelBinding, Lane, MipStatistics, TextureRole};
 
 /// One resolved texture: bytes, a content role, provenance, and the boundary of
 /// what is known.
 ///
-/// # Layers are surfaces, not a copy
+/// # One chain, not a layer stack
 ///
-/// [`Self::layers`] holds the base mip of **every** layer, in record order.
-/// That is a change of shape, not of meaning: the decode already produced them
-/// and the previous version published layer 0 and threw the rest away. A DXT5
-/// record's two layers differ byte-for-byte in 1233 of 1233 referenced records,
-/// so discarding layer 1 discarded a different image, not a duplicate — see
-/// [`claims::DXT5_LAYERS_ARE_DISTINCT`].
+/// [`Self::layers`] holds the base mip of **every chain** in the record, in
+/// record order, and for every raster record in this corpus that is **exactly
+/// one element**. It is a `Vec` because the decode's shape is, and because a
+/// caller written against the old two-layer reading keeps compiling — but
+/// `layers.len() == layer_count == 1` is the *finding*, not an accident. See
+/// [`claims::LAYER_COUNT_IS_DERIVED`], whose recorded value is the refutation of
+/// the "two layers" model, and [`channels`] for the consequence: **four** channel
+/// bindings per texture, not eight.
 ///
-/// [`Self::image`] remains, as the base mip of layer 0, because it is what
-/// existing callers read.
+/// [`Self::image`] is that single base mip, and it is what existing callers read.
 ///
 /// # The role is checked against this record's own bytes
 ///
@@ -75,7 +75,7 @@ pub struct ResolvedTexture {
     pub key: ResourceKey,
     /// Which record family this decoded as.
     pub kind: TextureKind,
-    /// The base mip (mip 0) of layer 0, RGBA8 row-major.
+    /// The base mip (mip 0) of the record's one chain, RGBA8 row-major.
     ///
     /// **Copy cost**: this is a clone, because the decode owns the whole mip
     /// chain. For a 512² texture that is 1 MiB per resolved texture, which is
@@ -83,15 +83,18 @@ pub struct ResolvedTexture {
     /// should call [`spore_texture::decode_raster`] on
     /// [`ContentStore::read`]'s bytes itself.
     pub image: MipImage,
-    /// The base mip of **every** layer, in record order.
+    /// The base mip of **every** chain, in record order.
     ///
     /// Always length [`Self::layer_count`], except from [`inspect_envelope`],
     /// which reads a header and stops: there it is empty and
-    /// [`Self::pixels_decoded`] is `false`.
+    /// [`Self::pixels_decoded`] is `false`. For a decoded raster record in this
+    /// corpus it is length **1**.
     pub layers: Vec<MipImage>,
     /// What this record's own texels are. See [`TextureRole`].
     pub role: TextureRole,
-    /// Per-lane statistics of layer 0's base mip, gathered in one pass.
+    /// Per-lane statistics of the base mip, gathered in one pass: distinct-value
+    /// counts, extremes, means, and the cross-lane sums behind
+    /// [`MipStatistics::correlation`].
     ///
     /// The evidence behind [`Self::role`], kept so a caller can see *why* a role
     /// was assigned rather than having to trust it. `texels == 0` when
@@ -100,11 +103,13 @@ pub struct ResolvedTexture {
     pub statistics: MipStatistics,
     /// The envelope the decode ran under, verbatim.
     pub envelope: RasterEnvelope,
-    /// Mip levels per layer, from the envelope. Equals `envelope.mip_count`.
+    /// Mip levels in the record's one chain, from the envelope. Equals
+    /// `envelope.mip_count`.
     pub mip_count: usize,
-    /// Layers in the record. **Derived** from the record size, never read from a
-    /// header field — see [`claims::LAYER_COUNT_IS_DERIVED`]. `0` from
-    /// [`inspect_envelope`], which never derives it.
+    /// Chains in the record. **Always 1** for a decoded raster record — see
+    /// [`claims::LAYER_COUNT_IS_DERIVED`]. `0` from [`inspect_envelope`], which
+    /// reads no payload and therefore states no count at all rather than
+    /// reporting the count it would have derived.
     pub layer_count: usize,
     /// Whether [`Self::image`] holds decoded texels. See
     /// [`Self::pixels_decoded`].
@@ -185,19 +190,42 @@ impl ResolvedTexture {
         self.image.pixels.len()
     }
 
-    /// The base mip of one layer, or `None` when the index is out of range.
+    /// The base mip of one chain, or `None` when the index is out of range.
     ///
     /// An out-of-range index is `None` rather than a panic or a substitute
-    /// layer: a renderer asking for layer 2 of a 1-layer record is asking a
-    /// question the record does not answer.
+    /// chain: a renderer asking for chain 1 of a 1-chain record is asking a
+    /// question the record does not answer. Under the refuted two-layer model
+    /// this returned a real image for every `DXT5` record, which is why the
+    /// corpus census for this file asserts that it returns `None` at index 1.
     pub fn layer(&self, index: usize) -> Option<&MipImage> {
         self.layers.get(index)
     }
 
-    /// Every channel of every layer, in `(layer, file-lane)` order.
+    /// Whether this record's fourth lane varies.
     ///
-    /// `4 * layer_count` entries. The order is the file's, so a `0x15` record's
-    /// first channel is the normal's **Z**; see [`crate::ChannelRole::NormalZ`].
+    /// `Some(true)` and `Some(false)` for [`TextureRole::ColourAndMask`], and
+    /// `None` for every other role — including [`TextureRole::Unidentified`] and
+    /// the `0x15` family's normal map, whose fourth lane is a *different* lane
+    /// with a different question attached (see
+    /// [`claims::MASK_LAYER_PURPOSE`] for why it is unknown).
+    ///
+    /// This exists because the role may not assume the answer: **46 of the 1 747
+    /// `DXT5` records of `Spore_Content.package` hold a constant, all-zero
+    /// fourth plane.** A signature that required a varying mask would have
+    /// refused them, so the per-record answer is reported here instead and the
+    /// signature deliberately says nothing about this lane.
+    pub fn mask_plane_varies(&self) -> Option<bool> {
+        if self.role != TextureRole::ColourAndMask || self.statistics.texels == 0 {
+            return None;
+        }
+        Some(!self.statistics.is_constant(Lane::Alpha))
+    }
+
+    /// Every channel of every chain, in `(chain, file-lane)` order.
+    ///
+    /// `4 * layer_count` entries, so **4** for a decoded raster record in this
+    /// corpus. The order is the file's, so a `0x15` record's first channel is the
+    /// normal's **Z**; see [`crate::ChannelRole::NormalZ`].
     pub fn channels(&self) -> Vec<ChannelBinding> {
         self.role.channels(self.layers.len())
     }
@@ -397,7 +425,7 @@ impl ModelTextures {
     /// Every distinct role this model's textures resolved to, with counts.
     ///
     /// A summary line, for a log or a report: "1 tangent-space-normal,
-    /// 2 layered-alpha-mask, 0 unidentified".
+    /// 2 colour-and-mask, 0 unidentified".
     pub fn role_census(&self) -> Vec<(TextureRole, usize)> {
         let mut counts: Vec<(TextureRole, usize)> = Vec::new();
         for entry in &self.textures {
@@ -481,7 +509,7 @@ pub fn inspect_envelope(
         claims::LAYER_COUNT_IS_DERIVED,
         claims::graded(
             claims::LAYER_COUNT_IS_DERIVED,
-            claims::PROV_MATERIALS_DESIGN,
+            claims::PROV_TEXTURE_CLAIMS,
             LAYER_COUNT_TEXT,
         ),
     ));
@@ -497,7 +525,7 @@ pub fn inspect_envelope(
             height: envelope.height,
             pixels: Vec::new(),
         },
-        // Likewise no layers: `layer_count` is 0 and `layers` is empty, which
+        // Likewise no chains: `layer_count` is 0 and `layers` is empty, which
         // agree. `layers.len()` is what `channels()` iterates, so an empty list
         // here means "no channel is claimed", not "every channel is unknown".
         layers: Vec::new(),
@@ -507,13 +535,12 @@ pub fn inspect_envelope(
         // alone. This is the crate's "we did not look", not "we looked and found
         // nothing".
         role: TextureRole::Unidentified,
-        statistics: MipStatistics::of(&MipImage {
-            width: 0,
-            height: 0,
-            pixels: Vec::new(),
-        }),
+        statistics: MipStatistics::empty(),
         envelope,
         mip_count: envelope.mip_count as usize,
+        // Zero, and deliberately not 1: a full decode answers this with 1, and a
+        // header read has not looked at anything that could answer it. `None`
+        // would have been better than a field, but the field is the API.
         layer_count: 0,
         pixels_decoded: false,
         claims: facts,
@@ -625,7 +652,9 @@ const SHAPE_TEXT: &str =
      records the repository's Python oracle walks. Recorded here as a corpus regularity, NOT as \
      the basis of a role: the second entry is DXT5 in 1922 sets and 0x15 in 459, so an ordinal \
      does not determine the content. What this model actually holds is in \
-     ModelTextures::observed_shape.";
+     ModelTextures::observed_shape. The names are fourccs, not roles: a DXT5 entry is graded \
+     colour-and-mask here and a 0x15 entry a tangent-space normal map, both read from each \
+     record's own bytes.";
 
 /// The corpus statement about the two independent ordinals.
 const ORDINAL_TEXT: &str =
@@ -641,12 +670,20 @@ const ORDINAL_TEXT: &str =
 /// quotation of the corpus. Two variants match the corpus measurement; the
 /// third is what a divergence looks like, and it is a variant rather than an
 /// error because a divergence is a finding.
+///
+/// The two named variants were **renamed on 2026-10-05**, from `MaskNormal` and
+/// `MaskMaskNormal`. "Mask" named the refuted two-layer model: the records in
+/// those slots are colour images with a fourth plane, and the two slots of a
+/// three-entry set are two *records*, not two layers of one. `as_str` keeps the
+/// old shapes visible in a log line so a reader can match a line printed before
+/// the rename against one printed after it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TexSetShape {
-    /// `(mask, normal)` — the 459-set shape in the corpus.
-    MaskNormal,
-    /// `(mask, mask, normal)` — the 1922-set shape in the corpus.
-    MaskMaskNormal,
+    /// `(colour-and-mask, normal)` — the 459-set shape in the corpus.
+    ColourAndMaskThenNormal,
+    /// `(colour-and-mask, colour-and-mask, normal)` — the 1922-set shape in the
+    /// corpus.
+    ColourAndMaskTwiceThenNormal,
     /// Something else. Carries the roles actually observed, in slot order.
     Divergent(Vec<TextureRole>),
     /// The shape cannot be isolated: no mesh, no references, or no even cut, so
@@ -661,14 +698,17 @@ pub enum TexSetShape {
 impl TexSetShape {
     /// Whether this shape is one of the two the corpus measured.
     pub fn matches_corpus(&self) -> bool {
-        matches!(self, Self::MaskNormal | Self::MaskMaskNormal)
+        matches!(
+            self,
+            Self::ColourAndMaskThenNormal | Self::ColourAndMaskTwiceThenNormal
+        )
     }
 
     /// The canonical spelling, for logs and JSON.
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::MaskNormal => "(mask, normal)",
-            Self::MaskMaskNormal => "(mask, mask, normal)",
+            Self::ColourAndMaskThenNormal => "(colour-and-mask, normal)",
+            Self::ColourAndMaskTwiceThenNormal => "(colour-and-mask, colour-and-mask, normal)",
             Self::Divergent(_) => "divergent",
             Self::Unavailable => "unavailable",
         }
@@ -727,11 +767,13 @@ fn observe_shape(
                 .map_or(TextureRole::Unidentified, |texture| texture.role)
         })
         .collect();
-    let mask = TextureRole::LayeredAlphaMask;
+    let colour = TextureRole::ColourAndMask;
     let normal = TextureRole::TangentSpaceNormal;
     match roles.as_slice() {
-        [a, b] if *a == mask && *b == normal => TexSetShape::MaskNormal,
-        [a, b, c] if *a == mask && *b == mask && *c == normal => TexSetShape::MaskMaskNormal,
+        [a, b] if *a == colour && *b == normal => TexSetShape::ColourAndMaskThenNormal,
+        [a, b, c] if *a == colour && *b == colour && *c == normal => {
+            TexSetShape::ColourAndMaskTwiceThenNormal
+        }
         _ => TexSetShape::Divergent(roles),
     }
 }
@@ -809,11 +851,14 @@ fn build_resolved(
     image: RasterImage,
 ) -> Result<ResolvedTexture, MaterialError> {
     let envelope = image.envelope;
-    // The base mip of EVERY layer, not just the first: a DXT5 record's two
-    // layers differ byte-for-byte in 1233/1233 referenced records, so layer 1 is
-    // a different image rather than a spare copy. Cloned out of the decode,
-    // which is the price of a self-contained value; a caller that wants the
-    // whole chain should call `spore_texture::decode_raster` itself.
+    // The base mip of EVERY chain in the record, which for a raster record in
+    // this corpus is exactly one: `spore-texture` verifies the record's length
+    // against a one-chain framing identity rather than dividing a payload to find
+    // a layer count, so there is nothing here to derive and nothing to discard.
+    // See `claims::LAYER_COUNT_IS_DERIVED`, whose recorded value is the
+    // refutation of the old two-chain reading. Cloned out of the decode, which is
+    // the price of a self-contained value; a caller that wants the whole chain
+    // should call `spore_texture::decode_raster` itself.
     let mut layers: Vec<MipImage> = Vec::with_capacity(image.layers.len());
     for layer in &image.layers {
         layers.push(
@@ -837,7 +882,7 @@ fn build_resolved(
     let statistics = MipStatistics::of(&base);
     let role = role::classify(envelope.fourcc, &statistics);
     debug_assert!(
-        role_text_agrees_with_statistics(role, &statistics),
+        role_text_agrees_with_statistics(envelope.fourcc, role, &statistics),
         "the recorded role text must agree with the statistics it describes"
     );
 
@@ -846,7 +891,7 @@ fn build_resolved(
         claims::LAYER_COUNT_IS_DERIVED,
         claims::graded(
             claims::LAYER_COUNT_IS_DERIVED,
-            claims::PROV_MATERIALS_DESIGN,
+            claims::PROV_TEXTURE_CLAIMS,
             LAYER_COUNT_TEXT,
         ),
     ));
@@ -854,7 +899,7 @@ fn build_resolved(
         claims::DXT5_SPEC_DEVIATIONS,
         claims::graded(
             claims::DXT5_SPEC_DEVIATIONS,
-            claims::PROV_DXT5_ORACLE,
+            claims::PROV_TEXTURE_CLAIMS,
             DXT5_DEVIATION_TEXT,
         ),
     ));
@@ -867,6 +912,22 @@ fn build_resolved(
         ),
     ));
     facts.push(normal_map_claim());
+    facts.push(TextureClaim::new(
+        claims::COLOUR_AND_MASK_CONTENT,
+        claims::graded(
+            claims::COLOUR_AND_MASK_CONTENT,
+            claims::PROV_MATERIAL_ROLES,
+            COLOUR_AND_MASK_TEXT,
+        ),
+    ));
+    facts.push(TextureClaim::new(
+        claims::MASK_PLANE_INDEPENDENT_OF_COLOUR,
+        claims::graded(
+            claims::MASK_PLANE_INDEPENDENT_OF_COLOUR,
+            claims::PROV_MATERIAL_ROLES,
+            MASK_PLANE_INDEPENDENCE_TEXT,
+        ),
+    ));
     facts.push(TextureClaim::new(
         claims::DXT5_CARRIES_NO_COLOUR,
         claims::graded(
@@ -928,10 +989,13 @@ fn header_claims(key: &ResourceKey, assumed_type: u32) -> Vec<TextureClaim> {
             claims::ENVELOPE_FIELD_10_MEANING,
             claims::non_finding(claims::ENVELOPE_FIELD_10_MEANING),
         ),
-        TextureClaim::new(
-            claims::ENVELOPE_FIELD_18_MEANING,
-            claims::non_finding(claims::ENVELOPE_FIELD_18_MEANING),
-        ),
+        // Delegated, like the luminance family below. `field_18` used to be a
+        // local non-finding ("meaning not established") whose real state was
+        // already measured upstream: it is the base level's own byte count in
+        // all three formats, verified over 4 386 records, and the decoder reads
+        // it as a cross-check. Restating it as unknown would be this crate
+        // disagreeing with its own decoder for the second time.
+        TextureClaim::new(claims::ENVELOPE_FIELD_18_MEANING, envelope_field_18_claim()),
         TextureClaim::new(
             claims::ENVELOPE_FIELD_1C_MEANING,
             claims::non_finding(claims::ENVELOPE_FIELD_1C_MEANING),
@@ -942,6 +1006,25 @@ fn header_claims(key: &ResourceKey, assumed_type: u32) -> Vec<TextureClaim> {
         // VERIFIED value, and restating it locally is exactly how it went stale.
         TextureClaim::new(claims::LUMINANCE_FOURCC_FAMILY, luminance_family_claim()),
     ]
+}
+
+/// `field_18`'s meaning, taken from `spore_texture`'s own claim table.
+///
+/// The third time this crate has delegated a fact about the raster envelope, and
+/// the second time it was about to contradict its own decoder. The grade must
+/// survive delegation: this crate files the republished fact under a subject, and
+/// a silent downgrade upstream would contradict this table.
+fn envelope_field_18_claim() -> Fact<&'static str> {
+    use spore_texture::claims as tex;
+    debug_assert_eq!(
+        tex::ENVELOPE_FIELD_18_MEANING,
+        claims::ENVELOPE_FIELD_18_MEANING,
+        "the republished subject must be the one this claim is filed under"
+    );
+    tex::claim(tex::ENVELOPE_FIELD_18_MEANING)
+        .expect("spore-texture always declares the field_18 claim")
+        .meaning
+        .clone()
 }
 
 /// The `0x15` family's fact, taken from `spore-texture`'s own claim table.
@@ -1013,35 +1096,69 @@ const ASSUMED_TYPE_TEXT: &str =
      the caller supplied one and this decode succeeded under it. A successful decode shows \
      the bytes fit; it does not make the reference declare the type.";
 
-/// The observation recorded for the block codec's departures from the spec.
+/// The observation recorded for the refuted block codec.
 const DXT5_DEVIATION_TEXT: &str =
-    "Spore's blocks are shaped like BC3/DXT5 and are NOT decoded like BC3/DXT5: four \
-     documented departures from the published specification are reproduced on purpose, so \
-     every decoded texel has red in {0,8}. A codec 'corrected' to the spec would change \
-     every pixel the game draws.";
+    "REFUTED, 2026-10-05. Spore's blocks ARE BC3. The four departures from the published \
+     specification that this crate previously reproduced on purpose -- an inverted \
+     palette-size test, R5G5B5 channel reads, a 6/2 alpha blend on the endpoint codes and \
+     no alpha0 == alpha1 collapse -- were real and byte-pinned, and that is exactly the \
+     problem: two implementations agreeing with each other on synthetic input produced a \
+     specification no record supports. Every recorded level prefix in every DXT5 record is \
+     the 16-byte-per-block figure, and that byte count is what refuted the 8-byte rule.";
 
-/// The observation recorded for the derived layer count.
-const LAYER_COUNT_TEXT: &str = "A raster record stores no layer count, so the count is derived \
-     from the record size by the per-format rule in spore-texture: DXT5 divides its payload \
-     by the layer stride, and the 0x15 family requires the record to match its framing \
-     exactly, which yields 1. Over the corpus the decodable DXT5 records yield 2 (1374 of \
-     1747; the other 373 are 12 bytes short of two layers and are refused by the division).";
+/// The observation recorded for the refuted layer count.
+const LAYER_COUNT_TEXT: &str =
+    "REFUTED, 2026-10-05: there is exactly ONE chain of mip levels per record, and nothing \
+     is derived. The previous model divided the payload by the layer stride and reported 2 \
+     on every DXT5 record; that was a double error which cancelled exactly -- 8 bytes per \
+     4x4 block instead of 16 makes one picture look like two half-pictures. spore-texture \
+     closes an exact record-length identity in 4386 of 4386 records across \
+     Spore_Content.package and Spore_EP1_Content_01.package, so layers.len() is 1 and this \
+     crate has no layer count to derive. Inspecting an envelope reports 0, not 1, because a \
+     header read has looked at nothing that could answer it.";
 
-/// The observation recorded for a DXT5 record's colour degeneracy.
+/// The observation recorded for the refuted 'DXT5 carries no colour' claim.
 const DXT5_NO_COLOUR_TEXT: &str =
-    "Not a colour map, and not by assumption: over 1374 decodable DXT5 records the decoded \
-     red channel takes exactly two values and green and blue exactly one, and a stride \
-     sample of 477771 palette entries from every DXT5 block in Spore_Content yields exactly \
-     two distinct RGB triples, (0,0,0) and (8,0,0). The degeneracy is structural -- the \
-     byte-pinned codec reads the colour field as two 6-bit values and its green and blue \
-     terms can only be zero -- so no input produces a third colour.";
+    "REFUTED, 2026-10-05, and this text is the refutation. The claim was a tautology of a \
+     broken codec rather than a measurement of any record: green and blue read as zero under \
+     R5G5B5 on a 6-BIT word BY CONSTRUCTION, because a 6-bit value cannot set bits 10..19. \
+     Read as BC3, over all 1747 DXT5 records of Spore_Content.package, every record's lane 0 \
+     takes at least 32 distinct values (max 235), lane 1 at least 64 (max 255) and lane 2 at \
+     least 32 (max 235); 0 of 1747 have a colour lane of two values or fewer; and the \
+     documented record 0x2f4e681c:0x40632900:0x067a07f0 carries 4436 distinct RGB triples in \
+     one 512x512 base mip. The old 'exactly 2 distinct RGB triples, (0,0,0) and (8,0,0)' was \
+     what the broken codec produced.";
 
-/// The observation recorded for a DXT5 record's two layers.
+/// The observation recorded for the refuted 'two layers are distinct' claim.
 const DXT5_LAYERS_TEXT: &str =
-    "Layer 0 and layer 1 of the same record differ byte-for-byte in 1233 of 1233 referenced \
-     record-instances, so they are two surfaces rather than one image and a copy. No gmdl \
-     texture set names the same DXT5 record twice (1922 of 1922 three-entry sets), so \
-     publishing only layer 0 discarded a different image.";
+    "REFUTED, 2026-10-05, and this text is the refutation. There are no two layers: every \
+     raster record in the corpus is one chain, so this crate has nothing to compare. The old \
+     1233-of-1233 measurement was real arithmetic over the wrong thing -- it compared the two \
+     HALVES OF ONE PICTURE that an 8-byte block stride had split in two, which is why they \
+     differed byte for byte. What survives is a different statement: a model's two DXT5 \
+     records are two distinct RECORDS, and the two alpha planes the old model called 'layer \
+     0' and 'layer 1' were the first and second halves of a single base mip.";
+
+/// The observation recorded for the colour-and-mask reading of a BC3 record.
+const COLOUR_AND_MASK_TEXT: &str =
+    "Read as BC3, a DXT5 record's lanes 0-2 are a three-channel colour image and lane 3 is a \
+     fourth plane that does not vary with them. Assigned by checking THIS record's own base \
+     mip -- each colour lane takes at least 8 distinct values, against a corpus minimum of 32 \
+     -- not by its position in the model's texture list and not by its format word alone. The \
+     fourth lane is deliberately NOT part of the check: 46 of the 1747 corpus records hold a \
+     constant, all-zero fourth plane, so requiring one would refuse 46 real records. Whether \
+     this record's own fourth plane varies is on ResolvedTexture::mask_plane_varies. Graded at \
+     the BC3 codec's own grade and no higher; see colour_and_mask_content.";
+
+/// The observation recorded for the fourth plane's independence from the colour planes.
+const MASK_PLANE_INDEPENDENCE_TEXT: &str =
+    "Over all 1747 DXT5 records of Spore_Content.package the mean absolute colour-to-alpha \
+     correlation has median 0.067 and maximum 0.539, against a median mutual correlation of \
+     0.510 among the colour lanes themselves. The numbers behind this are per-record and \
+     published, not quoted here: MipStatistics::mean_alpha_correlation_abs and \
+     MipStatistics::mean_colour_correlation are where a caller re-derives them. NOT used as a \
+     gate -- 467 of 1747 records fall below a 0.30 mean colour correlation, so any correlation \
+     threshold would be a statistic rather than a property.";
 
 /// The fourcc a raster must carry for [`spore_texture::decode_raster`] to decode
 /// it, re-exported so a caller can assert on it without depending on
@@ -1058,7 +1175,7 @@ pub const REQUIRED_FOURCC: u32 = DXT5_FOURCC;
 fn role_text(role: TextureRole) -> &'static str {
     match role {
         TextureRole::TangentSpaceNormal => NORMAL_ROLE_TEXT,
-        TextureRole::LayeredAlphaMask => MASK_ROLE_TEXT,
+        TextureRole::ColourAndMask => COLOUR_ROLE_TEXT,
         TextureRole::Unidentified => UNIDENTIFIED_ROLE_TEXT,
     }
 }
@@ -1074,17 +1191,28 @@ const NORMAL_ROLE_TEXT: &str =
      check: a constant field is a degenerate normal map, not a failed one.";
 
 /// The text recorded for a DXT5 role.
-const MASK_ROLE_TEXT: &str =
-    "A single-channel mask over a degenerate colour field, in two layers. Assigned by checking \
-     this record's own base mip -- red takes at most two distinct values, green and blue at \
-     most one each, and alpha at least two, i.e. the alpha plane is not constant. NOT a colour \
-     map of any kind -- see dxt5_carries_no_colour for the measurement. What either layer is FOR \
-     is unknown; see mask_layer_purpose.";
+const COLOUR_ROLE_TEXT: &str =
+    "A three-channel colour image in lanes 0-2 over a fourth plane that does not vary with \
+     them, in ONE chain of mip levels. Assigned by checking this record's own base mip -- \
+     each of lanes 0, 1 and 2 takes at least 8 distinct values -- and not by its format word \
+     alone. The fourth lane is not part of the check because 46 of the 1747 corpus records \
+     hold a constant one; read this record's own answer from \
+     ResolvedTexture::mask_plane_varies. The colour planes are REAL: see \
+     dxt5_carries_no_colour, which now records the refutation of the claim that they were \
+     not. What either the colour or the fourth plane is FOR is unknown; see \
+     mask_layer_purpose.";
 
 /// The text recorded when no signature held.
+///
+/// Says "for its format word" on purpose. The *other* signature may well hold —
+/// a `0x15` record whose bytes are a colour field is `Unidentified` while
+/// satisfying the colour signature perfectly — and the previous wording, "matched
+/// no signature", claimed a negative the check did not make.
 const UNIDENTIFIED_ROLE_TEXT: &str =
-    "The record decoded and its content matched no signature: its own base mip is neither a \
-     tangent-space normal map nor a degenerate-colour field over a full-range alpha plane. \
+    "The record decoded and its content matched no signature FOR ITS FORMAT WORD: as a 0x15 \
+     record its base mip is not a tangent-space normal map, and as a DXT5 record its lanes are \
+     not three colour lanes that each take at least 8 distinct values. The other family's \
+     signature may still hold -- that is what makes the fourcc necessary rather than decorative. \
      Reported rather than defaulted, because the format word alone would have named a role this \
      record's bytes did not earn.";
 
@@ -1092,15 +1220,27 @@ const UNIDENTIFIED_ROLE_TEXT: &str =
 ///
 /// Checked in debug builds inside [`build_resolved`]. This is the guard against
 /// the failure this crate exists for: prose that keeps asserting something the
-/// numbers stopped supporting. `Unidentified` must mean *both* signatures
-/// declined — otherwise the text would claim a negative the check did not make.
-fn role_text_agrees_with_statistics(role: TextureRole, stats: &MipStatistics) -> bool {
+/// numbers stopped supporting.
+///
+/// `fourcc` is part of the question, and the reason is a real case rather than a
+/// tidiness one. [`TextureRole::Unidentified`] means **this record's own format
+/// word's** signature declined. The other signature may well hold: a `0x15`
+/// record whose bytes are a colour field classifies as `Unidentified` while
+/// satisfying [`role::colour_and_mask_signature`] perfectly. An earlier version
+/// of this guard required *both* signatures to decline, which is false — and the
+/// debug assertion caught it, which is the whole reason the guard exists.
+fn role_text_agrees_with_statistics(fourcc: u32, role: TextureRole, stats: &MipStatistics) -> bool {
     let normal = role::normal_map_signature(stats);
-    let mask = role::layered_mask_signature(stats);
+    let colour = role::colour_and_mask_signature(stats);
     match role {
-        TextureRole::TangentSpaceNormal => normal,
-        TextureRole::LayeredAlphaMask => mask,
-        TextureRole::Unidentified => !normal && !mask,
+        TextureRole::TangentSpaceNormal => fourcc == LUMINANCE_FOURCC && normal,
+        TextureRole::ColourAndMask => fourcc == DXT5_FOURCC && colour,
+        TextureRole::Unidentified => match fourcc {
+            LUMINANCE_FOURCC => !normal,
+            DXT5_FOURCC => !colour,
+            // A fourcc with no signature at all: declining is all it can do.
+            _ => !normal && !colour,
+        },
     }
 }
 

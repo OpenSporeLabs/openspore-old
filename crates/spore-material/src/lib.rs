@@ -73,23 +73,43 @@
 //! [`role::classify`] takes the record's `fourcc` **and** an exact per-lane
 //! statistic over its own base mip, and a record whose content does not match
 //! its format word lands in [`TextureRole::Unidentified`] rather than keeping a
-//! role it did not earn. Measured over `Spore_Content.package` (2026-10-04):
+//! role it did not earn.
+//!
+//! Two content classes are established, and one of them **replaced a refuted
+//! one** on 2026-10-05:
 //!
 //! * a `0x15` record is a **tangent-space normal map stored Z first** — 901 of
 //!   901 records satisfy the check, and the reordering failure it exists to
-//!   catch cannot pass it;
-//! * a `DXT5` record is **not a colour map**: over 1 374 decodable records and
-//!   720 371 712 base-mip texels the decoded green and blue channels have a
-//!   span of **zero** and red takes **two** values, and its two layers differ
-//!   byte-for-byte in **1 374 / 1 374** records.
+//!   catch cannot pass it. The content claim is **delegated** to
+//!   [`spore_texture::claims`], never restated here;
+//! * a `DXT5` record is a **colour image with a fourth plane**
+//!   ([`TextureRole::ColourAndMask`]) — over all 1 747 records in
+//!   `Spore_Content.package`, each of lanes 0–2 takes at least **32 distinct
+//!   values** and **0** records have a colour lane of two or fewer. The old model,
+//!   [`TextureRole::LayeredAlphaMask`] over
+//!   [`ChannelRole::DegenerateColour`], was a **tautology of a broken codec**:
+//!   green and blue read as zero under R5G5B5 on a 6-bit word *by construction*.
+//!   Its claims are kept as refutations, not deleted — see
+//!   [`claims::DXT5_CARRIES_NO_COLOUR`].
 //!
-//! **There is no `Diffuse` variant**, and adding one would be a claim about a
-//! record that does not exist: every raster record in the corpus is one of the
-//! two above or a `DXT1` this build refuses by name. `tests/honesty.rs` fails if
-//! a role spelling ever names an unestablished purpose.
+//! **There is still no `Diffuse` variant**, and the reason has *changed*, which
+//! matters. It is no longer "no raster record in the corpus carries colour" —
+//! 1 747 of them do. It is now **"what colour a record is for is not
+//! established"**: no shader has been read, no referenced group id has a
+//! canonical name, and [`ChannelRole::ColourPlane::purpose_established`] is
+//! `false` for every lane of a `DXT5` record. A `Diffuse` variant would convert
+//! an unestablished *purpose* into a confident role.
 //!
-//! What a mask plane is **for** remains unknown, and
+//! What the fourth plane is **for** remains unknown, and
 //! [`claims::MASK_LAYER_PURPOSE`] is a non-finding. Content is not purpose.
+//!
+//! **Grading.** The colour reading is `INFERRED`, not `VERIFIED`, and
+//! [`claims::bc3_claim_ceiling`] is why: a statement about what a decoded BC3
+//! texel *contains* cannot outrank the codec that decoded it, and no decode of a
+//! real Spore record has been compared against the game's own output. The normal
+//! map reading carries no such ceiling because the `0x15` family is uncompressed
+//! and its texel layout is graded `VERIFIED` upstream on an independent
+//! measurement.
 //!
 //! The full derivation, with every corpus table and the engine specification,
 //! is in `docs/MATERIAL-ROLES.md`.
@@ -111,10 +131,12 @@
 //!
 //! `inspect_envelope` is the cheap question — "how big is this record?" — asked
 //! of an atlas that may hold thousands of them. It reads a 32-byte header and
-//! stops, which is why its [`ResolvedTexture::pixels_decoded`] is `false` and
-//! its [`ResolvedTexture::role`] is [`TextureRole::Unidentified`]: a header read
-//! is not a content check, and "we did not look" is not "we looked and found
-//! nothing". A refusal never returns an image at all.
+//! stops, which is why its [`ResolvedTexture::pixels_decoded`] is `false`, its
+//! [`ResolvedTexture::layers`] is **empty**, its
+//! [`ResolvedTexture::layer_count`] is **0** rather than the 1 a decode would
+//! report, and its [`ResolvedTexture::role`] is [`TextureRole::Unidentified`]: a
+//! header read is not a content check, and "we did not look" is not "we looked
+//! and found nothing". A refusal never returns an image at all.
 //!
 //! # The six things this crate will not do
 //!
@@ -123,8 +145,9 @@
 //! | It will not | Because | Enforced by |
 //! | --- | --- | --- |
 //! | invent a material name from its id | the registry is external to the data | [`MeshMaterial::name`] is `None`; `material_name` returns `None` for every id |
-//! | name a texture's purpose | no shader has been read, and no mask plane's job is established | [`SamplerRole`] has one variant; [`ChannelRole::purpose_established`] is `false` for three of six |
-//! | call a texture "diffuse" | no raster record in the corpus decodes as a colour map | no such [`TextureRole`] variant; `tests/honesty.rs` sweeps for the word |
+//! | name a texture's purpose | no shader has been read, and no lane of a `DXT5` record has an established job | [`SamplerRole`] has one variant; [`ChannelRole::purpose_established`] is `false` for two of five |
+//! | call a texture "diffuse" | its colour planes are real but what they colour is not established; see the section above | no such [`TextureRole`] variant; `tests/honesty.rs` sweeps for the word |
+//! | grade a claim about decoded BC3 above the codec | no decode has been compared against the game's output | [`claims::bc3_claim_ceiling`]; a test pins every such claim at or below it |
 //! | assign a role from a texture's position in the list | position correlates with content in this corpus but does not determine it | [`role::classify`] takes content statistics; [`TextureSlot::ordinal_agrees`] is a cross-check |
 //! | cut a texture list per mesh because the division worked | a short list divides just as neatly as a complete one | [`partition_texture_refs`] refuses a cut the record contradicts; [`BindingScope::Undetermined`] is the answer then |
 //! | bury the type assumption | the reference carries no type word | `assumed_type` is a parameter of every entry point, and [`claims::ASSUMED_RECORD_TYPE`] records it at `INFERRED` |
@@ -164,29 +187,37 @@
 //!
 //! # What the documented asset actually does
 //!
-//! Measured over `SPORE/Data/Spore_Content.package` on 2026-10-04 and asserted
-//! by `tests/real_corpus_roles.rs::the_documented_assets_roles`, which prints
-//! every field:
+//! Measured over `SPORE/Data/Spore_Content.package` on 2026-10-05 and asserted
+//! by `tests/real_asset.rs::the_documented_asset_resolves_three_images_with_measured_roles`,
+//! which prints every field:
 //!
 //! | Reference | Result | role |
 //! | --- | --- | --- |
-//! | `0x2f4e681c:0x40632900:0x067a07f0` | 512x512, 10 mips, **2 layers**, `DXT5` | [`TextureRole::LayeredAlphaMask`] |
-//! | `0x2f4e681c:0x40632901:0x067a07f0` | 512x512, 10 mips, **2 layers**, `DXT5` | [`TextureRole::LayeredAlphaMask`] |
-//! | `0x2f4e681c:0x40632902:0x067a07f0` | **512x512**, 10 mips, 1 layer, `fourcc 0x00000015` | [`TextureRole::TangentSpaceNormal`] |
+//! | `0x2f4e681c:0x40632900:0x067a07f0` | 512x512, 10 mips, **1 chain**, `DXT5` | [`TextureRole::ColourAndMask`] |
+//! | `0x2f4e681c:0x40632901:0x067a07f0` | 512x512, 10 mips, **1 chain**, `DXT5` | [`TextureRole::ColourAndMask`] |
+//! | `0x2f4e681c:0x40632902:0x067a07f0` | 512x512, 10 mips, 1 chain, `fourcc 0x00000015` | [`TextureRole::TangentSpaceNormal`] |
 //!
-//! **Two corrections to what this module used to say.** The third record was
+//! **Three corrections to what this module used to say.** The third record was
 //! described here as *1024x1024* and *refused*; it is **512x512** and it
-//! **decodes**. `Spore_Content.package` contains no 1024² raster of either
-//! format — the `0x15` family occurs at 32², 256² and 512² only — and
-//! `spore-texture` established the family's framing over 901 of 901 records.
-//! The bytes win; see `docs/MATERIAL-ROLES.md` §8.
+//! **decodes**. `Spore_Content.package` contains no 1024² raster of either format
+//! — the `0x15` family occurs at 32², 256² and 512² only — and `spore-texture`
+//! established the family's framing over 901 of 901 records. And the first two
+//! were described as **2 layers** each; they are **one chain**, because the block
+//! stride that produced the second layer was refuted. The bytes win; see
+//! `docs/MATERIAL-ROLES.md` §8.
 //!
-//! So [`resolve_model_textures`] on the documented asset now yields **three**
+//! The two `DXT5` records' own base mips carry **4436** and several thousand
+//! distinct RGB triples respectively, with 92 / 121 / 73 (first record) and
+//! 184 / 238 / 198 (second) distinct values in lanes 0 / 1 / 2. Their fourth
+//! planes max out at **73** and carry 21 and 32 distinct values.
+//!
+//! So [`resolve_model_textures`] on the documented asset yields **three**
 //! images and no error, and [`resolve_model_record`] reports
-//! [`ModelTextures::observed_shape`] = `(mask, mask, normal)` with 3 of 3
-//! ordinals agreeing. A resolver that aborted on the first failure would still
-//! return nothing for an asset with an undecodable texture, which is why the
-//! batch returns a `Vec<Result<..>>`.
+//! [`ModelTextures::observed_shape`] =
+//! [`TexSetShape::ColourAndMaskTwiceThenNormal`] with 3 of 3 ordinals agreeing.
+//! A resolver that aborted on the first failure would still return nothing for
+//! an asset with an undecodable texture, which is why the batch returns a
+//! `Vec<Result<..>>`.
 //!
 //! # Testing
 //!
@@ -226,7 +257,9 @@ mod material;
 mod resolve;
 mod role;
 
-pub use claims::{grade_of, spec_of, ClaimKind, ClaimSpec, ALL_CLAIMS};
+pub use claims::{
+    bc3_claim_ceiling, grade_of, refuted_subjects, spec_of, ClaimKind, ClaimSpec, ALL_CLAIMS,
+};
 pub use error::MaterialError;
 pub use material::{
     material_name, model_materials, partition_texture_refs, BindingScope, MaterialClaim,
@@ -237,7 +270,7 @@ pub use resolve::{
     OrdinalAgreement, ResolvedTexture, TexSetShape, TextureClaim, TextureKind, REQUIRED_FOURCC,
 };
 pub use role::{
-    classify, layered_mask_signature, normal_map_signature, role_evidence, ChannelBinding,
-    ChannelRole, Lane, MipStatistics, TextureRole, NORMAL_LANE_CENTRE, NORMAL_LANE_TOLERANCE,
-    NORMAL_Z_LEAD, NORMAL_Z_MEAN_FLOOR,
+    classify, colour_and_mask_signature, normal_map_signature, role_evidence, ChannelBinding,
+    ChannelRole, Lane, MipStatistics, TextureRole, COLOUR_LANES, COLOUR_LANE_CARDINALITY_FLOOR,
+    LANE_PAIRS, NORMAL_LANE_CENTRE, NORMAL_LANE_TOLERANCE, NORMAL_Z_LEAD, NORMAL_Z_MEAN_FLOOR,
 };

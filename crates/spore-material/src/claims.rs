@@ -39,6 +39,39 @@
 //! `EvidenceLevel::Unknown`, `EvidenceState::Missing` and **no provenance**. A
 //! non-finding is not a zero, not an empty string and not a default colour; see
 //! `spore_core::evidence`.
+//!
+//! # Refuted subjects, kept under their original names
+//!
+//! Three subjects here once asserted something the corpus has since refuted:
+//! [`LAYER_COUNT_IS_DERIVED`], [`DXT5_CARRIES_NO_COLOUR`] and
+//! [`DXT5_LAYERS_ARE_DISTINCT`]. **None of them was deleted.** Each is recorded
+//! as [`ClaimKind::Refuted`] under its original spelling, carrying the
+//! measurement that refuted it and naming, through
+//! [`ClaimSpec::kind`][k], the *other* crate's subject that measured it.
+//!
+//! Two reasons that is the right shape and not bookkeeping:
+//!
+//! 1. A refutation that deletes its subject leaves the next reader with nothing
+//!    to contradict, which is how a wrong belief gets re-derived. The commit
+//!    message, the pull request and the changelog all age out; this does not.
+//! 2. Every one of the three was *load-bearing* — two of them decided which
+//!    records this crate could classify at all — so deleting them would have
+//!    left the change invisible in the place a reader looks first.
+//!
+//! # Delegation, and the ceiling it produces
+//!
+//! A statement about what a decoded texel **contains** cannot be stronger than
+//! the codec that decoded it. `spore-texture` grades BC3 as
+//! [`spore_texture::claims::BC3_CODEC`] — `INFERRED`, because the stride is a
+//! byte count but the codec inside a block has never been compared against the
+//! game's own output. [`bc3_claim_ceiling`] returns that grade, and
+//! [`COLOUR_AND_MASK_CONTENT`] is pinned at or below it by a test.
+//!
+//! This is the second time this crate has delegated a fact it previously
+//! restated. The first time it did not, `spore-texture` corrected the `0x15`
+//! family's description, this crate asserted the opposite of its own decoder,
+//! and **five** tests failed rather than one because the stale claim was
+//! load-bearing for the batch error handling.
 
 use spore_core::evidence::{EvidenceLevel, EvidenceState, Fact, Provenance};
 
@@ -70,17 +103,36 @@ pub const ASSUMED_RECORD_TYPE_NAME: &str = "assumed_record_type_name";
 pub const RESOLVED_GROUP_NAME: &str = "resolved_group_name";
 
 /// A raster record stores no layer count; the count is derived by division.
+///
+/// **REFUTED, 2026-10-05.** There is no layer count to derive *and no division
+/// to perform*: every raster record in the corpus is exactly **one** chain of mip
+/// levels, and `spore-texture` verifies the record length against that identity
+/// rather than dividing a payload. The old "derived 2" was a double error that
+/// cancelled — 8 bytes per 4x4 block instead of 16 made one picture look like two
+/// half-pictures. The subject keeps its spelling so the refutation is findable
+/// from the old name.
 pub const LAYER_COUNT_IS_DERIVED: &str = "layer_count_is_derived";
 
 /// Re-publication of [`spore_texture::claims::DXT5_SPEC_DEVIATIONS`], so a
-/// caller reading only this crate's claims still learns that the decoded texels
-/// are deliberately *not* BC3-spec DXT5.
+/// caller reading only this crate's claims still learns that the *previous*
+/// decode was not BC3 and why.
+///
+/// The subject string is unchanged because the upstream subject it republishes
+/// is unchanged, and the upstream claim is now itself the register of the
+/// refutation. Delegated, never restated: see the module documentation.
 pub const DXT5_SPEC_DEVIATIONS: &str = "dxt5_spec_deviations";
 
 /// Re-publication of [`spore_texture::claims::ENVELOPE_FIELD_10_MEANING`].
 pub const ENVELOPE_FIELD_10_MEANING: &str = "envelope_field_10_meaning";
 
 /// Re-publication of [`spore_texture::claims::ENVELOPE_FIELD_18_MEANING`].
+///
+/// **Delegated, not a local non-finding.** It used to be republished here as
+/// `meaning_not_established`, which was already wrong when the field's real state
+/// was measured upstream: it is the base level's own byte count in **all three**
+/// formats, verified over 4 386 records, and `spore-texture` reads it as a
+/// cross-check. That is the second time this crate would have contradicted its own
+/// decoder if it had kept a local copy.
 pub const ENVELOPE_FIELD_18_MEANING: &str = "envelope_field_18_meaning";
 
 /// Re-publication of [`spore_texture::claims::ENVELOPE_FIELD_1C_MEANING`].
@@ -100,8 +152,8 @@ pub const MATERIAL_ID_MEANING: &str = "material_id_meaning";
 /// [`TEXTURE_SET_ENTRY_LAYOUT`]) and holds no role field.
 pub const SAMPLER_ROLE: &str = "sampler_role";
 
-/// What a resolved texture's own bytes are: a tangent-space normal map, a
-/// layered single-channel mask, or unidentified.
+/// What a resolved texture's own bytes are: a tangent-space normal map, a colour
+/// image with a fourth plane, or unidentified.
 ///
 /// Distinct from [`SAMPLER_ROLE`] on purpose. This one is answerable from the
 /// record and is checked per record; the sampler stage is a property of a
@@ -116,15 +168,57 @@ pub const TEXTURE_CONTENT_ROLE: &str = "texture_content_role";
 /// `Spore_Content.package`. See `docs/LUMINANCE-RASTER.md`.
 pub const NORMAL_MAP_CONTENT: &str = "normal_map_content";
 
+/// A `DXT5`-family record read as BC3 carries a three-channel colour image in
+/// lanes 0-2, over a fourth plane that does not vary with them.
+///
+/// **Graded at the ceiling, not above it.** The stride is proven by a byte
+/// count and the alpha half is measured, but the BC3 codec itself is
+/// `spore_texture`'s `INFERRED` reading — no decode of a real record has been
+/// compared against the game's own output — so this claim inherits that grade.
+/// See [`bc3_claim_ceiling`], which a test pins it against.
+pub const COLOUR_AND_MASK_CONTENT: &str = "colour_and_mask_content";
+
+/// The fourth lane of a `DXT5` record does not track its three colour lanes.
+///
+/// **This crate's own measurement**, and graded at the BC3 ceiling rather than
+/// `Observed`: over all 1 747 `DXT5` records of `Spore_Content.package` the mean
+/// absolute colour-to-alpha correlation has median **0.067** and maximum
+/// **0.539**, against a median mutual correlation of **0.510** among the colour
+/// lanes themselves. The *measurement* is exact, but a claim that compares the
+/// colour lanes with the alpha lane depends on the colour half, and that half's
+/// codec is `INFERRED` upstream — so the claim is too. Published per record on
+/// [`MipStatistics`](crate::MipStatistics), which is where a caller re-derives
+/// it, rather than as a number in this sentence. NOT used as a gate: 467 of 1 747
+/// records fall below a 0.30 mean colour correlation, so any correlation
+/// threshold would be a statistic rather than a property.
+pub const MASK_PLANE_INDEPENDENT_OF_COLOUR: &str = "mask_plane_independent_of_colour";
+
 /// A `DXT5`-family record carries no colour: the byte-pinned codec reduces its
 /// colour field to two values across every record in the corpus.
+///
+/// **REFUTED, 2026-10-05 — and kept under its original spelling.** The claim was
+/// a tautology of a broken codec, not a measurement of any record: green and
+/// blue read as zero under R5G5B5 on a **6-bit** word *by construction*, because
+/// a 6-bit value cannot set bits 10..19. Read as BC3 the same records carry at
+/// least **32 distinct reds, 64 greens and 32 blues** each, and 0 of 1 747 have a
+/// colour lane of two values or fewer.
 pub const DXT5_CARRIES_NO_COLOUR: &str = "dxt5_carries_no_colour";
 
 /// A `DXT5` record's two layers are two distinct surfaces, not one image and a
 /// copy.
+///
+/// **REFUTED, 2026-10-05 — and kept under its original spelling.** There are no
+/// two layers. Every raster record in the corpus is one chain of mip levels, so
+/// `layers.len()` is 1 and the question has no subject. The 1 233 / 1 233
+/// measurement this claim was built on compared the two *halves of one picture*
+/// that an 8-byte block stride had split in two, which is why they differed.
 pub const DXT5_LAYERS_ARE_DISTINCT: &str = "dxt5_layers_are_distinct";
 
-/// What a mask layer is **for**. Nothing, in this build.
+/// What the fourth plane of a `DXT5` record is **for**. Nothing, in this build.
+///
+/// The subject keeps the word "layer" from the refuted two-layer model so the
+/// non-finding stays findable; the plane in question is lane 3 of the record's
+/// single chain.
 pub const MASK_LAYER_PURPOSE: &str = "mask_layer_purpose";
 
 /// The shapes a gmdl texture set occurs in, measured over the whole corpus.
@@ -303,13 +397,39 @@ pub enum ClaimKind {
         /// The reason code of the non-finding, when the table has no name.
         reason: &'static str,
     },
+    /// A subject whose former claim the corpus **refuted**. The value recorded
+    /// is the refutation; `refuted_by` names the *other* crate's subject that
+    /// measured it.
+    ///
+    /// Three subjects here are in this state, and none of them was deleted — see
+    /// the module documentation for why a refutation that removes its subject
+    /// is a defect.
+    Refuted {
+        /// The grade of the **refutation**, which is not the grade of the thing
+        /// that was refuted.
+        level: EvidenceLevel,
+        /// The subject in `spore_texture::claims` that measured the refutation.
+        ///
+        /// A subject string rather than a level, because the point is not that
+        /// the refutation is well supported but that the *evidence lives in the
+        /// crate that did the measuring*. A caller can look it up; a bare
+        /// `EvidenceLevel` would let this crate re-state the finding and drift.
+        refuted_by: &'static str,
+    },
 }
 
 impl ClaimKind {
     /// The grade this claim is recorded at.
+    ///
+    /// For [`Self::Refuted`] this is the grade of the **refutation**, so a
+    /// subject that once carried `VERIFIED` for a false statement now carries
+    /// `VERIFIED` for its falsity. That is deliberate: the grade describes the
+    /// thing this crate records today, and today it records that the old claim
+    /// is false.
     pub const fn level(self) -> EvidenceLevel {
         match self {
             Self::Graded(level) | Self::GradedOrNonFinding { level, .. } => level,
+            Self::Refuted { level, .. } => level,
             Self::NonFinding(_) => EvidenceLevel::Unknown,
         }
     }
@@ -317,7 +437,7 @@ impl ClaimKind {
     /// The reason code, when this claim can be a non-finding.
     pub const fn reason(self) -> Option<&'static str> {
         match self {
-            Self::Graded(_) => None,
+            Self::Graded(_) | Self::Refuted { .. } => None,
             Self::NonFinding(reason) | Self::GradedOrNonFinding { reason, .. } => Some(reason),
         }
     }
@@ -325,6 +445,19 @@ impl ClaimKind {
     /// Whether this claim may carry a value.
     pub const fn can_carry_value(self) -> bool {
         !matches!(self, Self::NonFinding(_))
+    }
+
+    /// The subject that measured this subject's refutation, when it has one.
+    pub const fn refuted_by(self) -> Option<&'static str> {
+        match self {
+            Self::Refuted { refuted_by, .. } => Some(refuted_by),
+            _ => None,
+        }
+    }
+
+    /// Whether this subject's recorded value is a refutation.
+    pub const fn is_refuted(self) -> bool {
+        matches!(self, Self::Refuted { .. })
     }
 }
 
@@ -376,16 +509,36 @@ pub const ALL_CLAIMS: &[ClaimSpec] = &[
     },
     ClaimSpec {
         subject: LAYER_COUNT_IS_DERIVED,
-        kind: ClaimKind::Graded(EvidenceLevel::Observed),
-        basis: "No layer-count field exists; the count comes from dividing the payload by \
-                the layer stride, and yields 2 on every real 512x512 DXT5 record measured \
-                (0x2f4e681c:0x40632900/01:0x067a07f0 on 2026-10-04).",
+        kind: ClaimKind::Refuted {
+            level: EvidenceLevel::Verified,
+            refuted_by: spore_texture::claims::LAYER_COUNT,
+        },
+        basis: "REFUTED, and the subject is kept under its old name so the \
+                refutation is findable from the thing it refutes. There is no \
+                layer count and nothing to divide for one: every raster record in \
+                the corpus is exactly ONE chain of mip levels, verified by an \
+                exact-consume record-length identity in 4386 of 4386 records \
+                across Spore_Content.package and Spore_EP1_Content_01.package. \
+                The old 'derived 2' was a double error that cancelled exactly -- \
+                8 bytes per 4x4 block instead of 16 makes one picture look like \
+                two half-pictures -- which is why 1374 records decoded and 373 \
+                did not. RasterImage::layers is therefore always length 1.",
     },
     ClaimSpec {
         subject: DXT5_SPEC_DEVIATIONS,
-        kind: ClaimKind::Graded(EvidenceLevel::Verified),
-        basis: "pinned byte-for-byte by spore-texture against two independent \
-                implementations and the hand-computed golden values.",
+        kind: ClaimKind::Refuted {
+            level: EvidenceLevel::Verified,
+            refuted_by: spore_texture::claims::DXT5_SPEC_DEVIATIONS,
+        },
+        basis: "REFUTED, 2026-10-05. The departures from published BC3 -- an \
+                inverted palette-size test, R5G5B5 channel reads, a 6/2 alpha blend, \
+                no alpha0 == alpha1 collapse -- were real, byte-pinned departures, and \
+                that is exactly the problem: two implementations agreeing with each \
+                other on synthetic input produced a 'specification' that no record \
+                supports. Every recorded level prefix in every DXT5 record is the \
+                16-byte-per-block figure, so the stride was wrong. Spore's blocks ARE \
+                BC3. This crate delegates rather than restating, for the second time \
+                it has had the chance to get this wrong.",
     },
     ClaimSpec {
         subject: ENVELOPE_FIELD_10_MEANING,
@@ -394,8 +547,16 @@ pub const ALL_CLAIMS: &[ClaimSpec] = &[
     },
     ClaimSpec {
         subject: ENVELOPE_FIELD_18_MEANING,
-        kind: ClaimKind::NonFinding(MEANING_NOT_ESTABLISHED),
-        basis: "re-published from spore_texture::claims; no decoder reads the word.",
+        kind: ClaimKind::Graded(EvidenceLevel::Verified),
+        basis: "re-published from spore_texture::claims, which measured it over 4386 \
+                of 4386 raster records in Spore_Content.package and \
+                Spore_EP1_Content_01.package. It is the base level's OWN byte count in \
+                all three formats -- 0x40000 for a 512x512 DXT5 record, 0x10000 for a \
+                256x256, 0x8000 for a 256x256 DXT1, w*h*4 for the 0x15 family -- and the \
+                decoder READS it as a cross-check, refusing a record whose header \
+                disagrees with its own geometry. This crate previously republished it as \
+                'meaning not established', which was a local copy contradicting the \
+                decoder above it. Delegated, never restated.",
     },
     ClaimSpec {
         subject: ENVELOPE_FIELD_1C_MEANING,
@@ -444,12 +605,18 @@ pub const ALL_CLAIMS: &[ClaimSpec] = &[
     },
     ClaimSpec {
         subject: TEXTURE_CONTENT_ROLE,
-        kind: ClaimKind::Graded(EvidenceLevel::Observed),
+        kind: ClaimKind::Graded(EvidenceLevel::Inferred),
         basis: "assigned per resolved record from its own format word AND a \
                 statistic over its own base mip (role::classify). A record whose \
-                content fails the check for its format word is Unidentified, so \
-                the role is an observation of this record rather than a lookup \
-                of its family's name. Deliberately NOT the same claim as \
+                content fails the check for its format word is Unidentified, so the \
+                check is an observation OF THIS RECORD and never a lookup of its \
+                family's name. Graded INFERRED, and that is a LOWERING rather than a \
+                convenience: one subject records both content families, and the \
+                colour-and-mask reading cannot outrank the BC3 codec (bc3_claim_ceiling) \
+                even though the normal-map reading could. Reported at the floor so one \
+                static grade is honest for both. role::role_evidence answers the \
+                different question 'did this record's own check run', which is \
+                Observed for every variant. Deliberately NOT the same claim as \
                 SAMPLER_ROLE.",
     },
     ClaimSpec {
@@ -462,32 +629,80 @@ pub const ALL_CLAIMS: &[ClaimSpec] = &[
     },
     ClaimSpec {
         subject: DXT5_CARRIES_NO_COLOUR,
-        kind: ClaimKind::Graded(EvidenceLevel::Verified),
-        basis: "over 1374 decodable DXT5 records x 2 layers x 262144 texels the \
-                decoded red channel takes exactly 2 values and green and blue \
-                exactly 1 each; a stride sample of 477771 palette entries from \
-                every DXT5 block in the corpus yields exactly 2 distinct RGB \
-                triples, (0,0,0) and (8,0,0). Structural, not sampled: the codec \
-                reads the colour field as two 6-bit values and its green and \
-                blue terms can only be zero. See docs/MATERIAL-ROLES.md.",
+        kind: ClaimKind::Refuted {
+            level: EvidenceLevel::Verified,
+            refuted_by: spore_texture::claims::DXT5_SPEC_DEVIATIONS,
+        },
+        basis: "REFUTED, 2026-10-05, and kept under its original spelling. The claim \
+                was a tautology of a broken codec rather than a measurement of any \
+                record: green and blue read as zero under R5G5B5 on a 6-BIT word BY \
+                CONSTRUCTION, because a 6-bit value cannot set bits 10..19. The block \
+                stride was then charged at 8 bytes where the records hold 16. Read as \
+                BC3 over all 1747 DXT5 records of Spore_Content.package: every \
+                record's lane 0 takes at least 32 distinct values (max 235), lane 1 at \
+                least 64 (max 255) and lane 2 at least 32 (max 235); 0 of 1747 have a \
+                colour lane of two values or fewer; the documented record \
+                0x2f4e681c:0x40632900:0x067a07f0 carries 4436 distinct RGB triples in \
+                one 512x512 base mip. The old 'exactly 2 distinct RGB triples, (0,0,0) \
+                and (8,0,0)' is what its own codec produced. See \
+                docs/MATERIAL-ROLES.md section 4.",
     },
     ClaimSpec {
         subject: DXT5_LAYERS_ARE_DISTINCT,
-        kind: ClaimKind::Graded(EvidenceLevel::Verified),
-        basis: "layer 0 and layer 1 of the same DXT5 record differ byte-for-byte in \
-                1233/1233 referenced record-instances, and a 3-entry gmdl texture \
-                set never names the same DXT5 record twice (1922/1922 sets). Two \
-                surfaces, not one image and a copy.",
+        kind: ClaimKind::Refuted {
+            level: EvidenceLevel::Verified,
+            refuted_by: spore_texture::claims::LAYER_COUNT,
+        },
+        basis: "REFUTED, 2026-10-05, and kept under its original spelling. There are no \
+                two layers: every raster record in the corpus is one chain, so \
+                ResolvedTexture::layers has length 1 and the question has no subject. \
+                The old 1233/1233 measurement compared the two HALVES OF ONE PICTURE \
+                that an 8-byte block stride had split in two, which is why they \
+                differed byte-for-byte; a correct 16-byte stride finds one image there. \
+                The surviving statement is a different one: a model's two DXT5 \
+                records are two distinct RECORDS, and TextureSlot keeps them apart.",
+    },
+    ClaimSpec {
+        subject: COLOUR_AND_MASK_CONTENT,
+        kind: ClaimKind::Graded(EvidenceLevel::Inferred),
+        basis: "graded INFERRED and NOT Verified, because a statement about what a \
+                decoded BC3 texel contains cannot outrank the codec that decoded it. \
+                spore-texture grades BC3 at INFERRED (claims::BC3_CODEC): the 16-byte \
+                stride is a byte count and the BC4 alpha half beats the alternative by \
+                a factor of 20-50 on every shape, but no decode of a real record has \
+                been compared against the game's own output. bc3_claim_ceiling() \
+                returns that grade and a test pins this claim at or below it. The \
+                per-record check that admits a record into TextureRole::ColourAndMask \
+                is role::colour_and_mask_signature; the measurement behind it is in \
+                DXT5_CARRIES_NO_COLOUR's refutation above.",
+    },
+    ClaimSpec {
+        subject: MASK_PLANE_INDEPENDENT_OF_COLOUR,
+        kind: ClaimKind::Graded(EvidenceLevel::Inferred),
+        basis: "THIS CRATE'S OWN MEASUREMENT, so not delegated -- but graded at the BC3 \
+                ceiling rather than Observed, because comparing the colour lanes with \
+                the alpha lane depends on the colour half and that half's codec is \
+                INFERRED upstream. Over all 1747 DXT5 records of Spore_Content.package \
+                the mean absolute colour-to-alpha correlation has median 0.067 and \
+                maximum 0.539, against a median mutual correlation of 0.510 among the \
+                colour lanes themselves. Published per record on MipStatistics, which is \
+                where a caller re-derives it, rather than as a number in this sentence. \
+                NOT used as a gate: 467 of 1747 records fall below a 0.30 mean colour \
+                correlation, so any correlation threshold would be a statistic rather \
+                than a property.",
     },
     ClaimSpec {
         subject: MASK_LAYER_PURPOSE,
         kind: ClaimKind::NonFinding(MEANING_NOT_ESTABLISHED),
-        basis: "a mask layer's CONTENT is measured (a full-range 8-bit channel over \
-                a degenerate colour field) and its PURPOSE is unknown. Nothing in the \
-                gmdl record, the raster envelope or the texture-set entry \
-                distinguishes one candidate purpose from another -- a specular mask \
-                and a gloss mask look identical in these records -- so \
-                ChannelRole::MaskChannel says what the bytes are and no more.",
+        basis: "the fourth lane's CONTENT is measured (one 8-bit channel, \
+                statistically independent of the three colour planes, 1 to 256 distinct \
+                values per record and CONSTANT in 46 of 1747) and its PURPOSE is \
+                unknown. Nothing in the gmdl record, the raster envelope or the \
+                texture-set entry distinguishes one candidate purpose from another -- \
+                a specular mask and a gloss mask look identical in these records -- so \
+                ChannelRole::MaskChannel says what the bytes are and no more. Its name \
+                is about the SHAPE of the data, not a job. The subject keeps 'layer' \
+                from the refuted two-layer model so the non-finding stays findable.",
     },
     ClaimSpec {
         subject: TEXTURE_SET_SHAPES,
@@ -640,6 +855,38 @@ pub fn grade_of(subject: &str) -> EvidenceLevel {
     spec_of(subject).map_or(EvidenceLevel::Unknown, |spec| spec.kind.level())
 }
 
+/// The strongest grade any claim **in this crate** may carry about what a
+/// decoded BC3 texel contains.
+///
+/// Delegates to [`spore_texture::claims::BC3_CODEC`] rather than declaring a
+/// level of its own, so the ceiling moves when the crate that measured the codec
+/// moves it. It is `INFERRED` today, and the reason it is not `VERIFIED` is
+/// specific and checkable: the 16-byte block stride is a byte count over 4 386
+/// records and the BC4 alpha half is measured against the alternative by a
+/// factor of 20–50 on every shape, but **no decode of a real Spore DXT5 record
+/// has ever been compared against the game's own output**. That comparison is
+/// the test that would raise the ceiling, and nothing in this repository has run
+/// it.
+///
+/// A claim that violated the ceiling would be asserting more about Spore's texels
+/// than the crate that decoded them does — which is precisely how the refuted
+/// `dxt5_carries_no_colour` came to exist.
+pub fn bc3_claim_ceiling() -> EvidenceLevel {
+    spore_texture::claims::grade_of(spore_texture::claims::BC3_CODEC)
+}
+
+/// Every subject in this crate that is a [`ClaimKind::Refuted`], with the
+/// upstream subject that measured each refutation.
+///
+/// Exposed so a reader (and a test) can enumerate the refuted claims without
+/// walking [`ALL_CLAIMS`] and matching on a variant.
+pub fn refuted_subjects() -> Vec<(&'static str, &'static str)> {
+    ALL_CLAIMS
+        .iter()
+        .filter_map(|spec| spec.kind.refuted_by().map(|by| (spec.subject, by)))
+        .collect()
+}
+
 /// Builds the non-finding for `subject`.
 ///
 /// The reason code comes from the subject's own specification, so a claim can
@@ -746,7 +993,12 @@ mod tests {
                     "{}: a subject that can carry a value has a real grade",
                     spec.subject
                 ),
-                ClaimKind::Graded(_) => unreachable!("Graded has no reason code"),
+                // A refutation carries a VALUE -- the falsity of the old claim --
+                // so it is graded like any other available claim. Asserting it
+                // here is what stops a refutation from decaying into a
+                // non-finding, which would be indistinguishable from "we never
+                // knew".
+                ClaimKind::Refuted { .. } | ClaimKind::Graded(_) => {}
             }
             let fact = non_finding(spec.subject);
             assert!(fact.is_unavailable(), "{}", spec.subject);
@@ -845,8 +1097,12 @@ mod tests {
         assert_eq!(grade_of(GROUP_LOW_BYTE_IS_SLOT), EvidenceLevel::Verified);
         assert_eq!(grade_of(TEXTURE_SET_SHAPES), EvidenceLevel::Verified);
         // And the content role, which IS answerable, must not be confused with
-        // it: two different subjects, two different grades.
-        assert_eq!(grade_of(TEXTURE_CONTENT_ROLE), EvidenceLevel::Observed);
+        // it: two different subjects. The content subject sits at the BC3
+        // ceiling (`INFERRED`), and the sampler non-finding at `UNKNOWN` — which
+        // is a *lower* grade, so `!=` alone would be satisfied by any change and
+        // is asserted alongside the exact pair.
+        assert_eq!(grade_of(TEXTURE_CONTENT_ROLE), bc3_claim_ceiling());
+        assert_eq!(grade_of(SAMPLER_ROLE), EvidenceLevel::Unknown);
         assert_ne!(grade_of(TEXTURE_CONTENT_ROLE), grade_of(SAMPLER_ROLE));
     }
 
@@ -881,15 +1137,134 @@ mod tests {
     }
 
     #[test]
-    fn the_dxt5_content_claims_are_verified_and_its_purpose_is_not() {
-        assert_eq!(grade_of(DXT5_CARRIES_NO_COLOUR), EvidenceLevel::Verified);
-        assert_eq!(grade_of(DXT5_LAYERS_ARE_DISTINCT), EvidenceLevel::Verified);
+    fn the_colour_and_mask_finding_is_inferred_and_its_purpose_is_not() {
+        // Content known, purpose unknown, and the two must not be merged. The
+        // old test asserted `dxt5_carries_no_colour` was VERIFIED; the corpus
+        // refuted it, so this asserts the opposite about the same subjects.
+        assert_eq!(
+            grade_of(COLOUR_AND_MASK_CONTENT),
+            EvidenceLevel::Inferred,
+            "a reading OF a BC3 decode cannot outrank the BC3 codec"
+        );
+        assert_eq!(
+            grade_of(MASK_PLANE_INDEPENDENT_OF_COLOUR),
+            EvidenceLevel::Inferred,
+            "comparing the colour lanes with the alpha lane depends on the colour \
+             half, whose codec is Inferred upstream"
+        );
+        assert_eq!(
+            grade_of(TEXTURE_CONTENT_ROLE),
+            EvidenceLevel::Inferred,
+            "one subject records both content families, so it sits at the floor"
+        );
         assert_eq!(grade_of(NORMAL_MAP_CONTENT), EvidenceLevel::Verified);
-        // Content known, purpose unknown: the three must not be merged.
+        // Content known, purpose unknown.
         assert_eq!(grade_of(MASK_LAYER_PURPOSE), EvidenceLevel::Unknown);
         assert_eq!(
             non_finding(MASK_LAYER_PURPOSE).reason(),
             Some(MEANING_NOT_ESTABLISHED)
+        );
+    }
+
+    #[test]
+    fn the_three_refuted_subjects_are_recorded_not_deleted() {
+        // A refutation that removes its subject leaves the next reader with
+        // nothing to contradict, which is how a wrong belief gets re-derived. The
+        // original spellings are kept precisely so the refutation is findable
+        // FROM the thing it refutes.
+        for subject in [
+            LAYER_COUNT_IS_DERIVED,
+            DXT5_CARRIES_NO_COLOUR,
+            DXT5_LAYERS_ARE_DISTINCT,
+            DXT5_SPEC_DEVIATIONS,
+        ] {
+            let spec = spec_of(subject).unwrap_or_else(|| panic!("{subject} was deleted"));
+            assert!(spec.kind.is_refuted(), "{subject} must stay a refutation");
+            assert!(
+                spec.kind.refuted_by().is_some(),
+                "{subject} names no measuring subject"
+            );
+            assert!(
+                spec.basis.to_ascii_lowercase().contains("refuted"),
+                "{subject}: the refutation must be visible in the basis itself"
+            );
+            // And the grade is of the REFUTATION, which is itself a corpus
+            // measurement rather than a belief.
+            assert_eq!(spec.kind.level(), EvidenceLevel::Verified, "{subject}");
+        }
+        // The two that were graded `VERIFIED` for a false statement still grade
+        // `VERIFIED` — for their falsity. Nothing about the old grade leaked into
+        // the old claim.
+        assert_eq!(grade_of(DXT5_CARRIES_NO_COLOUR), EvidenceLevel::Verified);
+        assert_eq!(grade_of(DXT5_LAYERS_ARE_DISTINCT), EvidenceLevel::Verified);
+        // And a refutation carries a value: it is not a non-finding, because
+        // "we looked and found nothing" would be indistinguishable from never
+        // having looked.
+        assert!(spec_of(DXT5_CARRIES_NO_COLOUR)
+            .unwrap()
+            .kind
+            .can_carry_value());
+    }
+
+    #[test]
+    fn every_refutation_delegates_to_a_subject_the_measuring_crate_still_declares() {
+        // The delegation is checked, not assumed: a `refuted_by` that names a
+        // subject `spore_texture` has since deleted would silently turn this
+        // crate's evidence pointer into a dangling string. This is the defect
+        // class that produced the refuted `dxt5_carries_no_colour` in the first
+        // place -- a local restatement drifting from the crate that measured it.
+        let refuted = refuted_subjects();
+        assert_eq!(
+            refuted.len(),
+            4,
+            "four subjects are refuted; adding one must come with a basis saying so"
+        );
+        for (subject, by) in refuted {
+            let upstream = spore_texture::claims::claim(by)
+                .unwrap_or_else(|| panic!("{subject} names {by}, which spore-texture dropped"));
+            assert_ne!(
+                upstream.meaning.level(),
+                EvidenceLevel::Unknown,
+                "{subject}: delegated to a subject with no established meaning"
+            );
+        }
+    }
+
+    #[test]
+    fn a_claim_about_decoded_bc3_texels_never_exceeds_the_codecs_own_grade() {
+        // The rule that makes a refutation stick: this crate may not re-state,
+        // let alone upgrade, a reading of a codec the other crate graded.
+        let ceiling = bc3_claim_ceiling();
+        assert_eq!(ceiling, EvidenceLevel::Inferred);
+        assert_eq!(
+            ceiling,
+            spore_texture::claims::grade_of(spore_texture::claims::BC3_CODEC),
+            "the ceiling is whatever the crate that measured the codec says"
+        );
+        for subject in [
+            COLOUR_AND_MASK_CONTENT,
+            MASK_PLANE_INDEPENDENT_OF_COLOUR,
+            TEXTURE_CONTENT_ROLE,
+        ] {
+            assert!(
+                grade_of(subject) <= ceiling,
+                "{subject} is a statement about decoded BC3 texels and may not outrank \
+                 the BC3 codec itself"
+            );
+        }
+        // Three subjects sit exactly AT the ceiling, which is the honest place
+        // for them: no promotion, no penalty.
+        assert_eq!(grade_of(COLOUR_AND_MASK_CONTENT), ceiling);
+        assert_eq!(grade_of(MASK_PLANE_INDEPENDENT_OF_COLOUR), ceiling);
+        assert_eq!(grade_of(TEXTURE_CONTENT_ROLE), ceiling);
+        // And the counterpart, which is why the normal-map finding CAN be
+        // Verified: it is a claim about 0x15 records, whose texel layout upstream
+        // grades Verified on an independent measurement (lane 0 tracks the derived
+        // Z with correlation 0.954).
+        assert_eq!(grade_of(NORMAL_MAP_CONTENT), EvidenceLevel::Verified);
+        assert!(
+            spore_texture::claims::grade_of(spore_texture::claims::LUMINANCE_TEXEL_LAYOUT)
+                >= EvidenceLevel::Verified
         );
     }
 

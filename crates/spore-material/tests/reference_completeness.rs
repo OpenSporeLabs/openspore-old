@@ -221,7 +221,7 @@ fn roles_walk_the_whole_list_under_the_undetermined_scope() {
         ),
         (
             raster_key(0x4062_2900, 0x067C_79D2),
-            raster_record(8, 8, 2, DXT5_FOURCC, 2),
+            raster_record(16, 16, 2, DXT5_FOURCC),
         ),
         (
             raster_key(0x4062_2901, 0x067C_79D2),
@@ -254,7 +254,7 @@ fn roles_walk_the_whole_list_under_the_undetermined_scope() {
     assert_eq!(
         roles,
         vec![
-            Ok(spore_material::TextureRole::LayeredAlphaMask),
+            Ok(spore_material::TextureRole::ColourAndMask),
             Ok(spore_material::TextureRole::TangentSpaceNormal),
         ]
     );

@@ -12,7 +12,7 @@ use spore_core::ResourceKey;
 use spore_gmdl::GmdlTextureRef;
 use spore_material::{
     claims, inspect_envelope, resolve_model_record, resolve_model_textures, resolve_texture,
-    MaterialError,
+    MaterialError, MipStatistics, TextureRole,
 };
 use spore_texture::{DXT5_FOURCC, RASTER_TYPE};
 use support::*;
@@ -26,20 +26,20 @@ fn reference(group: u32) -> GmdlTextureRef {
 }
 
 /// The store the documented asset's three references resolve against:
-/// two 512x512-style DXT5 records and one luminance record.
+/// two 512x512-style DXT5 records and one `0x15` normal-map record.
 fn documented_store() -> ContentStore {
     store_over(&[
         (
             raster_key(0x4063_2900, DOCUMENTED_INSTANCE_ID),
-            raster_record(8, 8, 2, DXT5_FOURCC, 2),
+            raster_record(16, 16, 2, DXT5_FOURCC),
         ),
         (
             raster_key(0x4063_2901, DOCUMENTED_INSTANCE_ID),
-            raster_record(8, 8, 2, DXT5_FOURCC, 2),
+            raster_record(16, 16, 2, DXT5_FOURCC),
         ),
         (
             raster_key(0x4063_2902, DOCUMENTED_INSTANCE_ID),
-            luminance_raster(8, 8),
+            luminance_raster(16, 16),
         ),
     ])
 }
@@ -57,67 +57,99 @@ fn documented_store_with_a_corrupt_third() -> ContentStore {
         (documented_model_key(), documented_gmdl()),
         (
             raster_key(0x4063_2900, DOCUMENTED_INSTANCE_ID),
-            raster_record(8, 8, 2, DXT5_FOURCC, 2),
+            raster_record(16, 16, 2, DXT5_FOURCC),
         ),
         (
             raster_key(0x4063_2901, DOCUMENTED_INSTANCE_ID),
-            raster_record(8, 8, 2, DXT5_FOURCC, 2),
+            raster_record(16, 16, 2, DXT5_FOURCC),
         ),
         (
             raster_key(0x4063_2902, DOCUMENTED_INSTANCE_ID),
-            malformed_luminance_raster(8, 8),
+            malformed_luminance_raster(16, 16),
         ),
     ])
 }
 
 #[test]
-fn a_synthetic_raster_resolves_to_the_base_mip_of_layer_zero() {
+fn a_synthetic_raster_resolves_to_the_base_mip_of_its_one_chain() {
     let store = store_over(&[(
         raster_key(0x4063_2900, DOCUMENTED_INSTANCE_ID),
-        two_layer_raster(),
+        dxt5_raster(),
     )]);
     let resolved = resolve_texture(&store, reference(0x4063_2900), RASTER_TYPE).unwrap();
 
     // Envelope, carried verbatim.
     assert_eq!(resolved.envelope.fourcc, DXT5_FOURCC);
     assert_eq!(resolved.envelope.version, 1);
-    assert_eq!(resolved.envelope.width, 8);
-    assert_eq!(resolved.envelope.height, 8);
+    assert_eq!(resolved.envelope.width, 16);
+    assert_eq!(resolved.envelope.height, 16);
     assert_eq!(resolved.envelope.mip_count, 2);
 
-    // Counts: mips from the envelope, layers DERIVED from the record size.
+    // Counts: mips from the envelope, chains from the decode. The chain count is
+    // ONE and nothing is derived: the decoder checked the record's length against
+    // its framing identity, so a mismatch was refused rather than divided.
     assert_eq!(resolved.mip_count, 2);
-    assert_eq!(resolved.layer_count, 2);
+    assert_eq!(resolved.layer_count, 1, "one chain, not two");
+    assert_eq!(resolved.layers.len(), resolved.layer_count);
     assert_eq!(
         resolved.mip_count, resolved.envelope.mip_count as usize,
         "the published count is the envelope's, not a re-derived one"
     );
 
-    // The image is the base mip of the FIRST layer, and it is not empty.
-    assert_eq!(resolved.image.width, 8);
-    assert_eq!(resolved.image.height, 8);
-    assert_eq!(resolved.pixel_len(), 8 * 8 * 4);
+    // The image is the base mip and it is not empty.
+    assert_eq!(resolved.image.width, 16);
+    assert_eq!(resolved.image.height, 16);
+    assert_eq!(resolved.pixel_len(), 16 * 16 * 4);
     assert_eq!(resolved.pixel_len(), resolved.image.pixels.len());
     assert!(
         resolved.pixels_decoded(),
         "a full resolve decodes pixels, and says so"
     );
 
-    // The first block of layer 0 is the flat block, whose every texel is
-    // palette[0] = (8,0,0) with the reversed-free ramp's entry round(2*255/8).
-    assert_eq!(&resolved.image.pixels[0..4], &[8, 0, 0, 64]);
-    // Block index 2 of layer 0 mip 0 is `addressing_block((1*37 + 1*11 + 2) % 16)
-    // = addressing_block(2)`, whose texel `t` takes code `(2 >> t) & 1`: texel 0
-    // takes code 0 and texel 1 — the only set bit of 2 — takes code 1. Block 2
-    // starts at texel 16, i.e. byte 64 of the base mip. A decode that read the
-    // wrong layer, mip or block would not put a zero alpha exactly there.
-    let block_2 = 2 * 4 * 4 * 4;
-    assert_eq!(&resolved.image.pixels[block_2..block_2 + 4], &[8, 0, 0, 64]);
-    let block_2_texel_1 = block_2 + 4;
+    // The first block of the base mip is `support::colour_block(0)`: alpha0 = 40,
+    // alpha1 = 0, colour0 = r5g6b5(0, 8, 16) and every texel of that block taking
+    // colour index 0 and alpha index 0. So the first texel is colour0 expanded and
+    // the ramp's first entry.
+    //
+    // The expectation is computed from the **published** expansion rules and the
+    // stored colour WORD, not from whatever the decoder happens to produce: the
+    // fixture stores `(r5, g6, b5) = (0, 2, 2)` for `(0, 8, 16)`, because the
+    // quantisation is `(v * n + 127) / 255` and the *expansion* is bit
+    // replication — two different functions, and conflating them is how a
+    // golden-value test stops being one.
+    let block = colour_block(0);
+    let stored = u16::from_le_bytes([block[8], block[9]]);
     assert_eq!(
-        &resolved.image.pixels[block_2_texel_1..block_2_texel_1 + 4],
-        &[0, 0, 0, 0],
-        "code 1 is palette[1] = (0,0,0) with the ramp's zero alpha"
+        stored,
+        (2u16 << 5) | 2,
+        "r5g6b5(0, 8, 16) quantises to r5=0, g6=2, b5=2 -- the word the fixture stores"
+    );
+    assert_eq!(block[0], 40, "alpha0");
+    assert_eq!(block[1], 0, "alpha1");
+    let expected = expand_expect(0, 2, 2, 40);
+    assert_eq!(&resolved.image.pixels[0..4], &expected);
+    assert!(
+        resolved.channels().len() == 4,
+        "one chain of four lanes, not two chains of four"
+    );
+
+    // **The mis-offset property this assertion exists for, restated for BC3.**
+    // Block index 1 of the base mip is `colour_block(((0 + 1) * 11 + 1) % 16)
+    // = colour_block(12)`, whose texel 0 takes colour code 0 and texel 1 takes
+    // colour code 1 — so the two differ in value. A decode that walked the wrong
+    // level, the wrong offset into the chain, or a second chain that does not
+    // exist would not put these bytes exactly here.
+    let block_1 = 16 * 4;
+    let b12 = colour_block(12);
+    assert_ne!(
+        b12[12..16],
+        [0, 0, 0, 0],
+        "the addressing block must actually differ per texel, or this test is vacuous"
+    );
+    assert_ne!(
+        &resolved.image.pixels[block_1..block_1 + 4],
+        &resolved.image.pixels[block_1 + 4..block_1 + 8],
+        "two adjacent texels of the same block must decode differently"
     );
 
     assert_eq!(resolved.kind.as_str(), "raster");
@@ -127,6 +159,23 @@ fn a_synthetic_raster_resolves_to_the_base_mip_of_layer_zero() {
         ResourceKey::new(RASTER_TYPE, 0x4063_2900, DOCUMENTED_INSTANCE_ID),
         "the key published is the one used, with the type made explicit"
     );
+}
+
+/// The RGBA a BC3 block's first palette entry decodes to, computed from the
+/// published expansion rules rather than from a recorded constant.
+///
+/// 5-bit channels expand by bit replication, `(v << 3) | (v >> 2)`; the 6-bit
+/// green by `(v << 2) | (v >> 4)`. Written out here so the test does not merely
+/// restate whatever the decoder happens to produce — which is the mistake the
+/// golden-value tests in `spore-texture` exist to catch.
+fn expand_expect(r: u8, g: u8, b: u8, a: u8) -> [u8; 4] {
+    fn expand5(v: u32) -> u8 {
+        ((v << 3) | (v >> 2)) as u8
+    }
+    fn expand6(v: u32) -> u8 {
+        ((v << 2) | (v >> 4)) as u8
+    }
+    [expand5(r as u32), expand6(g as u32), expand5(b as u32), a]
 }
 
 #[test]
@@ -162,10 +211,14 @@ fn the_resolution_records_what_it_assumed_and_what_it_does_not_know() {
     assert_eq!(absent.fact.level(), EvidenceLevel::Unknown);
     assert!(absent.fact.provenance().is_empty());
 
-    // The three unnamed envelope words stay unknown.
+    // The three unnamed envelope words stay unknown. `field_18` is now a KNOWN
+    // word -- spore-texture verified it as the base level's own byte count in
+    // 4386 of 4386 records and the decoder reads it as a cross-check -- so this
+    // crate republishes the upstream finding. It used to be a local non-finding
+    // with no basis, which is the shape a claim takes when nobody says where it
+    // came from.
     for subject in [
         claims::ENVELOPE_FIELD_10_MEANING,
-        claims::ENVELOPE_FIELD_18_MEANING,
         claims::ENVELOPE_FIELD_1C_MEANING,
     ] {
         let claim = resolved.claim(subject).expect(subject);
@@ -173,6 +226,11 @@ fn the_resolution_records_what_it_assumed_and_what_it_does_not_know() {
         assert_eq!(claim.fact.level(), EvidenceLevel::Unknown, "{subject}");
         assert!(claim.fact.provenance().is_empty(), "{subject}");
     }
+    assert_eq!(
+        resolved.envelope.field_18,
+        (16 * 16 / 16) * 16,
+        "field_18 is the base level's own byte count: 16 blocks of 16 bytes"
+    );
 
     // The luminance family used to be in that loop. It is not any more: the
     // corpus refuted the refusal, `spore-texture` decoded all 901 records, and
@@ -210,9 +268,12 @@ fn the_resolution_records_what_it_assumed_and_what_it_does_not_know() {
         group.fact.reason(),
         Some(claims::NO_GROUP_NAME_IN_CANONICAL_TABLE)
     );
-    // The unknown set is enumerated rather than floored. It used to be
-    // `>= 6`, which survived the luminance claim moving from non-finding to
-    // VERIFIED only by accident -- a floor cannot notice a fact being *lost*.
+    // The unknown set is enumerated rather than floored. It used to be `>= 6`,
+    // which survived two claims moving from non-finding to a graded value only by
+    // accident -- a floor cannot notice a fact being *lost*. The list shrank from
+    // six to five on 2026-10-05: `envelope_field_18_meaning` left it, because
+    // spore-texture measured the word and this crate now delegates to it instead
+    // of republishing it as unknown.
     let unknowns: Vec<&str> = resolved
         .unknowns()
         .map(|claim| claim.subject.as_str())
@@ -223,27 +284,60 @@ fn the_resolution_records_what_it_assumed_and_what_it_does_not_know() {
             claims::TEXTURE_REFERENCE_TYPE_WORD,
             claims::RESOLVED_GROUP_NAME,
             claims::ENVELOPE_FIELD_10_MEANING,
-            claims::ENVELOPE_FIELD_18_MEANING,
             claims::ENVELOPE_FIELD_1C_MEANING,
-            // The mask layer's PURPOSE is a non-finding even though its content
-            // is known and graded: content is not purpose. Adding it here is
-            // the point -- a claim that stops being recorded is as much a
-            // regression as one that starts.
+            // The fourth plane's PURPOSE is a non-finding even though its content
+            // is measured. Adding it here is the point -- a claim that stops
+            // being recorded is as much a regression as one that starts.
             claims::MASK_LAYER_PURPOSE,
         ],
-        "six facts are genuinely unknown, and this list is the whole of them"
+        "five facts are genuinely unknown, and this list is the whole of them"
     );
     assert!(
         !unknowns.contains(&claims::LUMINANCE_FOURCC_FAMILY),
         "the 0x15 family is no longer one of the unknowns"
     );
+    assert!(
+        !unknowns.contains(&claims::ENVELOPE_FIELD_18_MEANING),
+        "field_18 is measured upstream, so this crate republishes it as a value"
+    );
 
-    // The codec's departures from the BC3 specification are re-published, so a
-    // caller reading only these claims learns that the pixels are not spec DXT5.
-    let deviations = resolved
-        .claim(claims::DXT5_SPEC_DEVIATIONS)
+    // The refutations are recorded as VALUES, not as non-findings. "We looked
+    // and found nothing" would be indistinguishable from never having looked, and
+    // the whole point of keeping them is that the next reader can see them.
+    for subject in [
+        claims::LAYER_COUNT_IS_DERIVED,
+        claims::DXT5_CARRIES_NO_COLOUR,
+        claims::DXT5_LAYERS_ARE_DISTINCT,
+        claims::DXT5_SPEC_DEVIATIONS,
+    ] {
+        let claim = resolved
+            .claim(subject)
+            .unwrap_or_else(|| panic!("{subject}"));
+        assert!(
+            claim.fact.is_available(),
+            "{subject}: a refutation carries a value"
+        );
+        assert!(
+            claim
+                .fact
+                .value()
+                .expect("a value")
+                .to_ascii_lowercase()
+                .contains("refut"),
+            "{subject}: the recorded text must say it is a refutation"
+        );
+    }
+    // And the claim that replaces the old 'no colour' one is present, at the
+    // BC3 ceiling rather than above it.
+    let colour = resolved
+        .claim(claims::COLOUR_AND_MASK_CONTENT)
         .expect("subject");
-    assert_eq!(deviations.fact.level(), EvidenceLevel::Verified);
+    assert_eq!(colour.fact.level(), EvidenceLevel::Inferred);
+    assert_eq!(colour.fact.level(), claims::bc3_claim_ceiling());
+    let independence = resolved
+        .claim(claims::MASK_PLANE_INDEPENDENT_OF_COLOUR)
+        .expect("subject");
+    assert!(independence.fact.is_available());
 }
 
 #[test]
@@ -296,15 +390,15 @@ fn results_come_back_in_the_order_the_record_referenced_them() {
     let store = store_over(&[
         (
             raster_key(0x4063_2900, DOCUMENTED_INSTANCE_ID),
-            raster_record(8, 8, 2, DXT5_FOURCC, 2),
+            raster_record(8, 8, 2, DXT5_FOURCC),
         ),
         (
             raster_key(0x4063_2901, DOCUMENTED_INSTANCE_ID),
-            raster_record(16, 16, 1, DXT5_FOURCC, 1),
+            raster_record(16, 16, 1, DXT5_FOURCC),
         ),
         (
             raster_key(0x4063_2902, DOCUMENTED_INSTANCE_ID),
-            raster_record(4, 4, 1, DXT5_FOURCC, 1),
+            raster_record(32, 32, 1, DXT5_FOURCC),
         ),
     ]);
     let model = spore_gmdl::parse(&documented_gmdl()).unwrap();
@@ -316,7 +410,7 @@ fn results_come_back_in_the_order_the_record_referenced_them() {
         .iter()
         .map(|result| result.as_ref().expect("all three resolve").image.width)
         .collect();
-    assert_eq!(widths, vec![8, 16, 4], "encounter order, not sorted order");
+    assert_eq!(widths, vec![8, 16, 32], "encounter order, not sorted order");
     let groups: Vec<u32> = results
         .iter()
         .map(|result| result.as_ref().unwrap().key.group_id)
@@ -369,12 +463,12 @@ fn a_missing_record_in_the_middle_leaves_its_neighbours_intact() {
     let store = store_over(&[
         (
             raster_key(0x4063_2900, DOCUMENTED_INSTANCE_ID),
-            raster_record(8, 8, 2, DXT5_FOURCC, 2),
+            raster_record(16, 16, 2, DXT5_FOURCC),
         ),
         // 0x40632901 is deliberately absent.
         (
             raster_key(0x4063_2902, DOCUMENTED_INSTANCE_ID),
-            raster_record(4, 4, 1, DXT5_FOURCC, 1),
+            raster_record(32, 32, 1, DXT5_FOURCC),
         ),
     ]);
     let model = spore_gmdl::parse(&documented_gmdl()).unwrap();
@@ -387,7 +481,7 @@ fn a_missing_record_in_the_middle_leaves_its_neighbours_intact() {
         results[2].is_ok(),
         "a failure must not remove a later success"
     );
-    assert_eq!(results[2].as_ref().unwrap().image.width, 4);
+    assert_eq!(results[2].as_ref().unwrap().image.width, 32);
 }
 
 #[test]
@@ -475,8 +569,8 @@ fn the_assumed_type_is_honoured_and_the_failure_names_it() {
 fn inspecting_an_envelope_answers_the_cheap_question_without_pixels() {
     let store = documented_store();
     let envelope = inspect_envelope(&store, reference(0x4063_2900), RASTER_TYPE).unwrap();
-    assert_eq!(envelope.envelope.width, 8);
-    assert_eq!(envelope.envelope.height, 8);
+    assert_eq!(envelope.envelope.width, 16);
+    assert_eq!(envelope.envelope.height, 16);
     assert_eq!(envelope.mip_count, 2);
     assert_eq!(
         envelope.pixel_len(),
@@ -487,10 +581,23 @@ fn inspecting_an_envelope_answers_the_cheap_question_without_pixels() {
         !envelope.pixels_decoded(),
         "an empty image must be distinguishable from a decode that produced nothing"
     );
+    // **Zero, not one.** A full decode answers this with 1; a header read has
+    // looked at nothing that could answer it, and reporting the count it *would*
+    // have derived would be claiming a measurement that did not happen. This is
+    // the crate's "we did not look", not "we looked and found nothing".
     assert_eq!(
         envelope.layer_count, 0,
-        "the layer count is derived from the payload, which was never read"
+        "inspect states no chain count rather than guessing the one a decode reports"
     );
+    assert_eq!(envelope.layers.len(), 0);
+    assert_eq!(envelope.statistics, MipStatistics::empty());
+    assert_eq!(
+        envelope.mask_plane_varies(),
+        None,
+        "no texel was examined, so no answer exists"
+    );
+    assert_eq!(envelope.channels().len(), 0, "no texel was examined");
+    assert_eq!(envelope.role, TextureRole::Unidentified);
     assert!(
         envelope.claim(claims::ASSUMED_RECORD_TYPE).is_some(),
         "the envelope answer carries the same assumption record as the full one"
@@ -505,10 +612,7 @@ fn inspecting_an_envelope_answers_the_cheap_question_without_pixels() {
     // decoded".
     let luminance = inspect_envelope(&store, reference(0x4063_2902), RASTER_TYPE).unwrap();
     assert_eq!(luminance.envelope.fourcc, LUMINANCE_FOURCC);
-    assert_eq!(
-        luminance.layer_count, 0,
-        "inspect derives no layer count: it reads no payload, so it reports zero"
-    );
+    assert_eq!(luminance.layer_count, 0);
 
     // It now decodes as well. That half of this assertion used to be a refusal,
     // which is the change the corpus forced.
@@ -516,8 +620,9 @@ fn inspecting_an_envelope_answers_the_cheap_question_without_pixels() {
         .expect("the 0x15 family decodes");
     assert_eq!(
         decoded.layer_count, 1,
-        "the decode does derive a layer count"
+        "the decode does report the chain count, and it is 1"
     );
+    assert_eq!(decoded.mask_plane_varies(), None, "not a DXT5 record");
 
     // And the refusal path is still reachable, for a record that is actually
     // broken rather than merely in a family that used to be unsupported.
@@ -525,15 +630,15 @@ fn inspecting_an_envelope_answers_the_cheap_question_without_pixels() {
         (documented_model_key(), documented_gmdl()),
         (
             raster_key(0x4063_2900, DOCUMENTED_INSTANCE_ID),
-            raster_record(8, 8, 2, DXT5_FOURCC, 2),
+            raster_record(16, 16, 2, DXT5_FOURCC),
         ),
         (
             raster_key(0x4063_2901, DOCUMENTED_INSTANCE_ID),
-            raster_record(8, 8, 2, DXT5_FOURCC, 2),
+            raster_record(16, 16, 2, DXT5_FOURCC),
         ),
         (
             raster_key(0x4063_2902, DOCUMENTED_INSTANCE_ID),
-            malformed_luminance_raster(8, 8),
+            malformed_luminance_raster(16, 16),
         ),
     ]);
     let refused = resolve_texture(&broken, reference(0x4063_2902), RASTER_TYPE).unwrap_err();
@@ -553,11 +658,11 @@ fn a_model_record_resolves_through_the_gmdl_layer() {
         (documented_model_key(), documented_gmdl()),
         (
             raster_key(0x4063_2900, DOCUMENTED_INSTANCE_ID),
-            raster_record(8, 8, 2, DXT5_FOURCC, 2),
+            raster_record(16, 16, 2, DXT5_FOURCC),
         ),
         (
             raster_key(0x4063_2901, DOCUMENTED_INSTANCE_ID),
-            raster_record(8, 8, 2, DXT5_FOURCC, 2),
+            raster_record(16, 16, 2, DXT5_FOURCC),
         ),
         (
             raster_key(0x4063_2902, DOCUMENTED_INSTANCE_ID),

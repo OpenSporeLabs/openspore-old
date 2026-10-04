@@ -21,11 +21,11 @@ fn documented_model_store() -> spore_assets::ContentStore {
         (documented_model_key(), documented_gmdl()),
         (
             raster_key(0x4063_2900, DOCUMENTED_INSTANCE_ID),
-            raster_record(8, 8, 2, spore_texture::DXT5_FOURCC, 2),
+            raster_record(16, 16, 2, spore_texture::DXT5_FOURCC),
         ),
         (
             raster_key(0x4063_2901, DOCUMENTED_INSTANCE_ID),
-            raster_record(8, 8, 2, spore_texture::DXT5_FOURCC, 2),
+            raster_record(16, 16, 2, spore_texture::DXT5_FOURCC),
         ),
         (
             raster_key(0x4063_2902, DOCUMENTED_INSTANCE_ID),
@@ -88,14 +88,17 @@ fn the_documented_assets_own_shape_is_the_two_mask_one_normal_measurement() {
     .expect("the model record resolves");
     // Measured corpus: a `(DXT5, DXT5, 0x15)` set in 1922 of 2381 sets. This
     // model's roles come out in that order, from its own records' content.
-    assert_eq!(resolved.observed_shape, TexSetShape::MaskMaskNormal);
+    assert_eq!(
+        resolved.observed_shape,
+        TexSetShape::ColourAndMaskTwiceThenNormal
+    );
     assert!(resolved.observed_shape.matches_corpus());
     // And the roles are what the renderer needs, in slot order.
     assert_eq!(
         resolved.roles(),
         vec![vec![
-            TextureRole::LayeredAlphaMask,
-            TextureRole::LayeredAlphaMask,
+            TextureRole::ColourAndMask,
+            TextureRole::ColourAndMask,
             TextureRole::TangentSpaceNormal,
         ]],
         "the normal map is the LAST slot, and that came from its content"
@@ -103,7 +106,7 @@ fn the_documented_assets_own_shape_is_the_two_mask_one_normal_measurement() {
     assert_eq!(
         resolved.role_census(),
         vec![
-            (TextureRole::LayeredAlphaMask, 2),
+            (TextureRole::ColourAndMask, 2),
             (TextureRole::TangentSpaceNormal, 1),
         ]
     );
@@ -152,20 +155,20 @@ fn two_meshes_split_six_references_three_each_and_the_roles_do_not_cross_over() 
         ),
         (
             raster_key(0x4063_2900, 1),
-            raster_record(8, 8, 2, spore_texture::DXT5_FOURCC, 2),
+            raster_record(16, 16, 2, spore_texture::DXT5_FOURCC),
         ),
         (
             raster_key(0x4063_2901, 1),
-            raster_record(8, 8, 2, spore_texture::DXT5_FOURCC, 2),
+            raster_record(16, 16, 2, spore_texture::DXT5_FOURCC),
         ),
         (raster_key(0x4063_2902, 1), luminance_raster(16, 16)),
         (
             raster_key(0x4064_2900, 1),
-            raster_record(8, 8, 2, spore_texture::DXT5_FOURCC, 2),
+            raster_record(16, 16, 2, spore_texture::DXT5_FOURCC),
         ),
         (
             raster_key(0x4064_2901, 1),
-            raster_record(8, 8, 2, spore_texture::DXT5_FOURCC, 2),
+            raster_record(16, 16, 2, spore_texture::DXT5_FOURCC),
         ),
         (raster_key(0x4064_2902, 1), luminance_raster(16, 16)),
     ]);
@@ -191,13 +194,13 @@ fn two_meshes_split_six_references_three_each_and_the_roles_do_not_cross_over() 
         resolved.roles(),
         vec![
             vec![
-                TextureRole::LayeredAlphaMask,
-                TextureRole::LayeredAlphaMask,
+                TextureRole::ColourAndMask,
+                TextureRole::ColourAndMask,
                 TextureRole::TangentSpaceNormal,
             ],
             vec![
-                TextureRole::LayeredAlphaMask,
-                TextureRole::LayeredAlphaMask,
+                TextureRole::ColourAndMask,
+                TextureRole::ColourAndMask,
                 TextureRole::TangentSpaceNormal,
             ],
         ]
@@ -325,11 +328,11 @@ fn a_failed_resolution_leaves_the_slot_and_reports_no_role() {
         (documented_model_key(), documented_gmdl()),
         (
             raster_key(0x4063_2900, DOCUMENTED_INSTANCE_ID),
-            raster_record(8, 8, 2, spore_texture::DXT5_FOURCC, 2),
+            raster_record(16, 16, 2, spore_texture::DXT5_FOURCC),
         ),
         (
             raster_key(0x4063_2901, DOCUMENTED_INSTANCE_ID),
-            raster_record(8, 8, 2, spore_texture::DXT5_FOURCC, 2),
+            raster_record(16, 16, 2, spore_texture::DXT5_FOURCC),
         ),
     ];
     records.push((
@@ -348,8 +351,8 @@ fn a_failed_resolution_leaves_the_slot_and_reports_no_role() {
     assert_eq!(
         partial.roles()[0],
         vec![
-            TextureRole::LayeredAlphaMask,
-            TextureRole::LayeredAlphaMask,
+            TextureRole::ColourAndMask,
+            TextureRole::ColourAndMask,
             // The reference is still there; its record is not. "Unidentified"
             // is what an unchecked slot reports, and `failures()` is where the
             // reason lives.
@@ -360,8 +363,8 @@ fn a_failed_resolution_leaves_the_slot_and_reports_no_role() {
     assert_eq!(
         partial.observed_shape,
         TexSetShape::Divergent(vec![
-            TextureRole::LayeredAlphaMask,
-            TextureRole::LayeredAlphaMask,
+            TextureRole::ColourAndMask,
+            TextureRole::ColourAndMask,
             TextureRole::Unidentified,
         ])
     );

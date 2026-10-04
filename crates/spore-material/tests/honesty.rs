@@ -1,4 +1,4 @@
-//! The invariants this crate exists to protect.
+//! # The invariants this crate exists to protect.
 //!
 //! Three of them, all testable and all easy to lose in an edit:
 //!
@@ -8,14 +8,21 @@
 //! 2. **No sampler role is claimed.** [`SamplerRole`] has one variant and every
 //!    binding carries it.
 //! 3. **No unestablished *purpose* is ever named as a role.** This one was
-//!    sharpened rather than relaxed. The original sweep forbade the words
-//!    outright, which was right when this crate knew nothing about any
-//!    texture's content. It now knows two things from the corpus — a
-//!    `0x15` record is a tangent-space normal map, and a `DXT5` record is a
-//!    layered single-channel mask — so "mention no purpose at all" is no longer
-//!    the invariant worth protecting. The invariant is: **a purpose nobody
-//!    established may never be asserted**, and naming it is only allowed where
-//!    the same sentence says it is unknown.
+//!    sharpened rather than relaxed, and then **sharpened a second time** on
+//!    2026-10-05. It originally forbade the words outright, which was right when
+//!    this crate knew nothing about any texture's content. It then knew two
+//!    things from the corpus — a `0x15` record is a tangent-space normal map and
+//!    a `DXT5` record is a layered single-channel mask — so "mention no purpose
+//!    at all" stopped being the invariant worth protecting.
+//!
+//!    **What the corpus then refuted was the second of those two things.** A
+//!    `DXT5` record is *not* a layered single-channel mask; it is a colour image
+//!    with a fourth plane, and the mask framing was an artefact of a codec that
+//!    read 8 bytes per block where the records hold 16. So the invariant is
+//!    unchanged in kind and considerably sharper in consequence: **not one lane
+//!    of a `DXT5` record has an established purpose**, where before the refuted
+//!    model let its alpha plane look like a mask with a job. Content is not
+//!    purpose, and a real colour image does not make the purpose known either.
 
 mod support;
 
@@ -168,13 +175,14 @@ fn no_role_or_channel_spelling_names_an_unestablished_purpose() {
     // `TextureRole::as_str()` and `ChannelRole::as_str()`, so those strings must
     // not name a purpose the corpus did not establish.
     const FORBIDDEN: [&str; 6] = ["diffuse", "specular", "gloss", "bump", "emissive", "albedo"];
-    let established = [
-        TextureRole::TangentSpaceNormal.as_str(),
-        TextureRole::LayeredAlphaMask.as_str(),
-    ];
+    // The **channel** roles with an established purpose, and nothing else. Since
+    // 2026-10-05 that is the three normal components only: the refuted
+    // two-layer model let a DXT5 alpha plane look like a mask with a job, and
+    // nothing established any lane of a DXT5 record's purpose.
+    const ESTABLISHED_CHANNELS: [&str; 3] = ["normal-z", "normal-x", "normal-y"];
     for role in [
         TextureRole::TangentSpaceNormal,
-        TextureRole::LayeredAlphaMask,
+        TextureRole::ColourAndMask,
         TextureRole::Unidentified,
     ] {
         let lowered = role.as_str().to_ascii_lowercase();
@@ -185,13 +193,16 @@ fn no_role_or_channel_spelling_names_an_unestablished_purpose() {
                 role.as_str()
             );
         }
+        // And a role names no purpose at all: not even the normal map is claimed
+        // to be *used* as one by the game.
+        assert!(!role.as_str().contains("normal") || role == TextureRole::TangentSpaceNormal);
     }
     for role in [
         ChannelRole::NormalZ,
         ChannelRole::NormalX,
         ChannelRole::NormalY,
+        ChannelRole::ColourPlane,
         ChannelRole::MaskChannel,
-        ChannelRole::DegenerateColour,
         ChannelRole::UnidentifiedLane,
     ] {
         let lowered = role.as_str().to_ascii_lowercase();
@@ -202,19 +213,30 @@ fn no_role_or_channel_spelling_names_an_unestablished_purpose() {
                 role.as_str()
             );
         }
-        // And a purpose-free spelling still does not imply a known purpose: only
-        // the three normal roles have one.
+        // And a purpose-free spelling still does not imply a known purpose.
         assert_eq!(
             role.purpose_established(),
-            established.contains(&role.as_str()) || role.purpose_established(),
+            ESTABLISHED_CHANNELS.contains(&role.as_str()),
             "{}",
             role.as_str()
         );
     }
-    // The two content facts this crate DOES state, stated positively so the
-    // sweep above cannot be satisfied by saying nothing at all.
-    assert!(established.contains(&"tangent-space-normal"));
-    assert!(established.contains(&"layered-alpha-mask"));
+    // The content facts this crate DOES state, stated positively so the sweep
+    // above cannot be satisfied by saying nothing at all -- and so a reader
+    // cannot mistake "no purpose established" for "nothing established".
+    assert!(ESTABLISHED_CHANNELS.contains(&ChannelRole::NormalZ.as_str()));
+    assert!(!ESTABLISHED_CHANNELS.contains(&ChannelRole::ColourPlane.as_str()));
+    assert_eq!(
+        TextureRole::ColourAndMask.as_str(),
+        "colour-and-mask",
+        "the DXT5 role must say the colour is REAL; the old 'layered-alpha-mask' \
+         spelling denied it on the authority of a broken codec"
+    );
+    assert_eq!(
+        ChannelRole::ColourPlane.as_str(),
+        "colour-plane",
+        "and a lane's spelling must not still say the colour is degenerate"
+    );
     assert!(
         !TextureRole::Unidentified.as_str().contains("normal"),
         "an unidentified texture claims nothing, least of all a normal map"
@@ -226,7 +248,7 @@ fn no_recorded_claim_value_names_an_unestablished_purpose() {
     const FORBIDDEN: [&str; 6] = ["diffuse", "specular", "gloss", "bump", "emissive", "albedo"];
     let store = store_over(&[(
         raster_key(0x4063_2900, DOCUMENTED_INSTANCE_ID),
-        raster_record(8, 8, 2, DXT5_FOURCC, 2),
+        raster_record(16, 16, 2, DXT5_FOURCC),
     )]);
     let resolved = resolve_texture(&store, documented_texture_refs()[0], RASTER_TYPE).unwrap();
     let mut recorded: Vec<String> = resolved
@@ -260,6 +282,17 @@ fn no_recorded_claim_value_names_an_unestablished_purpose() {
     assert!(
         combined.contains("normal map"),
         "the 0x15 normal-map finding must actually be stated, not merely permitted"
+    );
+    assert!(
+        combined.contains("colour"),
+        "and since 2026-10-05 the colour finding must be stated too: the previous \
+         version passed this sweep by DENYING that these records carry colour, which \
+         was a measurement of a broken codec"
+    );
+    assert!(
+        combined.contains("refuted"),
+        "the refutations must appear in the recorded values, or a reader cannot tell \
+         which claims changed"
     );
 }
 
@@ -344,7 +377,7 @@ fn the_claims_table_declares_no_subject_this_crate_cannot_record() {
     // producer, which is its own kind of dishonesty.
     let store = store_over(&[(
         raster_key(0x4063_2900, DOCUMENTED_INSTANCE_ID),
-        raster_record(8, 8, 2, DXT5_FOURCC, 2),
+        raster_record(16, 16, 2, DXT5_FOURCC),
     )]);
     // Three producers, because the claim table spans three levels: a resolved
     // texture, a mesh's material, and the model as a whole.
@@ -357,11 +390,11 @@ fn the_claims_table_declares_no_subject_this_crate_cannot_record() {
         (documented_model_key(), documented_gmdl()),
         (
             raster_key(0x4063_2900, DOCUMENTED_INSTANCE_ID),
-            raster_record(8, 8, 2, DXT5_FOURCC, 2),
+            raster_record(16, 16, 2, DXT5_FOURCC),
         ),
         (
             raster_key(0x4063_2901, DOCUMENTED_INSTANCE_ID),
-            raster_record(8, 8, 2, DXT5_FOURCC, 2),
+            raster_record(16, 16, 2, DXT5_FOURCC),
         ),
         (
             raster_key(0x4063_2902, DOCUMENTED_INSTANCE_ID),

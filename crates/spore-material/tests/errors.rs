@@ -23,7 +23,7 @@ fn a_missing_record_yields_a_typed_error_naming_the_key() {
     // A store with one record, asked for a different instance.
     let store = store_over(&[(
         raster_key(0x4063_2900, DOCUMENTED_INSTANCE_ID),
-        two_layer_raster(),
+        dxt5_raster(),
     )]);
     let absent = GmdlTextureRef {
         instance_id: 0x067A_07FF,
@@ -140,8 +140,8 @@ fn a_malformed_luminance_record_is_a_typed_error_not_a_blank_image() {
     );
     let text = error.to_string();
     assert!(
-        text.contains("luminance") || text.contains("0x15"),
-        "the failing family must be named: {text}"
+        text.contains(&format!("0x{:08x}", LUMINANCE_FOURCC)) && text.contains("implies"),
+        "the failing family must be named and the arithmetic stated: {text}"
     );
 
     // And still no empty image: a refusal returns nothing at all.
@@ -160,7 +160,7 @@ fn an_unrelated_fourcc_is_still_refused_by_name() {
     const BOGUS: u32 = 0x1234_5678;
     let store = store_over(&[(
         raster_key(0x4063_2900, DOCUMENTED_INSTANCE_ID),
-        raster_record(16, 16, 2, BOGUS, 1),
+        raster_record(16, 16, 2, BOGUS),
     )]);
     let error = resolve_texture(&store, first_reference(), RASTER_TYPE).unwrap_err();
 
@@ -187,7 +187,7 @@ fn an_unrelated_fourcc_is_still_refused_by_name() {
 #[test]
 fn every_other_texture_refusal_arrives_as_a_decode_error_with_its_own_reason() {
     let key = raster_key(0x4063_2900, DOCUMENTED_INSTANCE_ID);
-    let store = store_over(&[(key, two_layer_raster())]);
+    let store = store_over(&[(key, dxt5_raster())]);
 
     // A truncated record: the envelope does not fit.
     let truncated = store_over(&[(key, vec![0u8; 8])]);
@@ -201,22 +201,58 @@ fn every_other_texture_refusal_arrives_as_a_decode_error_with_its_own_reason() {
     );
     assert!(error.to_string().contains("32-byte raster envelope"));
 
-    // A payload that does not divide by the layer stride.
-    let mut misaligned = two_layer_raster();
+    // A record whose length is not the one its own envelope implies. **The test
+    // used to say "a payload that does not divide by the layer stride" and to
+    // expect `TextureError::PayloadNotMultiple`.** There is no layer stride any
+    // more — one chain, and the record length is fully determined by the framing
+    // identity — so that variant is gone from `spore-texture` and the check that
+    // replaced it is strictly stronger: it quotes the record size it found, the
+    // one it expected, the geometry and the format word, and it refuses rather
+    // than rounding. The property this test protects is unchanged: a record one
+    // byte longer than it claims is a typed decode error, never a padded or
+    // truncated decode.
+    let mut misaligned = dxt5_raster();
     misaligned.push(0);
     let misaligned_store = store_over(&[(key, misaligned)]);
     let error = resolve_texture(&misaligned_store, first_reference(), RASTER_TYPE).unwrap_err();
     assert!(matches!(
         error,
         MaterialError::Decode {
-            source: TextureError::PayloadNotMultiple { .. },
+            source: TextureError::RecordSizeMismatch { .. },
             ..
         }
     ));
-    assert!(error.to_string().contains("layer stride"));
+    let text = error.to_string();
+    assert!(
+        text.contains("implies"),
+        "the arithmetic must be stated: {text}"
+    );
+    assert!(
+        text.contains(&format!("0x{:08x}", DXT5_FOURCC)),
+        "and the format named: {text}"
+    );
+    // One byte over, and the reported pair differs by exactly one.
+    let MaterialError::Decode {
+        source:
+            TextureError::RecordSizeMismatch {
+                record_size,
+                expected,
+                ..
+            },
+        ..
+    } = &error
+    else {
+        panic!("{error:?}");
+    };
+    assert_eq!(
+        record_size - expected,
+        1,
+        "the refusal must quote the arithmetic it actually performed: one byte more \
+         than the envelope implies"
+    );
 
     // A zero dimension is refused rather than turned into an empty image.
-    let zero = store_over(&[(key, raster_record(0, 8, 2, DXT5_FOURCC, 1))]);
+    let zero = store_over(&[(key, raster_record(0, 8, 2, DXT5_FOURCC))]);
     let error = resolve_texture(&zero, first_reference(), RASTER_TYPE).unwrap_err();
     assert!(matches!(
         error,
@@ -273,11 +309,14 @@ fn every_error_variant_has_an_asserted_message() {
             "png",
         ),
         (
+            // A fourcc outside the three the corpus contains. It used to be
+            // `LUMINANCE_FOURCC` here, which asserted a refusal the decoder no
+            // longer makes: the `0x15` family decodes, 901 of 901 records.
             MaterialError::UnsupportedFourcc {
                 key,
-                fourcc: LUMINANCE_FOURCC,
+                fourcc: 0x1234_5678,
             },
-            "0x00000015",
+            "0x12345678",
         ),
         (
             MaterialError::Decode {
@@ -320,6 +359,24 @@ fn every_error_variant_has_an_asserted_message() {
         7,
         "a new MaterialError variant needs a message case here"
     );
+    // And the fourcc refusal must name every format this build DOES read, not
+    // one. It used to name `DXT5` alone and call the `0x15` family out of scope,
+    // which sent a caller looking for a bug that was not there.
+    let refusal = MaterialError::UnsupportedFourcc {
+        key,
+        fourcc: 0x1234_5678,
+    }
+    .to_string();
+    for (fourcc, spelling) in [
+        (DXT5_FOURCC, "0x35545844"),
+        (spore_texture::DXT1_FOURCC, "0x31545844"),
+        (LUMINANCE_FOURCC, "0x00000015"),
+    ] {
+        assert!(
+            refusal.contains(spelling),
+            "the refusal must name {spelling} (0x{fourcc:08x}) as supported: {refusal}"
+        );
+    }
 }
 
 #[test]
@@ -343,7 +400,7 @@ fn the_defensive_empty_image_variant_is_constructed_directly() {
 fn a_wildcard_reference_message_names_which_component_was_wild() {
     let store = store_over(&[(
         raster_key(0x4063_2900, DOCUMENTED_INSTANCE_ID),
-        two_layer_raster(),
+        dxt5_raster(),
     )]);
     let wildcard_instance = GmdlTextureRef {
         instance_id: spore_core::WILDCARD,
@@ -403,7 +460,19 @@ fn the_claims_table_and_the_error_variants_agree_on_the_luminance_wording() {
     };
     let text = error.to_string();
     assert!(text.contains("0x12345678"));
-    assert!(text.contains(&format!("0x{:08x}", DXT5_FOURCC)));
+    // All three known formats, and the word "decoded" beside them: a refusal that
+    // misreports what IS supported is the failure this crate's other half exists
+    // to prevent, and it cost this crate one documented asset's worth of reader
+    // confusion when the `0x15` family was called out of scope after it had been
+    // decoded.
+    for spelling in [
+        format!("0x{:08x}", DXT5_FOURCC),
+        format!("0x{:08x}", spore_texture::DXT1_FOURCC),
+        format!("0x{:08x}", LUMINANCE_FOURCC),
+    ] {
+        assert!(text.contains(&spelling), "{spelling} missing from {text}");
+    }
+    assert!(text.contains("all three decoded"), "{text}");
 }
 
 #[test]

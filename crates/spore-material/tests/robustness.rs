@@ -89,7 +89,7 @@ fn exercise_all_entry_points(bytes: Vec<u8>) {
 
 #[test]
 fn no_prefix_of_a_raster_record_panics_any_entry_point() {
-    let record = two_layer_raster();
+    let record = dxt5_raster();
     for length in 0..=record.len() {
         exercise_all_entry_points(record[..length].to_vec());
     }
@@ -100,7 +100,7 @@ fn no_prefix_of_a_raster_record_panics_any_entry_point() {
 
 #[test]
 fn no_single_byte_mutation_of_a_raster_record_panics() {
-    let record = two_layer_raster();
+    let record = dxt5_raster();
     for offset in 0..record.len() {
         for value in [0x00u8, 0x01, 0x7F, 0x80, 0xFF] {
             let mut mutated = record.clone();
@@ -164,7 +164,7 @@ fn no_prefix_of_a_model_record_panics() {
             (documented_model_key(), record[..length].to_vec()),
             (
                 raster_key(0x4063_2900, DOCUMENTED_INSTANCE_ID),
-                two_layer_raster(),
+                dxt5_raster(),
             ),
         ]);
         let _ = resolve_model_record(&store, &documented_model_key(), RASTER_TYPE);
@@ -183,7 +183,7 @@ fn no_single_byte_mutation_of_a_model_record_panics() {
                 (documented_model_key(), mutated),
                 (
                     raster_key(0x4063_2900, DOCUMENTED_INSTANCE_ID),
-                    two_layer_raster(),
+                    dxt5_raster(),
                 ),
             ]);
             let _ = resolve_model_record(&store, &documented_model_key(), RASTER_TYPE);
@@ -285,7 +285,7 @@ fn a_record_whose_payload_is_not_the_declared_size_is_refused_by_the_store() {
     // disagree is corruption, and this crate must not paper over it.
     let mut records = dbpf_package(&[(
         raster_key(0x4063_2900, DOCUMENTED_INSTANCE_ID),
-        two_layer_raster(),
+        dxt5_raster(),
     )]);
     // The memory-size word is the sixth row word of the first row: 4 (flags) +
     // type + group + instance + offset + stored = 24 bytes in, memory size at 24.

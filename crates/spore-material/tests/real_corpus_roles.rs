@@ -26,8 +26,9 @@
 //!
 //! | Test | Re-measures |
 //! |---|---|
-//! | [`raster_population`] | the fourcc census, the DXT5 layer split, the `0x15` framing identity |
-//! | [`dxt5_records_carry_no_colour`] | the colour degeneracy, over every decodable DXT5 record |
+//! | [`raster_population`] | the fourcc census, the chain count, the `0x15` framing identity |
+//! | [`dxt5_records_carry_real_colour`] | **the refutation**: what the four lanes of every decodable DXT5 record actually contain |
+//! | [`dxt5_colour_lanes_are_correlated_and_the_fourth_is_not`] | the mutual-correlation and independence statistics behind `TextureRole::ColourAndMask` |
 //! | [`normal_map_signature_holds_corpus_wide`] | the normal-map role check, over every `0x15` record |
 //! | [`every_gmdl_record_partitions_evenly`] | the per-mesh partition's divisibility, over every gmdl record |
 //!
@@ -42,8 +43,8 @@ use spore_assets::{ContentStore, Package};
 use spore_core::ResourceKey;
 use spore_gmdl::GMDL_TYPE;
 use spore_material::{
-    classify, layered_mask_signature, normal_map_signature, partition_texture_refs, Lane,
-    MipStatistics, TextureRole,
+    classify, colour_and_mask_signature, normal_map_signature, partition_texture_refs, Lane,
+    MipStatistics, TextureRole, COLOUR_LANE_CARDINALITY_FLOOR,
 };
 use spore_texture::{parse_envelope, RASTER_TYPE};
 
@@ -70,16 +71,17 @@ fn raster_keys(store: &ContentStore) -> Vec<ResourceKey> {
 
 // ---------------------------------------------------------------- 1. population
 
-/// The raster population: fourcc census, layer split, `0x15` framing.
+/// The raster population: fourcc census, chain count, `0x15` framing.
 #[test]
 #[ignore = "needs the git-ignored SPORE/ tree"]
 fn raster_population() {
     let store = store();
     let mut counts = std::collections::BTreeMap::new();
-    let mut dxt5_layers = std::collections::BTreeMap::new();
+    let mut dxt5_chains = std::collections::BTreeMap::new();
     let mut lum_identity_ok = 0usize;
     let mut lum_identity_bad = 0usize;
     let mut shapes = std::collections::BTreeMap::new();
+    let mut dxt5_shapes = std::collections::BTreeMap::new();
 
     for key in raster_keys(&store) {
         let Ok(record) = store.read(&key) else {
@@ -94,9 +96,17 @@ fn raster_population() {
             .or_insert(0usize) += 1;
         match envelope.fourcc {
             spore_texture::DXT5_FOURCC => {
+                *dxt5_shapes
+                    .entry((
+                        envelope.width,
+                        envelope.height,
+                        envelope.mip_count,
+                        record.len(),
+                    ))
+                    .or_insert(0usize) += 1;
                 match spore_texture::layer_count_for(record.len(), &envelope) {
-                    Ok(layers) => *dxt5_layers.entry(layers).or_insert(0usize) += 1,
-                    Err(_) => *dxt5_layers.entry(0usize).or_insert(0usize) += 1,
+                    Ok(chains) => *dxt5_chains.entry(chains).or_insert(0usize) += 1,
+                    Err(_) => *dxt5_chains.entry(0usize).or_insert(0usize) += 1,
                 }
             }
             spore_texture::LUMINANCE_FOURCC => {
@@ -118,7 +128,8 @@ fn raster_population() {
     println!("# raster records: {}", counts.values().sum::<usize>());
     println!("# fourcc census: {counts:#x?}");
     println!("# shapes: {shapes:#x?}");
-    println!("# dxt5 derived layer counts: {dxt5_layers:?}");
+    println!("# DXT5 (w, h, mips, record bytes) shapes: {dxt5_shapes:#x?}");
+    println!("# DXT5 derived chain counts: {dxt5_chains:?}");
     println!("# 0x15 framing identity: {lum_identity_ok} exact, {lum_identity_bad} not");
 
     assert_eq!(counts.get(&0x3554_5844), Some(&1747), "DXT5");
@@ -126,33 +137,63 @@ fn raster_population() {
     assert_eq!(
         counts.get(&0x3154_5844),
         Some(&306),
-        "DXT1, refused by name"
+        "DXT1, which spore-texture also decodes"
     );
     assert_eq!(lum_identity_bad, 0, "the 0x15 framing identity must hold");
     assert_eq!(lum_identity_ok, 901);
-    // The derived DXT5 split: 1374 records divide into 2 layers and 373 do not
-    // divide at all. The 373 are the 64^2 and 256^2 families, which are 12
-    // bytes short of two layers -- a finding for `spore-texture`, recorded here
-    // because it bounds what this crate can classify.
-    assert_eq!(dxt5_layers.get(&2), Some(&1374));
-    assert_eq!(dxt5_layers.get(&0), Some(&373));
+    // **THE REFUTATION, in the population.** The previous version of this test
+    // asserted 1374 records yielding 2 chains and 373 yielding none, and the 373
+    // were "4 or 12 bytes short of two whole layers" — an artefact of charging 8
+    // bytes per 4x4 block. Under the measured 16-byte stride every record
+    // decodes and every one holds exactly one chain.
+    assert_eq!(
+        dxt5_chains.get(&1),
+        Some(&1747),
+        "every DXT5 record is one chain and none is refused"
+    );
+    assert_eq!(
+        dxt5_chains.get(&2),
+        None,
+        "no record holds two chains: the two-layer reading is refuted"
+    );
+    assert_eq!(dxt5_chains.get(&0), None, "and none is refused either");
+    // Three shapes, and each one's record length is the measured one. The
+    // 64x64 shape is the one the old rule refused outright.
+    assert_eq!(dxt5_shapes.len(), 3);
+    assert_eq!(dxt5_shapes.get(&(512, 512, 10, 349_616)), Some(&1374));
+    assert_eq!(dxt5_shapes.get(&(256, 256, 9, 87_468)), Some(&306));
+    assert_eq!(dxt5_shapes.get(&(64, 64, 7, 5_540)), Some(&67));
 }
 
 // ------------------------------------------------------------------ 2. colour
 
-/// No decodable DXT5 record in the corpus carries a colour.
+/// **THE REFUTATION.** Every decodable `DXT5` record in the corpus carries real
+/// colour in lanes 0–2.
+///
+/// This test used to be called `dxt5_records_carry_no_colour` and asserted the
+/// exact opposite — a green span of 0, a blue span of 0 and at most two red
+/// values across every record. Those numbers were a property of an 8-byte block
+/// read: green and blue came out zero *by construction*, because R5G5B5 on a
+/// 6-bit word cannot set bits 10..19. It measured the codec, not the data. The
+/// test keeps its name changed, its purpose intact, and its old numbers in
+/// [`claims::DXT5_CARRIES_NO_COLOUR`](spore_material::claims::DXT5_CARRIES_NO_COLOUR).
 #[test]
 #[ignore = "needs the git-ignored SPORE/ tree"]
-fn dxt5_records_carry_no_colour() {
+fn dxt5_records_carry_real_colour() {
     let store = store();
     let mut records = 0usize;
     let mut texels = 0usize;
-    let mut green_max_span = 0u32;
-    let mut blue_max_span = 0u32;
-    let mut red_cardinality_max = 0usize;
-    let mut alpha_min_distinct = usize::MAX;
-    let mut all_layers_match = 0usize;
-    let mut layers_differing = 0usize;
+    let mut min_card = [usize::MAX; 4];
+    let mut max_card = [0usize; 4];
+    let mut global_min = [u8::MAX; 4];
+    let mut global_max = [0u8; 4];
+    let mut widest_span = [0u32; 4];
+    let mut signature_ok = 0usize;
+    let mut signature_declined = Vec::new();
+    let mut constant_fourth_plane = 0usize;
+    let mut fourth_plane_distinct: Vec<usize> = Vec::new();
+    let mut role_census: std::collections::BTreeMap<&str, usize> =
+        std::collections::BTreeMap::new();
 
     for key in raster_keys(&store) {
         let Ok(record) = store.read(&key) else {
@@ -167,53 +208,216 @@ fn dxt5_records_carry_no_colour() {
         let Ok(image) = spore_texture::decode_raster(&record) else {
             continue;
         };
+        assert_eq!(
+            image.layers.len(),
+            1,
+            "{key:?}: one chain, or the framing identity did not close"
+        );
+        let Some(base) = image.layers.first().and_then(|chain| chain.first()) else {
+            continue;
+        };
         records += 1;
-        let mut layers: Vec<Vec<u8>> = Vec::new();
-        for layer in &image.layers {
-            let Some(base) = layer.first() else { continue };
-            let stats = MipStatistics::of(base);
-            texels += stats.texels;
-            green_max_span = green_max_span.max(
-                u32::from(stats.max[Lane::Green.index()])
-                    - u32::from(stats.min[Lane::Green.index()]),
-            );
-            blue_max_span = blue_max_span.max(
-                u32::from(stats.max[Lane::Blue.index()]) - u32::from(stats.min[Lane::Blue.index()]),
-            );
-            red_cardinality_max = red_cardinality_max.max(stats.distinct[Lane::Red.index()]);
-            alpha_min_distinct = alpha_min_distinct.min(stats.distinct[Lane::Alpha.index()]);
-            assert!(
-                layered_mask_signature(&stats),
-                "{key:?}: layer statistics do not match the mask signature"
-            );
-            layers.push(base.pixels.clone());
+        texels += base.pixels.len() / 4;
+        let stats = MipStatistics::of(base);
+        for lane in 0..4 {
+            min_card[lane] = min_card[lane].min(stats.distinct[lane]);
+            max_card[lane] = max_card[lane].max(stats.distinct[lane]);
+            global_min[lane] = global_min[lane].min(stats.min[lane]);
+            global_max[lane] = global_max[lane].max(stats.max[lane]);
+            widest_span[lane] =
+                widest_span[lane].max(u32::from(stats.max[lane]) - u32::from(stats.min[lane]));
         }
-        if layers.len() == 2 {
-            if layers[0] == layers[1] {
-                all_layers_match += 1;
-            } else {
-                layers_differing += 1;
-            }
+        fourth_plane_distinct.push(stats.distinct[Lane::Alpha.index()]);
+        if stats.is_constant(Lane::Alpha) {
+            constant_fourth_plane += 1;
         }
+        if colour_and_mask_signature(&stats) {
+            signature_ok += 1;
+        } else {
+            signature_declined.push(format!("{key:?} cards={:?}", stats.distinct));
+        }
+        *role_census
+            .entry(classify(envelope.fourcc, &stats).as_str())
+            .or_insert(0usize) += 1;
     }
+    fourth_plane_distinct.sort_unstable();
 
     println!("# decodable DXT5 records: {records}");
     println!("# base-mip texels examined: {texels}");
-    println!("# widest green span: {green_max_span}");
-    println!("# widest blue span: {blue_max_span}");
-    println!("# largest red cardinality: {red_cardinality_max}");
-    println!("# smallest alpha cardinality: {alpha_min_distinct}");
-    println!("# records whose two layers are identical: {all_layers_match}");
-    println!("# records whose two layers differ: {layers_differing}");
+    println!("# min distinct values per lane (r, g, b, a): {min_card:?}");
+    println!("# max distinct values per lane (r, g, b, a): {max_card:?}");
+    println!("# global per-lane min: {global_min:?}");
+    println!("# global per-lane max: {global_max:?}");
+    println!("# widest per-lane span: {widest_span:?}");
+    println!(
+        "# fourth-plane distinct values, min/max: {} / {}",
+        fourth_plane_distinct.first().copied().unwrap_or(0),
+        fourth_plane_distinct.last().copied().unwrap_or(0)
+    );
+    println!("# records whose fourth plane is CONSTANT: {constant_fourth_plane}");
+    println!("# records the colour signature admits: {signature_ok}");
+    println!(
+        "# records the colour signature declines: {}",
+        signature_declined.len()
+    );
+    println!("# role census: {role_census:?}");
 
-    // The measurement behind claims::DXT5_CARRIES_NO_COLOUR.
-    assert_eq!(green_max_span, 0, "green is constant in every texel");
-    assert_eq!(blue_max_span, 0, "blue is constant in every texel");
-    assert!(red_cardinality_max <= 2, "red takes at most two values");
-    assert!(alpha_min_distinct >= 2, "the alpha plane is never constant");
-    // The measurement behind claims::DXT5_LAYERS_ARE_DISTINCT.
-    assert_eq!(all_layers_match, 0, "no record's two layers are identical");
-    assert_eq!(layers_differing, 1374);
+    // The measurement behind claims::COLOUR_AND_MASK_CONTENT and the refutation
+    // of claims::DXT5_CARRIES_NO_COLOUR.
+    assert_eq!(records, 1747, "every DXT5 record in the package decodes");
+    assert!(
+        min_card[0] >= COLOUR_LANE_CARDINALITY_FLOOR,
+        "lane 0 never drops to the floor: the smallest is {min_card:?}"
+    );
+    assert!(min_card[1] >= COLOUR_LANE_CARDINALITY_FLOOR);
+    assert!(min_card[2] >= COLOUR_LANE_CARDINALITY_FLOOR);
+    assert_eq!(global_max, [255, 255, 255, 255]);
+    assert_eq!(global_min, [0, 0, 0, 0]);
+    // **The specific numbers the claims and the doc quote.** If these move, the
+    // constants beside them (`COLOUR_LANE_CARDINALITY_FLOOR`) have to be
+    // re-derived rather than left to look approximately right.
+    assert_eq!(
+        min_card,
+        [32, 64, 32, 1],
+        "the per-lane minima the doc and the claims cite"
+    );
+    assert_eq!(max_card, [235, 255, 235, 256]);
+    assert_eq!(
+        widest_span[1], 255,
+        "green spans the full range somewhere: it is not a constant lane"
+    );
+    // The signature admits every single record: no corpus record has a colour
+    // lane at or below the floor, so there is no "degenerate colour field" class
+    // left in this corpus.
+    assert_eq!(signature_ok, records, "the role check must not decline");
+    assert!(
+        signature_declined.is_empty(),
+        "{:?}",
+        &signature_declined[..signature_declined.len().min(5)]
+    );
+    // The fourth plane: 46 records hold it constant, which is why no signature
+    // condition mentions it.
+    assert_eq!(
+        constant_fourth_plane, 46,
+        "records whose fourth plane never varies -- the case a 'mask must vary' \
+         condition would have refused"
+    );
+    assert_eq!(
+        fourth_plane_distinct.first().copied(),
+        Some(1),
+        "and the smallest fourth-plane cardinality is 1, i.e. all-zero"
+    );
+    // Every record classifies as colour-and-mask from its own bytes.
+    assert_eq!(
+        role_census.get(TextureRole::ColourAndMask.as_str()),
+        Some(&records)
+    );
+}
+
+/// What makes the three colour lanes one colour image rather than three
+/// independent channels — and what makes the fourth plane something else.
+///
+/// `TextureRole::ColourAndMask` names two content classes. This test measures
+/// both, and it is deliberately **not** used as a gate: 467 of 1 747 records fall
+/// below a 0.30 mean colour correlation, so any correlation threshold would be a
+/// statistic of this corpus rather than a property of the format. The numbers go
+/// into the claims; the gate stays on the cardinality floor.
+#[test]
+#[ignore = "needs the git-ignored SPORE/ tree"]
+fn dxt5_colour_lanes_are_correlated_and_the_fourth_is_not() {
+    let store = store();
+    let mut colour: Vec<f64> = Vec::new();
+    let mut alpha: Vec<f64> = Vec::new();
+    let mut undefined_colour = 0usize;
+    let mut undefined_alpha = 0usize;
+    let mut records = 0usize;
+
+    for key in raster_keys(&store) {
+        let Ok(record) = store.read(&key) else {
+            continue;
+        };
+        let Ok(envelope) = parse_envelope(&record) else {
+            continue;
+        };
+        if envelope.fourcc != spore_texture::DXT5_FOURCC {
+            continue;
+        }
+        let Ok(image) = spore_texture::decode_raster(&record) else {
+            continue;
+        };
+        let Some(base) = image.layers.first().and_then(|chain| chain.first()) else {
+            continue;
+        };
+        records += 1;
+        let stats = MipStatistics::of(base);
+        match stats.mean_colour_correlation() {
+            Some(value) => colour.push(value),
+            // A constant colour lane makes the correlation undefined, which is an
+            // absence and is counted rather than recorded as 0.0.
+            None => undefined_colour += 1,
+        }
+        match stats.mean_alpha_correlation_abs() {
+            Some(value) => alpha.push(value),
+            None => undefined_alpha += 1,
+        }
+    }
+    colour.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    alpha.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+    let describe = |values: &[f64]| {
+        format!(
+            "min {:.4} p1 {:.4} median {:.4} max {:.4}",
+            values.first().copied().unwrap_or(f64::NAN),
+            values.get(values.len() / 100).copied().unwrap_or(f64::NAN),
+            values.get(values.len() / 2).copied().unwrap_or(f64::NAN),
+            values.last().copied().unwrap_or(f64::NAN),
+        )
+    };
+    println!("# records: {records}");
+    println!("# mean colour-pair correlation  {}", describe(&colour));
+    println!("# mean |colour-to-alpha| corr   {}", describe(&alpha));
+    println!("# records where the colour correlation is undefined: {undefined_colour}");
+    println!("# records where the alpha correlation is undefined: {undefined_alpha}");
+    let below_030 = colour.iter().filter(|v| **v < 0.30).count();
+    println!("# records below a 0.30 mean colour correlation: {below_030}");
+
+    assert_eq!(records, 1747);
+    // The numbers `MASK_PLANE_INDEPENDENT_OF_COLOUR` and the doc cite. Compared
+    // with a tolerance rather than exactly: the inputs are exact integers and the
+    // correlation is computed in `f64`, so the last bits are arithmetic order
+    // rather than a fact about the corpus.
+    const TOLERANCE: f64 = 5e-5;
+    let near = |got: Option<f64>, want: f64, what: &str| {
+        let got = got.unwrap_or_else(|| panic!("{what} was undefined"));
+        assert!(
+            (got - want).abs() < TOLERANCE,
+            "{what}: measured {got:.6}, the claims and the doc cite {want}"
+        );
+    };
+    near(colour.first().copied(), -0.0779, "colour min");
+    near(
+        colour.get(colour.len() / 100).copied(),
+        -0.0165,
+        "colour p1",
+    );
+    near(
+        colour.get(colour.len() / 2).copied(),
+        0.5103,
+        "colour median",
+    );
+    near(colour.last().copied(), 0.7124, "colour max");
+    near(alpha.first().copied(), 0.0039, "alpha min");
+    near(alpha.get(alpha.len() / 2).copied(), 0.0673, "alpha median");
+    near(alpha.last().copied(), 0.5389, "alpha max");
+    assert_eq!(
+        below_030, 467,
+        "the count that makes a correlation threshold a statistic rather than a \
+         property -- which is why the signature gates on cardinality instead"
+    );
+    // Undefined means undefined: the 46 constant-fourth-plane records make the
+    // colour-to-alpha correlation meaningless, and they are counted, not zeroed.
+    assert_eq!(undefined_alpha, 46, "one per constant-fourth-plane record");
+    assert_eq!(undefined_colour, 0, "no record has a constant colour lane");
 }
 
 // -------------------------------------------------------------- 3. normal map
@@ -456,8 +660,8 @@ fn the_documented_assets_roles() {
     assert_eq!(
         resolved.roles(),
         vec![vec![
-            TextureRole::LayeredAlphaMask,
-            TextureRole::LayeredAlphaMask,
+            TextureRole::ColourAndMask,
+            TextureRole::ColourAndMask,
             TextureRole::TangentSpaceNormal,
         ]]
     );
@@ -469,8 +673,50 @@ fn the_documented_assets_roles() {
     assert_eq!(normal.envelope.width, 512);
     assert_eq!(normal.envelope.height, 512);
     assert_eq!(normal.mip_count, 10);
+    assert_eq!(normal.layer_count, 1, "one chain, as for every record");
     assert!(normal.pixels_decoded());
     assert!(normal_map_signature(&normal.statistics));
+
+    // The two `DXT5` records, and the measurements the claims cite about them.
+    // These are the exact numbers `docs/MATERIAL-ROLES.md` §4 publishes, so a
+    // change to any of them means the doc and the claim table are stale.
+    for (index, expected_cards, expected_alpha_max) in [
+        (0usize, [92usize, 121, 73, 21], 73u8),
+        (1, [184, 238, 198, 32], 73),
+    ] {
+        let texture = resolved.textures[index].as_ref().expect("resolves");
+        assert_eq!(texture.envelope.width, 512);
+        assert_eq!(texture.layer_count, 1);
+        assert_eq!(
+            texture.statistics.distinct, expected_cards,
+            "slot {index}: the per-lane cardinalities the doc cites"
+        );
+        assert_eq!(
+            texture.statistics.max[Lane::Alpha.index()],
+            expected_alpha_max,
+            "slot {index}: the fourth plane tops out at 73"
+        );
+        assert_eq!(texture.role, TextureRole::ColourAndMask);
+        assert!(colour_and_mask_signature(&texture.statistics));
+        assert_eq!(texture.mask_plane_varies(), Some(true));
+        assert_eq!(texture.channels().len(), 4);
+    }
+    // And the first record's 4436 distinct RGB triples: the single most direct
+    // statement that "DXT5 carries no colour" was a property of a codec.
+    let first = resolved.textures[0].as_ref().expect("resolves");
+    let mut triples = std::collections::BTreeSet::new();
+    for texel in first.image.pixels.chunks_exact(4) {
+        triples.insert([texel[0], texel[1], texel[2]]);
+    }
+    println!(
+        "# distinct RGB triples in 0x2f4e681c:0x40632900:0x067a07f0: {}",
+        triples.len()
+    );
+    assert_eq!(
+        triples.len(),
+        4436,
+        "the figure the doc quotes as the refutation of 'no colour'"
+    );
 }
 // --------------------------------------------------------------- 6. group zero
 

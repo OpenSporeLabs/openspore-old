@@ -9,11 +9,31 @@
 //! # Written from the format, not from the readers
 //!
 //! Each builder is written from the layout as documented in the reader's own
-//! source — `spore-dbpf`'s `index.rs`, `spore-texture`'s `raster.rs`,
-//! `spore-gmdl`'s `parse.rs` — and not from a call into the decoder. A builder
-//! that shared code with the reader would round-trip perfectly while both were
-//! wrong together, which is the failure mode `spore-gmdl`'s own test support is
-//! written to avoid.
+//! source — `spore-dbpf`'s `index.rs`, `spore-texture`'s `framing.rs` and
+//! `dxt5.rs`, `spore-gmdl`'s `parse.rs` — and not from a call into the decoder.
+//! A builder that shared code with the reader would round-trip perfectly while
+//! both were wrong together, which is the failure mode `spore-gmdl`'s own test
+//! support is written to avoid.
+//!
+//! # The raster fixtures are BC3, and one chain
+//!
+//! **This section was rewritten on 2026-10-05.** The previous DXT5 fixture built
+//! **8-byte blocks with 16-byte layer headers**, which is exactly the layout the
+//! corpus refutes:
+//!
+//! ```text
+//! record_size == 32 + base_level_bytes
+//!                     + SUM over m in 2..mip_count of (4 + level_m_bytes)
+//! ```
+//!
+//! 16 bytes per 4x4 block, `field_18` = the base level's own byte count, a `u32`
+//! length before every level from **2** on, **no** layer headers, and **one**
+//! chain. 2 954 of 2 954 records in `Spore_Content.package` satisfy exactly that
+//! identity, and the old fixture satisfied none of it.
+//!
+//! A fixture built from the refuted layout cannot test anything downstream of
+//! the refutation: it produced records the real decoder refuses, so every role
+//! assertion in this crate was failing for the wrong reason.
 //!
 //! # The realism that matters
 //!
@@ -21,8 +41,7 @@
 //! measured with `osptool` on `SPORE/Data/Spore_Content.package` (2026-10-04):
 //! one material id `0x407DFDDB`, three texture references with
 //! `instance_id = 0x067a07f0` and groups `0x40632900`, `0x40632901`,
-//! `0x40632902` — the third of which is a `0x15` luminance record this build
-//! refuses.
+//! `0x40632902` — all three of which **decode**.
 
 #![allow(dead_code)]
 
@@ -31,7 +50,7 @@ use spore_core::ResourceKey;
 use spore_gmdl::GmdlTextureRef;
 use spore_texture::{DXT5_FOURCC, RASTER_TYPE};
 
-/// The fourcc of the luminance family this build refuses.
+/// The fourcc of the uncompressed normal-map family.
 ///
 /// The observed value is `0x00000015`, whose high byte is `0x00`; the family is
 /// identified by `spore-texture` as `0x15xx`, so a synthetic record uses the
@@ -188,68 +207,198 @@ pub fn raster_key(group_id: u32, instance_id: u32) -> ResourceKey {
 // Raster records
 // ---------------------------------------------------------------------------
 
-/// Bytes in the raster envelope.
+/// Bytes in the raster envelope of the two block formats.
 const ENVELOPE_SIZE: usize = 32;
 
-/// Bytes in one layer header, which is skipped and never interpreted.
-const LAYER_HEADER_SIZE: usize = 16;
+/// Bytes in one 4x4 **BC3** block.
+const BLOCK_BYTES: usize = 16;
 
-/// Bytes in one 4x4 block.
-const BLOCK_BYTES: usize = 8;
-
-/// The block `addressing_block` builds for `k`, as one 8-byte DXT5 block.
+/// The first mip level the block formats prefix with its own `u32` byte count.
 ///
-/// `a0 = 0 < a1 = 255` (unreversed) and `c0 = 0x20 > c1 = 0x00`, so the
-/// two-colour palette is `[(8,0,0), (0,0,0)]`: code 0 gives `(8,0,0)` with alpha
-/// `round(2*255/8) = 64`, code 1 gives `(0,0,0)` with alpha 0. Sixteen distinct
-/// blocks exist, one per bit pattern, which is what makes them usable as an
-/// addressing probe.
-pub fn addressing_block(k: u8) -> [u8; BLOCK_BYTES] {
+/// Levels 0 and 1 are written bare. This is `spore-texture`'s measured rule, not
+/// a choice: a `u32` where a level-1 prefix would sit in a DXT5 record holds
+/// block data. **Unknown** why the `0x15` family differs (it prefixes level 1) —
+/// see `spore_texture::claims::FIRST_PREFIXED_LEVEL`.
+const FIRST_PREFIXED_LEVEL: u32 = 2;
+
+/// Texels in one 4x4 block.
+const TEXELS_PER_BLOCK: usize = 16;
+
+/// Packs an 8-bit RGB triple into a `R5G6B5` colour word.
+///
+/// Red in bits 11–15, green in bits 5–10, blue in bits 0–4, all little-endian on
+/// disk. Quantisation is `(v * n_max + 127) / 255`, i.e. round-to-nearest of the
+/// channel's own width; the *decoder* expands with bit replication, which is a
+/// different function, and that asymmetry is exactly why the fixture stores the
+/// words and lets the decoder expand them rather than predicting texels here.
+pub fn r5g6b5(r: u8, g: u8, b: u8) -> u16 {
+    let scale = |value: u8, max: u16| (u16::from(value) * max + 127) / 255;
+    // Red 5 bits at 11..15, green 6 at 5..10, blue 5 at 0..4. The maximum is
+    // `0xF800 | 0x07E0 | 0x001F = 0xFFFF`, so the shifts cannot overflow.
+    (scale(r, 31) << 11) | (scale(g, 63) << 5) | scale(b, 31)
+}
+
+/// Builds one 16-byte BC3 block from its two endpoint pairs and its index
+/// streams.
+///
+/// ```text
+/// b[0]      alpha0     u8
+/// b[1]      alpha1     u8
+/// b[2..8]   16 three-bit alpha indices, texel i at bits 3*i of a 48-bit LE word
+/// b[8..10]  colour0    R5G6B5 little-endian
+/// b[10..12] colour1    R5G6B5 little-endian
+/// b[12..16] 16 two-bit colour indices, texel i at bits 2*i of a 32-bit LE word
+/// ```
+///
+/// The two index streams are **independent** — one structural difference from
+/// the 8-byte "Spore block" codec this fixture replaces, which drove both
+/// channels from a single 2-bit stream.
+pub fn bc3_block(
+    alpha0: u8,
+    alpha1: u8,
+    colour0: u16,
+    colour1: u16,
+    alpha_codes: [u8; TEXELS_PER_BLOCK],
+    colour_codes: [u8; TEXELS_PER_BLOCK],
+) -> [u8; BLOCK_BYTES] {
     let mut bytes = [0u8; BLOCK_BYTES];
-    bytes[0] = 0; // alpha0
-    bytes[1] = 255; // alpha1
-    bytes[2] = 0x20; // colour lo
-    bytes[3] = 0x00; // colour hi
-    for (texel, code) in codes_for(k).into_iter().enumerate() {
-        bytes[4 + texel / 4] |= (code & 0x3) << (2 * (texel % 4));
+    bytes[0] = alpha0;
+    bytes[1] = alpha1;
+    let mut alpha_word: u64 = 0;
+    for (texel, code) in alpha_codes.iter().enumerate() {
+        alpha_word |= u64::from(code & 0x7) << (3 * texel);
     }
+    bytes[2..8].copy_from_slice(&alpha_word.to_le_bytes()[..6]);
+    bytes[8..10].copy_from_slice(&colour0.to_le_bytes());
+    bytes[10..12].copy_from_slice(&colour1.to_le_bytes());
+    let mut colour_word: u32 = 0;
+    for (texel, code) in colour_codes.iter().enumerate() {
+        colour_word |= u32::from(code & 0x3) << (2 * texel);
+    }
+    bytes[12..16].copy_from_slice(&colour_word.to_le_bytes());
     bytes
 }
 
-/// Texel `t` of [`addressing_block`] carries code `(k >> t) & 1`.
-fn codes_for(k: u8) -> [u8; 16] {
-    core::array::from_fn(|t| ((u32::from(k) >> t) & 1) as u8)
-}
-
-/// Bytes one mip of `width` x `height` occupies as DXT5 blocks.
+/// The block `colour_block` builds for `k`: every channel moves as `k` moves.
 ///
-/// Saturating for the same reason as [`chain_bytes`].
-fn mip_block_bytes(width: u32, height: u32) -> usize {
-    let blocks_wide = (width.max(1) as usize).div_ceil(4);
-    let blocks_high = (height.max(1) as usize).div_ceil(4);
-    blocks_wide
-        .saturating_mul(blocks_high)
-        .saturating_mul(BLOCK_BYTES)
-}
-
-/// The mip chain's block bytes for `mip_count` levels, matching
-/// `spore_texture::dxt5_chain_size` for mip counts below 32.
+/// This is what makes a synthetic `DXT5` record look like a real one **for the
+/// role check**, and the reason is a corpus measurement rather than taste: over
+/// all 1 747 `DXT5` records of `Spore_Content.package` each of lanes 0–2 takes
+/// at least **32** distinct values and none takes fewer. A fixture whose colour
+/// lanes were flat would be refused by the signature, and the resulting role
+/// would be `Unidentified` for a reason that has nothing to do with the code
+/// under test.
 ///
-/// Saturating, because the same expression must be computable for the absurd
-/// headers a refusal test builds: an overflowing `usize` here would turn a test
-/// into a panic, which is the one outcome these tests exist to rule out.
-fn chain_bytes(width: u32, height: u32, mip_count: u32) -> usize {
-    (0..mip_count).fold(0usize, |total, mip| {
-        let w = (width >> mip).max(1);
-        let h = (height >> mip).max(1);
-        total.saturating_add(mip_block_bytes(w, h))
-    })
+/// `alpha0` is **scrambled** across the block index rather than rising with it,
+/// and the alpha indices walk the eight-level ramp inside each block. The
+/// fourth plane is therefore not a monotone function of the colour, which is the
+/// one axis on which the corpus is emphatic: over all 1 747 real records the mean
+/// colour-to-alpha correlation has median **0.058** and maximum 0.539. It is still
+/// *published* rather than constant — the 46 corpus records whose fourth plane is
+/// constant are covered separately by [`flat_alpha_raster`].
+pub fn colour_block(k: u8) -> [u8; BLOCK_BYTES] {
+    let t = u32::from(k.min(15));
+    // Every colour channel **rises** with the block index, and the three lanes
+    // rise together with small fixed offsets between them. That is the axis on
+    // which realism is load-bearing for a fixture: over the real corpus the mean
+    // mutual correlation of the three colour lanes is **0.510**, which is the
+    // measurement behind "these are one colour image". A fixture whose three
+    // lanes moved independently would decode to something no Spore record
+    // contains, and any statistic taken from it would be a statistic of the
+    // fixture.
+    //
+    // The two colour endpoints are far apart so the two blend entries spread the
+    // lanes: an 8x8 record is four blocks, and with endpoints four apart it would
+    // take fewer than eight distinct values in a lane and be refused by the
+    // signature for a reason that has nothing to do with the code under test.
+    let channel = |v: u32| (v & 0xFF) as u8;
+    let base = t * 15;
+    bc3_block(
+        channel(40 + ((t * 7) % 16) * 14),
+        0,
+        r5g6b5(channel(base), channel(base + 8), channel(base + 16)),
+        r5g6b5(channel(base + 60), channel(base + 68), channel(base + 76)),
+        core::array::from_fn(|i| (i as u8).wrapping_add(k) % 8),
+        core::array::from_fn(|i| (i as u8).wrapping_add(k) & 3),
+    )
 }
 
-/// A DXT5 block that decodes to a flat field: every code 0 with the full ramp's
-/// first entry, so the decoded texel is `(8, 0, 0, 64)`.
-fn flat_block() -> [u8; BLOCK_BYTES] {
-    addressing_block(0)
+/// A `DXT5` record whose **every** block decodes to a constant, all-zero fourth
+/// plane, over a moving colour field.
+///
+/// The measured shape of the 46 records of `Spore_Content.package` that hold a
+/// constant fourth plane. It exists so the role signature is tested against the
+/// case that must NOT be refused: a requirement of "the mask plane varies" would
+/// refuse all 46, and this is the fixture that proves it does not.
+pub fn flat_alpha_raster(width: u32, height: u32, mip_count: u32) -> Vec<u8> {
+    let mut out = raster_envelope(width, height, mip_count, DXT5_FOURCC);
+    for mip in 0..mip_count {
+        if mip >= FIRST_PREFIXED_LEVEL {
+            push_u32(
+                &mut out,
+                u32::try_from(level_block_bytes(width, height, mip)).expect("a level fits in u32"),
+            );
+        }
+        for index in 0..block_count(width, height, mip) {
+            // alpha0 == alpha1 == 0: the BC4 ramp is then all zeros for every
+            // index including the six the specification leaves undefined, so the
+            // fourth lane is constant whatever the index stream says.
+            let mut block = colour_block(index as u8);
+            block[0] = 0;
+            block[1] = 0;
+            out.extend_from_slice(&block);
+        }
+    }
+    out
+}
+
+/// The block `addressing_block` builds for `k`, as one 16-byte BC3 block.
+///
+/// **An addressing probe, not a realistic texture.** Texel `t` carries colour
+/// index `(k >> t) & 1` and alpha index `(k >> t) & 1`, so the sixteen blocks
+/// `k = 0..16` are distinguishable by value and a decode that read the wrong
+/// level, chain or block index produces visibly wrong texels rather than
+/// plausible ones. The colours are the extremes of the word so the two palette
+/// entries are far apart.
+///
+/// Used by [`raster_header`], whose whole job is to be refused. The realistic
+/// path is [`colour_block`].
+pub fn addressing_block(k: u8) -> [u8; BLOCK_BYTES] {
+    bc3_block(
+        255,
+        0,
+        r5g6b5(255, 255, 255),
+        r5g6b5(0, 0, 0),
+        core::array::from_fn(|t| addressing_code(k, t)),
+        core::array::from_fn(|t| addressing_code(k, t)),
+    )
+}
+
+/// Texel `t` of [`addressing_block`] carries colour code `(k >> t) & 1`.
+///
+/// The shift is done on a `u32`: `t` runs to 15 and shifting a `u8` by 8 or more
+/// is an overflow the debug build refuses, which would turn the absurd-header
+/// tests into a panic instead of the typed refusal they exist to produce.
+const fn addressing_code(k: u8, t: usize) -> u8 {
+    ((k as u32 >> (t as u32)) & 1) as u8
+}
+
+/// Bytes one mip of `width` x `height` occupies as BC3 blocks.
+///
+/// Saturating, because the absurd-header fixtures declare geometries no builder
+/// could materialize and an overflowing `usize` here would turn a refusal test
+/// into a panic.
+fn level_block_bytes(width: u32, height: u32, mip: u32) -> usize {
+    block_count(width, height, mip).saturating_mul(BLOCK_BYTES)
+}
+
+/// How many 4x4 blocks one mip of `width` x `height` occupies.
+fn block_count(width: u32, height: u32, mip: u32) -> usize {
+    let w = (width >> mip).max(1);
+    let h = (height >> mip).max(1);
+    (w as usize)
+        .div_ceil(4)
+        .saturating_mul((h as usize).div_ceil(4))
 }
 
 /// The largest record [`raster_record`] will materialize.
@@ -260,12 +409,33 @@ fn flat_block() -> [u8; BLOCK_BYTES] {
 /// bytes a decoder needs in order to *refuse* them.
 pub const MAX_SYNTHETIC_RASTER_BYTES: u32 = 1 << 20;
 
-/// Writes a 32-byte envelope plus `payload_blocks` blocks of `mip 0`.
+/// Writes a 32-byte envelope for `width` x `height` x `mip_count`.
+///
+/// `field_18` is written as the base level's own byte count where that fits in a
+/// `u32`, because the decoder cross-checks it. It is saturated rather than
+/// refused so an absurd header is still materializable by [`raster_header`].
+fn raster_envelope(width: u32, height: u32, mip_count: u32, fourcc: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(ENVELOPE_SIZE);
+    push_u32(&mut out, 1); // version: observed 1 in every record, never validated
+    push_u32(&mut out, width);
+    push_u32(&mut out, height);
+    push_u32(&mut out, mip_count);
+    push_u32(&mut out, 8); // field_10: observed constant, never read by any decoder
+    push_u32(&mut out, fourcc);
+    let base = u32::try_from(level_block_bytes(width, height, 0)).unwrap_or(u32::MAX);
+    push_u32(&mut out, base); // field_18: the base level's own byte count
+    push_u32(&mut out, 0x0000_FFFF); // field_1c: read in DXT5/DXT1, payload in 0x15
+    debug_assert_eq!(out.len(), ENVELOPE_SIZE);
+    out
+}
+
+/// Writes a 32-byte envelope plus `payload_blocks` BC3 blocks of the base level.
 ///
 /// Enough for the decoders to read every envelope word and then refuse the
-/// record on its own terms — a wrong `fourcc`, a zero dimension, a chain that
-/// does not divide — without materializing a payload the header claims. This is
-/// how an absurd header is tested without building the absurd record.
+/// record on its own terms — a wrong `fourcc`, a zero dimension, a record length
+/// its own geometry does not imply — without materializing a payload the header
+/// claims. This is how an absurd header is tested without building the absurd
+/// record.
 pub fn raster_header(
     width: u32,
     height: u32,
@@ -273,102 +443,85 @@ pub fn raster_header(
     fourcc: u32,
     payload_blocks: usize,
 ) -> Vec<u8> {
-    let mut out = Vec::new();
-    push_u32(&mut out, 1);
-    push_u32(&mut out, width);
-    push_u32(&mut out, height);
-    push_u32(&mut out, mip_count);
-    push_u32(&mut out, 8);
-    push_u32(&mut out, fourcc);
-    push_u32(&mut out, 0x0004_0000);
-    push_u32(&mut out, 0x0000_FFFF);
-    // One layer header, which is skipped and never interpreted.
-    out.extend_from_slice(b"L000");
-    push_u32(&mut out, 0x1111_0000);
-    push_u32(&mut out, 0x2222_0000);
-    push_u32(&mut out, 0x3333_0000);
+    let mut out = raster_envelope(width, height, mip_count, fourcc);
     for index in 0..payload_blocks {
         out.extend_from_slice(&addressing_block((index % 16) as u8));
     }
     out
 }
 
-/// Builds a raster record with `layers` layers of `width` x `height` and
-/// `mip_count` mips each.
+/// Builds a raster record of `width` x `height` with `mip_count` mips, in the
+/// one chain every raster record in the corpus holds.
 ///
-/// The layout is the format's own: 32-byte envelope, **all** layer headers, then
-/// **all** layer payloads. Every payload block is distinct per layer and per
-/// block index, so a decoder that read a layer from the wrong offset would
-/// produce visibly wrong texels rather than plausible ones.
+/// The layout is the measured framing identity, not the refuted one: a 32-byte
+/// envelope whose `field_18` is the base level's own byte count, then level 0
+/// **unprefixed**, level 1 **unprefixed**, and a little-endian `u32` byte count
+/// in front of every level from [`FIRST_PREFIXED_LEVEL`] on. There are **no**
+/// layer headers and there is exactly **one** chain — a claim this crate records
+/// as a refutation, under the old subject, in `claims::LAYER_COUNT_IS_DERIVED`.
+///
+/// Every block is distinct per block index, so a decode that read the wrong level
+/// or block would produce visibly wrong texels rather than plausible ones.
 ///
 /// # Panics
 ///
 /// Above [`MAX_SYNTHETIC_RASTER_BYTES`]. See that constant for why.
-pub fn raster_record(
-    width: u32,
-    height: u32,
-    mip_count: u32,
-    fourcc: u32,
-    layers: usize,
-) -> Vec<u8> {
-    let chain = chain_bytes(width, height, mip_count) as u64;
-    let total = 32 + layers as u64 * (LAYER_HEADER_SIZE as u64 + chain);
+pub fn raster_record(width: u32, height: u32, mip_count: u32, fourcc: u32) -> Vec<u8> {
+    let total = record_size(width, height, mip_count);
     assert!(
         total <= u64::from(MAX_SYNTHETIC_RASTER_BYTES),
         "a {width}x{height}x{mip_count} record would be {total} bytes; \
          use raster_header for a header that is only meant to be refused"
     );
-    let mut out = Vec::new();
-    push_u32(&mut out, 1); // version: observed 1 in every record, never validated
-    push_u32(&mut out, width);
-    push_u32(&mut out, height);
-    push_u32(&mut out, mip_count);
-    push_u32(&mut out, 8); // field_10: observed constant, never read
-    push_u32(&mut out, fourcc);
-    push_u32(&mut out, 0x0004_0000); // field_18: observed constant, never read
-    push_u32(&mut out, 0x0000_FFFF); // field_1c
-
-    for layer in 0..layers {
-        // A 4-byte name plus three words, all of them never interpreted. The
-        // values differ per layer so a decoder that read them cannot look right
-        // by accident.
-        out.extend_from_slice(format!("L{layer:03}").as_bytes());
-        push_u32(&mut out, 0x1111_0000 | layer as u32);
-        push_u32(&mut out, 0x2222_0000 | layer as u32);
-        push_u32(&mut out, 0x3333_0000 | layer as u32);
-    }
-    debug_assert_eq!(out.len(), ENVELOPE_SIZE + layers * LAYER_HEADER_SIZE);
-
-    for layer in 0..layers {
-        for mip in 0..mip_count {
-            let w = (width >> mip).max(1);
-            let h = (height >> mip).max(1);
-            let block_count = mip_block_bytes(w, h) / BLOCK_BYTES;
-            for index in 0..block_count {
-                // Distinct per (layer, mip, block) so a mis-offset decode is
-                // observable by value.
-                let k = ((layer as u32 + 1) * 37 + (mip + 1) * 11 + index as u32) % 16;
-                let block = if index == 0 {
-                    flat_block()
-                } else {
-                    addressing_block(k as u8)
-                };
-                out.extend_from_slice(&block);
-            }
+    let mut out = raster_envelope(width, height, mip_count, fourcc);
+    for mip in 0..mip_count {
+        let bytes = level_block_bytes(width, height, mip);
+        if mip >= FIRST_PREFIXED_LEVEL {
+            push_u32(
+                &mut out,
+                u32::try_from(bytes).expect("a level below MAX_SYNTHETIC_RASTER_BYTES fits u32"),
+            );
+        }
+        for index in 0..(bytes / BLOCK_BYTES) {
+            // Distinct per (mip, block) so a mis-offset decode is observable by
+            // value. Block 0 of level 0 is the only one reused, and it is reused
+            // to give the base mip a predictable first texel.
+            let block = if index == 0 && mip == 0 {
+                colour_block(0)
+            } else {
+                colour_block((((mip + 1) * 11 + index as u32) % 16) as u8)
+            };
+            out.extend_from_slice(&block);
         }
     }
     debug_assert_eq!(
-        out.len() - ENVELOPE_SIZE - layers * LAYER_HEADER_SIZE,
-        layers * chain_bytes(width, height, mip_count),
-        "the payload must be exactly the layer stride the reader divides by"
+        out.len() as u64,
+        record_size(width, height, mip_count),
+        "the fixture must satisfy the framing identity the decoder verifies"
     );
     out
 }
 
-/// A valid two-layer 8x8 DXT5 record with two mips, the smallest fixture this
-/// crate's happy path uses.
-pub fn two_layer_raster() -> Vec<u8> {
-    raster_record(8, 8, 2, DXT5_FOURCC, 2)
+/// The record length the framing identity implies, saturating.
+fn record_size(width: u32, height: u32, mip_count: u32) -> u64 {
+    let mut total = ENVELOPE_SIZE as u64;
+    for mip in 0..mip_count {
+        if mip >= FIRST_PREFIXED_LEVEL {
+            total = total.saturating_add(4);
+        }
+        total = total.saturating_add(level_block_bytes(width, height, mip) as u64);
+    }
+    total
+}
+
+/// A valid 16x16 DXT5 record with two mips, the smallest fixture this crate's
+/// happy path uses.
+///
+/// **Renamed on 2026-10-05** from `two_layer_raster`, because there is one chain.
+/// The old name asserted the refuted model and every call site would have kept
+/// asserting it in prose.
+pub fn dxt5_raster() -> Vec<u8> {
+    raster_record(16, 16, 2, DXT5_FOURCC)
 }
 
 /// A **real** raster record of the `0x15` family.
