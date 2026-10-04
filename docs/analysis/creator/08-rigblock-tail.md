@@ -70,6 +70,36 @@ Also measured, for the record:
 size = 36 + 12 * 4^k ,  k in 0..7
 ```
 
+> **CORRECTION (2026-10-04, found by `spore-rigblock`'s corpus test).** The
+> formula above is **wrong for `k = 0`**, and this report's own histogram
+> contradicts it. `36 + 12·4⁰` = 48, but the histogram below lists **212 records
+> of exactly 36 bytes**, and §3.2's decompiled writer returns immediately after
+> the header when the level count is zero:
+>
+> ```
+> if n == 0:  write(&hdr, 0x24);  return   // -> exactly 36 bytes
+> ```
+>
+> The correct statement is:
+>
+> ```
+> cell_count = 0       when k == 0     <- the early return; no payload at all
+> cell_count = 4^k     when k >= 1
+> size       = 36 + 3 * cell_count
+> ```
+>
+> The per-level mapping, from this report's own size histogram cross-tabulated
+> against its level histogram, is
+> `k=0→36, 1→48, 2→84, 3→228, 4→804, 5→3108, 6→12324, 7→49188`
+> (counts `212, 330, 465, 369, 128, 37, 7, 1`, summing to 1549), which is
+> `36 + 3·4^k` for `k >= 1`. So `k = 0` carries **no cells**, not one.
+>
+> A `k = 0` record read as one cell would invent a cell the record does not
+> contain, which is why `spore-rigblock` refuses to. The rest of this report —
+> the field table, the nibble mapping, the slack histogram — is unaffected: the
+> payload simply does not exist at `k = 0`, and every other level's arithmetic
+> was already right.
+
 | offset | size | field | grade |
 |---|---:|---|---|
 | `0x00` | 12 | 3 floats — component-wise **MAX** over all cells of each cell's *low* corner | VERIFIED |

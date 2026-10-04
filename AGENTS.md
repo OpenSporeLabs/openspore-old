@@ -48,12 +48,14 @@ crates/spore-differential  Rust parsers vs the Python oracles, over real data
 crates/spore-cellcontent    the 12 Cell Stage gameplay record layouts
 crates/spore-semantic-bridge  read-only consumer of the spore-semantic passport
 crates/spore-creator-core  the authoring core: <sporemodel> creator documents
+crates/spore-rigblock  the part layer: rigblock bounds, RW4 skeleton body graph, bone names
 crates/spore-engine      the Bevy runtime
 crates/spore-tools       `osptool`, the inspection CLI
 ```
 
 **The load-bearing invariant: everything above `loader` is renderer-agnostic
-and Bevy-free.** `spore-core` … `spore-material`, `spore-creator-core` and
+and Bevy-free.** `spore-core` … `spore-material`, `spore-creator-core`,
+`spore-rigblock` and
 `spore-differential` must never gain a `bevy` dependency, and `spore-assets`
 must never touch a GPU. That is what makes the asset layer testable with no
 window and no game install, and it is why `--info` decodes a real record in
@@ -118,6 +120,16 @@ cargo test -p spore-differential --release -- --ignored --nocapture
   radices and both float spellings, and never gate a field on `formatversion` —
   `v16` documents both write and omit `<handles>`, and so do `v15` documents.
   See `docs/CREATOR-CORE.md`.
+
+- **Bone identity in a part skeleton is FNV-1, not FNV-1a.** The `Skeleton
+  (0x70002)` section's first array holds 2002 distinct 32-bit words that are
+  **FNV-1** (multiply, then xor) hashes of a morph-parameter name — `joint1..9`,
+  `base1..6`, `shaft1..5`, `hip`, `knee`, `iris`. It is *not* FNV-1a, which is
+  what this repo uses for DBPF instance ids; swapping the two orderings gives
+  **zero** matches and looks correct while doing it. 244 of 2002 are recovered,
+  graded per name by what witnesses them, and an exhaustive 62M-string search is
+  expected to produce **29 accidental collisions** — so a single unrepeated hit
+  proves nothing. Never re-derive the hash; use `spore_rigblock::vocabulary`.
 
 ### Evidence discipline (unchanged by the migration, now enforced in code)
 

@@ -14,6 +14,7 @@ members = [
     "crates/spore-differential",
     "crates/spore-semantic-bridge",
     "crates/spore-creator-core",
+    "crates/spore-rigblock",
 ]
 
 [workspace.package]
@@ -36,6 +37,7 @@ spore-cellcontent = { path = "crates/spore-cellcontent", version = "0.1.0" }
 spore-differential = { path = "crates/spore-differential", version = "0.1.0" }
 spore-semantic-bridge = { path = "crates/spore-semantic-bridge", version = "0.1.0" }
 spore-creator-core = { path = "crates/spore-creator-core", version = "0.1.0" }
+spore-rigblock = { path = "crates/spore-rigblock", version = "0.1.0" }
 
 # Bevy: no default features. The set below is the smallest one that gives a
 # native window, a wgpu renderer, PBR materials and PNG image loading.

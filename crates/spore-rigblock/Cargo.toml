@@ -1,0 +1,15 @@
+[package]
+name = "spore-rigblock"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The EditorRigblock part layer: rigblock bounds, the RW4 skeleton body graph, and the bone-name vocabulary."
+
+[dependencies]
+spore-core = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+spore-dbpf = { workspace = true }

@@ -644,3 +644,115 @@ editor UI, gizmo or selection model.
 | f32 `{:?}` round-trip, all finite patterns | measured | `05` |
 | `serde_json` emits `null` for NaN | measured | `05`, `serde_json-1.0.150/src/ser.rs:169-179` |
 | no UI is a **scope** decision, not a knowledge ceiling | **VERIFIED** | `07` §11 — type `0xCF6C21B8` ships the game's own UI-definition XML |
+
+---
+
+## 10. The body graph is recovered — and it is not in the mesh
+
+Added 2026-10-04, from `docs/analysis/creator/09`, `10` and `11`. This is the
+expedition's main result and it changes the architecture above, so it is stated
+here rather than only in the reports.
+
+### 10.1 A part is a PAIR, not a file
+
+The chain now closes one hop further than §3 described. A part is two records at
+group `0x40606000` sharing one instance id:
+
+| type | name | holds | crate |
+|---|---|---|---|
+| `0x2F4E681B` | `rw4` | a RenderWare 4 container; **6270 `Skeleton (0x70002)` sections** in 1568 of 1824 records | `spore-rigblock::skeleton` |
+| `0x01C135DA` | `gmsh` | the geometry, whose bones are an **anonymous local ordinal list** | not yet decoded in Rust |
+
+Neither record contains the other's type id (0 hits for `0x01C135DA`, 0 for the
+`0x00A00CE4` key tag), so **the join is by instance id alone** and it is the load
+that binds anonymous geometry to named bones. Decoding a mesh without its sibling
+container yields half a part.
+
+Note also that the two halves live in **different packages**: the rigblock bounds
+records are in `Spore_Game.package`, the part pair in `Spore_Graphics.package`,
+and the `prop` pointers in between in `Spore_Graphics.package` too. A reader who
+opens one file finds half the answer.
+
+### 10.2 The skeleton IS the body graph
+
+`Skeleton (0x70002)` is `0x18 + 12·N` bytes: three `u32[N]` arrays and nothing
+else, with **zero unaccounted bytes** in 6270 of 6270.
+
+* array 1 — bone identity
+* array 2 — a field whose values lie in `{0,1,2,3}` only (**meaning unknown**)
+* array 3 — **parent index**, every value in `[-1, N-1]`, **exactly one `-1` per
+  skeleton**, every parent chain acyclic
+
+Measured over the corpus with the Rust decoder: **6270 sections, 1568 records,
+15 763 bones, at most 25 bones in a skeleton, and a deepest parent chain of 24.**
+
+That last number is the interesting one. A depth-24 chain under a single root is
+a **serial chain**, which is what the SIGGRAPH paper describes; it is not proof
+that the chain is a *spine*, and the distinction is recorded rather than glossed.
+
+### 10.3 Bone identity is a hash of a name — FNV-1, not FNV-1a
+
+The 2002 distinct identity words are **FNV-1 hashes of a morph-lattice parameter
+name**: multiply then xor, basis `0x811C9DC5`, prime `0x01000193`. It is *not*
+FNV-1a, which is how this repository hashes DBPF ids, and swapping the two orderings
+yields zero matches where the correct one yields hundreds.
+
+244 identities are recovered, covering **43 % of all bone occurrences**, graded
+per name by what actually witnesses them:
+
+| grade | witness | names | bone occurrences |
+|---|---|---:|---:|
+| `Family` | ≥3 siblings of an indexed family recovered | 95 | 38.0 % |
+| `BinaryLiteral` | exact delimited bytes in a shipped `.exe`/`.dll` | 56 | 4.6 % |
+| `RecordLiteral` | exact delimited bytes in a decompressed record | 19 | 0.6 % |
+| `Unconfirmed` | a single exhaustive hit, nothing else | 74 | 1.4 % |
+
+Chance is accounted for: the exhaustive search covered 62 193 780 candidate
+strings against 2002 targets, i.e. **29.0 expected accidental collisions** against
+244 recovered. `BoneName::name_if_certain()` returns a name only for the three
+witnessed grades, so a caller cannot accidentally print an unproven word as
+anatomy — which is exactly how `kiomq` stayed out of a creature's skeleton.
+
+The recovered vocabulary is anatomical (`root`, `body`, `head`, `eye`, `pupil`,
+`iris`, `jaw1..3`, `neck1..2`, `shoulder`, `arm1..3`, `hand`, `hip`, `knee`,
+`ankle`, `elbow`, `tail`, `wing`, `fin`, `toe`, `weapon`, `mast`), mechanical
+(`joint1..9`, `joint20..29`, `base1..6`, `node1..6`, `stem0..5`, `shaft1..5`,
+`bolt1..4`, `bulb1..4`, `ring1..3`, `bounce`, `rotate`, `spin`, `radius`), and
+positional (`xpos`, `xneg`, `ypos`, `yneg`, `z_up`, `j_up`, `mid`, `tip`,
+`top1..4`).
+
+### 10.4 Two questions the corpus answered, against history
+
+**Symmetry is laterality, not an operation.** There is no symmetry flag, mirror
+node or reflection relationship anywhere: the skeleton payload is three arrays
+with zero slack. But complete left/right name pairs *are* present —
+`wingL`/`wingR`, `sideL`/`sideR`, `hipL`/`hipR`, `kneeL`/`kneeR`. So the editor
+operation is **not** serialized and its **result** is, the way any other part is.
+A "mirror this part" rule would be invented behaviour.
+
+**Attachment is still open, and precisely so.** `attach` (36 bones) and `csnap`
+(46) are recovered names, but both live *inside* one part's skeleton. The other
+candidate is the `<blockref>` childlist one level up. No array in `0x70002`
+stores a part-to-part reference, so the honest answer today is: the minimal
+persisted relationship for composing a creature is the **`<blockref>` childlist
+plus the local transform**, and whether a part's own `attach` bone participates is
+UNKNOWN. That is the highest-value open question in the whole subsystem, because
+it decides whether attachment is data or an editor convenience.
+
+### 10.5 What the paper predicted, and what it did not
+
+`docs/analysis/creator/11` §3 carries the full correspondence table. Summary of the
+rows that moved:
+
+| historical concept | corpus | verdict |
+|---|---|---|
+| body | one `Skeleton` per part container, 1–25 bones | **confirmed** |
+| parent | parent array, one root, acyclic, 6270/6270 | **confirmed** |
+| serial chain at the root | deepest chain measured at **24** | **strongly supported** |
+| caps | bone names recovered as a morph-parameter vocabulary | **confirmed as naming, not as caps** |
+| `grasper` | no token hashes to it | **unresolved** |
+| rest pose | 10 859 orthonormal transforms, none labelled | **unresolved** |
+| 20–80 bodies per character | a part holds ≤9 skeletons; a creature assembles up to 680 `<blockref>` | **consistent, not confirmed** |
+
+The one that must not be over-read: a paper "body" and a rigblock container's
+skeleton are **not shown to be the same unit**, and the table says so.
