@@ -95,16 +95,61 @@ pub const MATERIAL_NAME: &str = "material_name";
 /// What the material id *means*. Nothing, in this build.
 pub const MATERIAL_ID_MEANING: &str = "material_id_meaning";
 
-/// Which sampler stage a texture binding feeds. Unknown: the 16 bytes a gmdl
-/// texture-set entry skips before `{instance, group}` are not decoded.
+/// Which sampler stage a texture binding feeds. Unknown, and **not** because
+/// the entry's header was never read — it has now been read (see
+/// [`TEXTURE_SET_ENTRY_LAYOUT`]) and holds no role field.
 pub const SAMPLER_ROLE: &str = "sampler_role";
+
+/// What a resolved texture's own bytes are: a tangent-space normal map, a
+/// layered single-channel mask, or unidentified.
+///
+/// Distinct from [`SAMPLER_ROLE`] on purpose. This one is answerable from the
+/// record and is checked per record; the sampler stage is a property of a
+/// shader this workspace has never read.
+pub const TEXTURE_CONTENT_ROLE: &str = "texture_content_role";
+
+/// The `0x15` family's lanes 0-2 are a tangent-space normal map stored **Z
+/// first**.
+///
+/// **Re-published from `spore_texture::claims`, never restated.** The
+/// measurement is that crate's: 901 of 901 records of the family in
+/// `Spore_Content.package`. See `docs/LUMINANCE-RASTER.md`.
+pub const NORMAL_MAP_CONTENT: &str = "normal_map_content";
+
+/// A `DXT5`-family record carries no colour: the byte-pinned codec reduces its
+/// colour field to two values across every record in the corpus.
+pub const DXT5_CARRIES_NO_COLOUR: &str = "dxt5_carries_no_colour";
+
+/// A `DXT5` record's two layers are two distinct surfaces, not one image and a
+/// copy.
+pub const DXT5_LAYERS_ARE_DISTINCT: &str = "dxt5_layers_are_distinct";
+
+/// What a mask layer is **for**. Nothing, in this build.
+pub const MASK_LAYER_PURPOSE: &str = "mask_layer_purpose";
+
+/// The shapes a gmdl texture set occurs in, measured over the whole corpus.
+pub const TEXTURE_SET_SHAPES: &str = "texture_set_shapes";
+
+/// A texture-set entry's first header word is the entry's own ordinal within
+/// its texture set.
+pub const SAMPLER_WORD_IS_ENTRY_ORDINAL: &str = "sampler_word_is_entry_ordinal";
+
+/// A referenced texture's group id has the entry's ordinal in its low byte.
+pub const GROUP_LOW_BYTE_IS_SLOT: &str = "group_low_byte_is_slot";
+
+/// How a model's texture set was cut into per-mesh pieces, and how far that
+/// cut is evidence rather than arithmetic.
+pub const PER_MESH_TEXTURE_PARTITION: &str = "per_mesh_texture_partition";
+
+/// That material-info block `i` is mesh `i`. Not established.
+pub const MATERIAL_BLOCK_IS_MESH: &str = "material_block_is_mesh";
 
 /// The observed layout of one gmdl texture-set entry: 16 skipped bytes, then the
 /// referenced record's instance and group ids.
 pub const TEXTURE_SET_ENTRY_LAYOUT: &str = "texture_set_entry_layout";
 
 /// Which texture-set block belongs to which material id. Not established, so a
-/// [`MaterialModel`](crate::MaterialModel)'s bindings are the whole model's
+/// [`MeshMaterial`](crate::MeshMaterial)'s slots are the whole model's
 /// texture set rather than one material's share of it.
 pub const MATERIAL_TEXTURE_OWNERSHIP: &str = "material_texture_ownership";
 
@@ -132,7 +177,14 @@ pub const TEXTURE_REF_HAS_NO_TYPE_WORD: &str = "texture_ref_has_no_type_word";
 
 /// The 16 bytes preceding `{instance, group}` in a texture-set entry are
 /// skipped, not decoded, so no sampler role follows from them.
-pub const TEXTURE_ENTRY_HEADER_NOT_DECODED: &str = "texture_entry_header_not_decoded";
+///
+/// **Superseded as a statement about *decoding*, and still exactly right as a
+/// statement about the *role*.** The first of the 16 bytes has now been read
+/// and is the entry's ordinal ([`SAMPLER_WORD_IS_ENTRY_ORDINAL`]); the other 12
+/// take four distinct values across 6684 references and do not vary with the
+/// ordinal. So the header carries no role field, which is a stronger and better
+/// supported reason than "nobody decoded it".
+pub const NO_ROLE_FIELD_IN_TEXTURE_ENTRY: &str = "no_role_field_in_texture_entry";
 
 /// `spore-core`'s canonical type table has no name for this id.
 pub const NO_CANONICAL_TYPE_NAME: &str = "no_canonical_type_name";
@@ -149,6 +201,18 @@ pub const MEANING_NOT_ESTABLISHED: &str = "meaning_not_established";
 pub const MATERIAL_BLOCKS_NOT_ASSOCIATED: &str =
     "material_info_blocks_not_associated_with_material_ids";
 
+/// Nothing measured establishes that material-info block `i` is mesh `i`.
+///
+/// Separate from [`MATERIAL_BLOCKS_NOT_ASSOCIATED`] on purpose: that one says
+/// the *walk* discards the block boundaries, and this one says the *ordering*
+/// is an inference. The partition this crate offers is therefore graded
+/// `INFERRED` even when the arithmetic divides exactly.
+pub const BLOCK_ORDER_NOT_ESTABLISHED: &str = "material_info_block_order_not_established";
+
+/// The model's texture references do not divide evenly by its mesh count, so no
+/// per-mesh cut was attempted and every mesh holds the whole set.
+pub const TEXTURE_SET_DID_NOT_DIVIDE: &str = "texture_set_did_not_divide_by_mesh_count";
+
 // ---------------------------------------------------------------------------
 // Provenance references — the paths a graded claim is sourced from
 // ---------------------------------------------------------------------------
@@ -161,6 +225,10 @@ pub const PROV_RESOLVE: &str = "crates/spore-material/src/resolve.rs";
 
 /// The raster envelope byte-pinned against real records.
 pub const PROV_MATERIALS_DESIGN: &str = "docs/MATERIALS-DESIGN.md §1";
+
+/// The role census: every table in this crate's role assignments, measured over
+/// `SPORE/Data/Spore_Content.package` on 2026-10-04.
+pub const PROV_MATERIAL_ROLES: &str = "docs/MATERIAL-ROLES.md";
 
 /// The stdlib-only Python oracle for the block codec.
 pub const PROV_DXT5_ORACLE: &str = "tools/spore/dxt5/dxt5.py";
@@ -331,22 +399,140 @@ pub const ALL_CLAIMS: &[ClaimSpec] = &[
     },
     ClaimSpec {
         subject: SAMPLER_ROLE,
-        kind: ClaimKind::NonFinding(TEXTURE_ENTRY_HEADER_NOT_DECODED),
-        basis: "The 16 bytes before {instance, group} in a texture-set entry are skipped, \\
-                not decoded. Any concrete texture purpose -- colour, gloss, surface \\
-                orientation -- would be a guess about a shader nobody here has read.",
+        kind: ClaimKind::NonFinding(NO_ROLE_FIELD_IN_TEXTURE_ENTRY),
+        basis: "REFUTES the earlier reason, which was that the 16 bytes before \
+                {instance, group} were never read. They have now been read: the \
+                first word is the entry's ordinal (6684/6684 references) and the \
+                other 12 take four distinct values across 6684 references without \
+                varying with the ordinal. So the header carries NO role field at \
+                all, which is a stronger reason than 'not decoded'. Which shader \
+                stage the game binds a given texture to is still unread.",
+    },
+    ClaimSpec {
+        subject: TEXTURE_CONTENT_ROLE,
+        kind: ClaimKind::Graded(EvidenceLevel::Observed),
+        basis: "assigned per resolved record from its own format word AND a \
+                statistic over its own base mip (role::classify). A record whose \
+                content fails the check for its format word is Unidentified, so \
+                the role is an observation of this record rather than a lookup \
+                of its family's name. Deliberately NOT the same claim as \
+                SAMPLER_ROLE.",
+    },
+    ClaimSpec {
+        subject: NORMAL_MAP_CONTENT,
+        kind: ClaimKind::Graded(EvidenceLevel::Verified),
+        basis: "re-published from spore_texture::claims, which established it over \
+                901/901 records of the 0x15 family in Spore_Content.package. \
+                Delegated, never restated: a local copy of a republished fact is \
+                how this crate once asserted the opposite of its own decoder.",
+    },
+    ClaimSpec {
+        subject: DXT5_CARRIES_NO_COLOUR,
+        kind: ClaimKind::Graded(EvidenceLevel::Verified),
+        basis: "over 1374 decodable DXT5 records x 2 layers x 262144 texels the \
+                decoded red channel takes exactly 2 values and green and blue \
+                exactly 1 each; a stride sample of 477771 palette entries from \
+                every DXT5 block in the corpus yields exactly 2 distinct RGB \
+                triples, (0,0,0) and (8,0,0). Structural, not sampled: the codec \
+                reads the colour field as two 6-bit values and its green and \
+                blue terms can only be zero. See docs/MATERIAL-ROLES.md.",
+    },
+    ClaimSpec {
+        subject: DXT5_LAYERS_ARE_DISTINCT,
+        kind: ClaimKind::Graded(EvidenceLevel::Verified),
+        basis: "layer 0 and layer 1 of the same DXT5 record differ byte-for-byte in \
+                1233/1233 referenced record-instances, and a 3-entry gmdl texture \
+                set never names the same DXT5 record twice (1922/1922 sets). Two \
+                surfaces, not one image and a copy.",
+    },
+    ClaimSpec {
+        subject: MASK_LAYER_PURPOSE,
+        kind: ClaimKind::NonFinding(MEANING_NOT_ESTABLISHED),
+        basis: "a mask layer's CONTENT is measured (a full-range 8-bit channel over \
+                a degenerate colour field) and its PURPOSE is unknown. Nothing in the \
+                gmdl record, the raster envelope or the texture-set entry \
+                distinguishes one candidate purpose from another -- a specular mask \
+                and a gloss mask look identical in these records -- so \
+                ChannelRole::MaskChannel says what the bytes are and no more.",
+    },
+    ClaimSpec {
+        subject: TEXTURE_SET_SHAPES,
+        kind: ClaimKind::Graded(EvidenceLevel::Verified),
+        basis: "over every gmdl texture set the repository's Python oracle walks in \
+                Spore_Content.package (1819 records, 2381 blocks, 6684 references) \
+                there are exactly TWO shapes: (DXT5, DXT5, 0x15) in 1922 sets and \
+                (DXT5, 0x15) in 459 sets. The 0x15 record is always last. Recorded \
+                as a corpus regularity, NOT as the basis of a role: the second \
+                entry is DXT5 in 1922 sets and 0x15 in 459, so the ordinal alone \
+                does not determine the content. Re-checked per model by \
+                ModelTextures::observed_shape, which reports this model's own \
+                shape rather than restating these numbers.",
+    },
+    ClaimSpec {
+        subject: SAMPLER_WORD_IS_ENTRY_ORDINAL,
+        kind: ClaimKind::Graded(EvidenceLevel::Verified),
+        basis: "the first of the 16 bytes spore-gmdl skips equals the entry's \
+                position within its texture set in 6684/6684 references. So the \
+                ordinal this crate derives by arithmetic is the record's own \
+                statement, and a reader that disagreed with it would be wrong.",
+    },
+    ClaimSpec {
+        subject: GROUP_LOW_BYTE_IS_SLOT,
+        kind: ClaimKind::Graded(EvidenceLevel::Verified),
+        basis: "a referenced texture's group id carries the same ordinal in its low \
+                byte in 6684/6684 references (slot 0 -> ...00, 1 -> ...01, \
+                2 -> ...02). The corpus's references span SIX group families -- \
+                0x40612900, 0x40632900, 0x40642900, 0x40652900, 0x40662900 and \
+                0x406b2900 -- plus 150 references naming group id 0 outright, and \
+                the agreement holds across all of them. A convenient CROSS-CHECK; \
+                never a source of truth, because a naming convention would \
+                survive the records it describes being reordered.",
+    },
+    ClaimSpec {
+        subject: PER_MESH_TEXTURE_PARTITION,
+        // Graded when the division came out even, a non-finding when it did not.
+        // The grade is INFERRED in the first case and UNKNOWN in the second, and
+        // the second must never borrow the first's confidence: a partition that
+        // was not made carries no value at all.
+        kind: ClaimKind::GradedOrNonFinding {
+            level: EvidenceLevel::Inferred,
+            reason: TEXTURE_SET_DID_NOT_DIVIDE,
+        },
+        basis: "the cut is made by dividing the model's flat texture_refs by its \
+                mesh count, which is sound only if every material-info block \
+                contributed the same number of references. Measured two ways: \
+                spore-gmdl's own reader partitions 3589 of 3589 mesh-bearing gmdl \
+                records in Spore_Content.package evenly and not one unevenly, and \
+                mesh_count equals the block count in 1819/1819 records the \
+                Python oracle walks. Inference from a regularity, not a \
+                byte-level link -- see MATERIAL_BLOCK_IS_MESH.",
+    },
+    ClaimSpec {
+        subject: MATERIAL_BLOCK_IS_MESH,
+        kind: ClaimKind::NonFinding(BLOCK_ORDER_NOT_ESTABLISHED),
+        basis: "mesh_count == material-info block count in 1819/1819 records, and \
+                an even division in 3589/3589 records spore-gmdl walks, are strong \
+                regularities and still not a link: nothing in the record says block \
+                i is mesh i, only that there are as many of each. The per-mesh \
+                partition is therefore offered as INFERRED and labelled as such, \
+                never as a resolved binding.",
     },
     ClaimSpec {
         subject: TEXTURE_SET_ENTRY_LAYOUT,
         kind: ClaimKind::Graded(EvidenceLevel::Observed),
-        basis: "read directly off real records by spore-gmdl's walk; the skip is in the \
-                source at read_texture_set.",
+        basis: "read directly off real records: 16 bytes, of which the first is the \
+                entry's ordinal, then the referenced record's instance and group \
+                ids. The remaining 12 bytes are carried and not interpreted.",
     },
     ClaimSpec {
         subject: MATERIAL_TEXTURE_OWNERSHIP,
         kind: ClaimKind::NonFinding(MATERIAL_BLOCKS_NOT_ASSOCIATED),
-        basis: "spore-gmdl pushes every texture set's refs into one list and never records \
-                which block they came from, so no per-material share can be claimed.",
+        basis: "spore-gmdl pushes every texture set's refs into one list and never \
+                records which block they came from, so the block boundaries are \
+                unrecoverable from GmdlModel. What this crate offers instead is a \
+                per-mesh PARTITION derived by division, graded INFERRED -- see \
+                PER_MESH_TEXTURE_PARTITION. The non-finding is about the walk, not \
+                about the format.",
     },
     ClaimSpec {
         subject: MATERIAL_ID_READ_VERBATIM,
@@ -559,7 +745,63 @@ mod tests {
         );
         assert_eq!(
             non_finding(SAMPLER_ROLE).reason(),
-            Some(TEXTURE_ENTRY_HEADER_NOT_DECODED)
+            Some(NO_ROLE_FIELD_IN_TEXTURE_ENTRY)
+        );
+    }
+
+    #[test]
+    fn the_sampler_role_non_finding_is_now_backed_by_a_measurement_not_an_omission() {
+        // The reason code changed from "the header was not decoded" to "the
+        // header carries no role field", because the header has since been read.
+        // What must NOT change is that the claim is still UNKNOWN: a stronger
+        // reason for a non-finding must never promote it to a value.
+        assert_eq!(grade_of(SAMPLER_ROLE), EvidenceLevel::Unknown);
+        assert_ne!(grade_of(SAMPLER_ROLE), EvidenceLevel::Inferred);
+        assert_ne!(grade_of(SAMPLER_ROLE), EvidenceLevel::Observed);
+        assert_eq!(
+            grade_of(SAMPLER_WORD_IS_ENTRY_ORDINAL),
+            EvidenceLevel::Verified
+        );
+        assert_eq!(grade_of(GROUP_LOW_BYTE_IS_SLOT), EvidenceLevel::Verified);
+        assert_eq!(grade_of(TEXTURE_SET_SHAPES), EvidenceLevel::Verified);
+        // And the content role, which IS answerable, must not be confused with
+        // it: two different subjects, two different grades.
+        assert_eq!(grade_of(TEXTURE_CONTENT_ROLE), EvidenceLevel::Observed);
+        assert_ne!(grade_of(TEXTURE_CONTENT_ROLE), grade_of(SAMPLER_ROLE));
+    }
+
+    #[test]
+    fn the_per_mesh_partition_is_inferred_when_made_and_absent_when_not() {
+        assert_eq!(
+            grade_of(PER_MESH_TEXTURE_PARTITION),
+            EvidenceLevel::Inferred
+        );
+        assert!(spec_of(PER_MESH_TEXTURE_PARTITION)
+            .unwrap()
+            .kind
+            .reason()
+            .is_some());
+        assert_eq!(
+            non_finding(PER_MESH_TEXTURE_PARTITION).reason(),
+            Some(TEXTURE_SET_DID_NOT_DIVIDE)
+        );
+        assert_eq!(grade_of(MATERIAL_BLOCK_IS_MESH), EvidenceLevel::Unknown);
+        assert_eq!(
+            non_finding(MATERIAL_BLOCK_IS_MESH).reason(),
+            Some(BLOCK_ORDER_NOT_ESTABLISHED)
+        );
+    }
+
+    #[test]
+    fn the_dxt5_content_claims_are_verified_and_its_purpose_is_not() {
+        assert_eq!(grade_of(DXT5_CARRIES_NO_COLOUR), EvidenceLevel::Verified);
+        assert_eq!(grade_of(DXT5_LAYERS_ARE_DISTINCT), EvidenceLevel::Verified);
+        assert_eq!(grade_of(NORMAL_MAP_CONTENT), EvidenceLevel::Verified);
+        // Content known, purpose unknown: the three must not be merged.
+        assert_eq!(grade_of(MASK_LAYER_PURPOSE), EvidenceLevel::Unknown);
+        assert_eq!(
+            non_finding(MASK_LAYER_PURPOSE).reason(),
+            Some(MEANING_NOT_ESTABLISHED)
         );
     }
 

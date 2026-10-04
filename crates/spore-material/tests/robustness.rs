@@ -227,7 +227,7 @@ fn a_model_record_with_no_materials_resolves_to_no_materials() {
     let store = store_over(&[(documented_model_key(), record)]);
     let resolved = resolve_model_record(&store, &documented_model_key(), RASTER_TYPE).unwrap();
     assert!(resolved.textures.is_empty());
-    assert!(resolved.materials.is_empty());
+    assert!(resolved.meshes.is_empty());
     assert_eq!(resolved.resolved_count(), 0);
     assert!(resolved.failures().is_empty());
 }

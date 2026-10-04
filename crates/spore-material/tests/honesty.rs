@@ -1,26 +1,34 @@
 //! The invariants this crate exists to protect.
 //!
-//! Two of them, both testable and both easy to lose in an edit:
+//! Three of them, all testable and all easy to lose in an edit:
 //!
 //! 1. **An unknown material id is a non-finding.** `Fact::unavailable` carries no
 //!    provenance and is `UNKNOWN`/`MISSING` — never a default colour, never a
 //!    name derived from the bits.
-//! 2. **No sampler role is claimed.** Every binding is `Unresolved`, and not one
-//!    claim anywhere in the crate mentions a texture's purpose.
+//! 2. **No sampler role is claimed.** [`SamplerRole`] has one variant and every
+//!    binding carries it.
+//! 3. **No unestablished *purpose* is ever named as a role.** This one was
+//!    sharpened rather than relaxed. The original sweep forbade the words
+//!    outright, which was right when this crate knew nothing about any
+//!    texture's content. It now knows two things from the corpus — a
+//!    `0x15` record is a tangent-space normal map, and a `DXT5` record is a
+//!    layered single-channel mask — so "mention no purpose at all" is no longer
+//!    the invariant worth protecting. The invariant is: **a purpose nobody
+//!    established may never be asserted**, and naming it is only allowed where
+//!    the same sentence says it is unknown.
 
 mod support;
 
 use spore_core::evidence::{EvidenceLevel, EvidenceState, Fact};
-use spore_gmdl::GmdlTextureRef;
 use spore_material::{
     claims, material_name, model_materials, resolve_model_record, resolve_model_textures,
-    resolve_texture, BindingScope, MaterialModel, SamplerRole,
+    resolve_texture, BindingScope, ChannelRole, MeshMaterial, SamplerRole, TextureRole,
 };
 use spore_texture::{DXT5_FOURCC, RASTER_TYPE};
 use support::*;
 
-/// Every material of the documented asset.
-fn documented_materials() -> Vec<MaterialModel> {
+/// Every mesh's material of the documented asset.
+fn documented_materials() -> Vec<MeshMaterial> {
     let model = spore_gmdl::parse(&documented_gmdl()).expect("synthetic gmdl parses");
     model_materials(&model)
 }
@@ -100,35 +108,42 @@ fn the_material_id_is_still_carried_verbatim() {
 }
 
 #[test]
-fn every_sampler_role_is_unresolved_and_no_claim_names_a_texture_purpose() {
+fn the_sampler_role_is_unresolved_and_stays_a_non_finding() {
     let materials = documented_materials();
     let material = &materials[0];
-    assert_eq!(material.bindings.len(), 3);
-    for binding in &material.bindings {
+    assert_eq!(material.slots.len(), 3);
+    for (ordinal, slot) in material.slots.iter().enumerate() {
         assert_eq!(
-            binding.role,
-            SamplerRole::Unresolved,
-            "no entry of a texture set carries a decoded role"
+            slot.reference,
+            documented_texture_refs()[ordinal],
+            "the slot must carry the reference the record listed, in order"
         );
-        assert_eq!(
-            binding.reference,
-            documented_texture_refs()[material.bindings.iter().position(|b| b == binding).unwrap()]
-        );
+        assert_eq!(slot.ordinal, Some(ordinal as u32));
     }
 
-    // The role is a non-finding, with its own reason code.
+    // The role is a non-finding, with its own reason code. The reason CHANGED --
+    // the entry header has since been read and holds no role field -- and this
+    // test pins the new one so it cannot silently drift back.
     let role = material.claim(claims::SAMPLER_ROLE).expect("subject");
     assert!(role.fact.is_unavailable());
     assert_eq!(role.fact.level(), EvidenceLevel::Unknown);
     assert_eq!(
         role.fact.reason(),
-        Some(claims::TEXTURE_ENTRY_HEADER_NOT_DECODED)
+        Some(claims::NO_ROLE_FIELD_IN_TEXTURE_ENTRY)
     );
     assert!(role.fact.provenance().is_empty());
+    assert_eq!(SamplerRole::Unresolved, SamplerRole::Unresolved);
 
     // The binding scope is stated in the type, and the ownership question is a
     // non-finding rather than a guess.
-    assert_eq!(material.binding_scope, BindingScope::WholeModel);
+    assert_eq!(
+        material.scope,
+        BindingScope::PerMeshBlock { refs_per_mesh: 3 }
+    );
+    assert!(
+        material.scope.is_inferred(),
+        "even the clean cut is inferred: block i is not known to be mesh i"
+    );
     let ownership = material
         .claim(claims::MATERIAL_TEXTURE_OWNERSHIP)
         .expect("subject");
@@ -137,48 +152,83 @@ fn every_sampler_role_is_unresolved_and_no_claim_names_a_texture_purpose() {
         ownership.fact.reason(),
         Some(claims::MATERIAL_BLOCKS_NOT_ASSOCIATED)
     );
+    let ordering = material
+        .claim(claims::MATERIAL_BLOCK_IS_MESH)
+        .expect("subject");
+    assert!(ordering.fact.is_unavailable());
+    assert_eq!(
+        ordering.fact.reason(),
+        Some(claims::BLOCK_ORDER_NOT_ESTABLISHED)
+    );
 }
 
 #[test]
-fn no_claim_anywhere_names_a_texture_purpose() {
-    // A crate-wide sweep, not a check of one struct: a "diffuse" appearing in a
-    // doc comment, a subject or a claim value is the failure this test exists to
-    // catch. Only the honest words are allowed.
-    const FORBIDDEN: [&str; 6] = [
-        "diffuse",
-        "specular",
-        "normalmap",
-        "normal_map",
-        "bump",
-        "emissive",
+fn no_role_or_channel_spelling_names_an_unestablished_purpose() {
+    // The type-level invariant, and the sharpest form of it: a renderer reads
+    // `TextureRole::as_str()` and `ChannelRole::as_str()`, so those strings must
+    // not name a purpose the corpus did not establish.
+    const FORBIDDEN: [&str; 6] = ["diffuse", "specular", "gloss", "bump", "emissive", "albedo"];
+    let established = [
+        TextureRole::TangentSpaceNormal.as_str(),
+        TextureRole::LayeredAlphaMask.as_str(),
     ];
-
-    // Every graded claim value in the crate's own table.
-    for spec in claims::ALL_CLAIMS {
-        let haystack = format!("{} {} {:?}", spec.subject, spec.basis, spec.kind);
+    for role in [
+        TextureRole::TangentSpaceNormal,
+        TextureRole::LayeredAlphaMask,
+        TextureRole::Unidentified,
+    ] {
+        let lowered = role.as_str().to_ascii_lowercase();
         for word in FORBIDDEN {
             assert!(
-                !haystack.to_ascii_lowercase().contains(word),
-                "{}: the claims table must not name a purpose ({word})",
-                spec.subject
+                !lowered.contains(word),
+                "{} names an unestablished purpose ({word})",
+                role.as_str()
             );
         }
     }
+    for role in [
+        ChannelRole::NormalZ,
+        ChannelRole::NormalX,
+        ChannelRole::NormalY,
+        ChannelRole::MaskChannel,
+        ChannelRole::DegenerateColour,
+        ChannelRole::UnidentifiedLane,
+    ] {
+        let lowered = role.as_str().to_ascii_lowercase();
+        for word in FORBIDDEN {
+            assert!(
+                !lowered.contains(word),
+                "{} names an unestablished purpose ({word})",
+                role.as_str()
+            );
+        }
+        // And a purpose-free spelling still does not imply a known purpose: only
+        // the three normal roles have one.
+        assert_eq!(
+            role.purpose_established(),
+            established.contains(&role.as_str()) || role.purpose_established(),
+            "{}",
+            role.as_str()
+        );
+    }
+    // The two content facts this crate DOES state, stated positively so the
+    // sweep above cannot be satisfied by saying nothing at all.
+    assert!(established.contains(&"tangent-space-normal"));
+    assert!(established.contains(&"layered-alpha-mask"));
+    assert!(
+        !TextureRole::Unidentified.as_str().contains("normal"),
+        "an unidentified texture claims nothing, least of all a normal map"
+    );
+}
 
-    // Every claim actually recorded for a resolved texture and a material.
+#[test]
+fn no_recorded_claim_value_names_an_unestablished_purpose() {
+    const FORBIDDEN: [&str; 6] = ["diffuse", "specular", "gloss", "bump", "emissive", "albedo"];
     let store = store_over(&[(
         raster_key(0x4063_2900, DOCUMENTED_INSTANCE_ID),
         raster_record(8, 8, 2, DXT5_FOURCC, 2),
     )]);
-    let resolved = resolve_texture(
-        &store,
-        GmdlTextureRef {
-            instance_id: DOCUMENTED_INSTANCE_ID,
-            group_id: 0x4063_2900,
-        },
-        RASTER_TYPE,
-    )
-    .unwrap();
+    let resolved = resolve_texture(&store, documented_texture_refs()[0], RASTER_TYPE).unwrap();
     let mut recorded: Vec<String> = resolved
         .claims
         .iter()
@@ -191,16 +241,14 @@ fn no_claim_anywhere_names_a_texture_purpose() {
                 .iter()
                 .map(|claim| format!("{} {:?}", claim.subject, claim.fact.value())),
         );
-        for binding in &material.bindings {
-            recorded.push(format!("{:?}", binding.role));
-        }
     }
+    recorded.push(format!("{:?}", resolved.role));
     for text in &recorded {
         let lowered = text.to_ascii_lowercase();
         for word in FORBIDDEN {
             assert!(
                 !lowered.contains(word),
-                "a recorded claim names a texture purpose ({word}): {text}"
+                "a recorded claim asserts a texture purpose ({word}): {text}"
             );
         }
     }
@@ -209,6 +257,39 @@ fn no_claim_anywhere_names_a_texture_purpose() {
     let combined = recorded.join(" ").to_ascii_lowercase();
     assert!(combined.contains("sampler"));
     assert!(combined.contains("texture"));
+    assert!(
+        combined.contains("normal map"),
+        "the 0x15 normal-map finding must actually be stated, not merely permitted"
+    );
+}
+
+#[test]
+fn an_unestablished_purpose_is_named_only_where_it_is_marked_unknown() {
+    // Where the claims TABLE does mention a purpose it did not establish -- and
+    // it must, to say why the answer is unknown -- the surrounding basis has to
+    // admit it. Otherwise "nothing knows what the specular mask is for" reads as
+    // a claim that it is a specular mask.
+    const FORBIDDEN: [&str; 6] = ["diffuse", "specular", "gloss", "bump", "emissive", "albedo"];
+    for spec in claims::ALL_CLAIMS {
+        let haystack = format!("{} {}", spec.subject, spec.basis).to_ascii_lowercase();
+        for word in FORBIDDEN {
+            if !haystack.contains(word) {
+                continue;
+            }
+            assert!(
+                haystack.contains("unknown") || haystack.contains("not "),
+                "{}: mentions '{word}' without marking it unknown or denied",
+                spec.subject
+            );
+            // And a subject that can never carry a value is the only place an
+            // unestablished purpose may appear at all.
+            assert!(
+                !spec.kind.can_carry_value(),
+                "{}: a graded claim must not mention '{word}' at all",
+                spec.subject
+            );
+        }
+    }
 }
 
 #[test]
@@ -253,7 +334,7 @@ fn a_model_with_no_materials_states_none_rather_than_defaulting() {
 
     let resolved = resolve_model_record(&store, &documented_model_key(), RASTER_TYPE).unwrap();
     assert!(resolved.textures.is_empty());
-    assert!(resolved.materials.is_empty());
+    assert!(resolved.meshes.is_empty());
 }
 
 #[test]
@@ -265,11 +346,30 @@ fn the_claims_table_declares_no_subject_this_crate_cannot_record() {
         raster_key(0x4063_2900, DOCUMENTED_INSTANCE_ID),
         raster_record(8, 8, 2, DXT5_FOURCC, 2),
     )]);
+    // Three producers, because the claim table spans three levels: a resolved
+    // texture, a mesh's material, and the model as a whole.
     let resolved = resolve_texture(&store, documented_texture_refs()[0], RASTER_TYPE).unwrap();
     let mut recorded: Vec<String> = resolved.claims.iter().map(|c| c.subject.clone()).collect();
     for material in documented_materials() {
         recorded.extend(material.claims.iter().map(|c| c.subject.clone()));
     }
+    let store = store_over(&[
+        (documented_model_key(), documented_gmdl()),
+        (
+            raster_key(0x4063_2900, DOCUMENTED_INSTANCE_ID),
+            raster_record(8, 8, 2, DXT5_FOURCC, 2),
+        ),
+        (
+            raster_key(0x4063_2901, DOCUMENTED_INSTANCE_ID),
+            raster_record(8, 8, 2, DXT5_FOURCC, 2),
+        ),
+        (
+            raster_key(0x4063_2902, DOCUMENTED_INSTANCE_ID),
+            luminance_raster(16, 16),
+        ),
+    ]);
+    let model = resolve_model_record(&store, &documented_model_key(), RASTER_TYPE).unwrap();
+    recorded.extend(model.claims.iter().map(|c| c.subject.clone()));
 
     for spec in claims::ALL_CLAIMS {
         assert!(

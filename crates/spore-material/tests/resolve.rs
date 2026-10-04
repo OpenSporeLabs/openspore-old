@@ -225,8 +225,13 @@ fn the_resolution_records_what_it_assumed_and_what_it_does_not_know() {
             claims::ENVELOPE_FIELD_10_MEANING,
             claims::ENVELOPE_FIELD_18_MEANING,
             claims::ENVELOPE_FIELD_1C_MEANING,
+            // The mask layer's PURPOSE is a non-finding even though its content
+            // is known and graded: content is not purpose. Adding it here is
+            // the point -- a claim that stops being recorded is as much a
+            // regression as one that starts.
+            claims::MASK_LAYER_PURPOSE,
         ],
-        "five facts are genuinely unknown, and this list is the whole of them"
+        "six facts are genuinely unknown, and this list is the whole of them"
     );
     assert!(
         !unknowns.contains(&claims::LUMINANCE_FOURCC_FAMILY),
@@ -569,12 +574,19 @@ fn a_model_record_resolves_through_the_gmdl_layer() {
         "all three references now resolve"
     );
 
-    // One material, no name, four non-findings, and the whole model's bindings.
-    assert_eq!(resolved.materials.len(), 1);
-    let material = &resolved.materials[0];
+    // One mesh, no name, five non-findings, and this mesh's own slice of the
+    // model's texture set. One mesh and three references divides evenly, so the
+    // scope is the inferred per-mesh cut rather than the whole-model fallback.
+    assert_eq!(resolved.meshes.len(), 1);
+    assert_eq!(
+        resolved.scope,
+        spore_material::BindingScope::PerMeshBlock { refs_per_mesh: 3 }
+    );
+    let material = &resolved.meshes[0];
     assert_eq!(material.material_id, DOCUMENTED_MATERIAL_ID);
     assert_eq!(material.name, None);
-    assert_eq!(material.bindings.len(), 3);
+    assert_eq!(material.slots.len(), 3);
+    assert_eq!(material.unknowns().count(), 5);
 
     // With a genuinely corrupt third record, the failure is still paired with
     // the reference it belongs to, in order.

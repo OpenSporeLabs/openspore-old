@@ -13,19 +13,33 @@
 //! still passes — by saying so — because a missing game install is not a
 //! failure of this crate.
 //!
-//! # What it pins
+//! # What it pins, and what it stopped pinning
 //!
-//! The outcome measured with `osptool` on 2026-10-04 and re-measured through
-//! this crate's public API: the documented model's three texture references
-//! resolve to **two** 512x512 DXT5 images and **one** typed refusal, because
-//! `0x2f4e681c:0x40632902:0x067a07f0` is a 1024x1024 luminance record whose
-//! envelope `fourcc` is `0x00000015`. A resolver that aborted on the first
-//! failure would return nothing at all for this asset.
+//! This test used to assert that the documented model's three texture
+//! references resolve to **two** 512x512 DXT5 images and **one** typed
+//! `UnsupportedFourcc` refusal, on the stated grounds that
+//! `0x2f4e681c:0x40632902:0x067a07f0` is a *1024x1024* `0x15` record.
+//!
+//! **Both halves of that were wrong, and the corpus corrected them.**
+//! `spore-texture` established the `0x15` family's framing over 901 of 901
+//! records and now decodes it, so the third reference resolves; and the record
+//! is **512x512**, not 1024x1024 — `Spore_Content.package` contains no 1024²
+//! raster of either format. All three references now resolve.
+//!
+//! The test is updated rather than deleted, and the old expectation is recorded
+//! as refuted in `docs/MATERIAL-ROLES.md` §8. A test asserting a specification
+//! the real data refutes is exactly the "stale claim contradicting its own
+//! decoder" defect, and it is worse than no test.
+//!
+//! What it pins now: three 512x512 images — two 2-layer DXT5 and one 1-layer
+//! `0x15` — with roles `(mask, mask, normal)`, an even per-mesh cut, and 3 of 3
+//! ordinal agreements. See also `tests/real_corpus_roles.rs`, which measures the
+//! same asset over the whole package.
 
 use spore_assets::ContentStore;
 use spore_core::ResourceKey;
 use spore_gmdl::GMDL_TYPE;
-use spore_material::{claims, resolve_model_record, resolve_texture, MaterialError, SamplerRole};
+use spore_material::{claims, resolve_model_record, resolve_texture};
 use spore_texture::RASTER_TYPE;
 
 /// The documented asset.
@@ -34,8 +48,9 @@ const DOCUMENTED_ASSET: &str = "0x00e6bce5:0x40637e03:0x067a07f0";
 /// The instance id shared by all three of its texture references.
 const INSTANCE: u32 = 0x067A_07F0;
 
-/// The group of the reference this build refuses.
-const LUMINANCE_GROUP: u32 = 0x4063_2902;
+/// The group of the `0x15`-family reference: a tangent-space normal map, not a
+/// refusal.
+const NORMAL_MAP_GROUP: u32 = 0x4063_2902;
 
 /// Where the content package lives, or `None` when it cannot be found.
 fn package_path() -> Option<std::path::PathBuf> {
@@ -55,7 +70,7 @@ fn package_path() -> Option<std::path::PathBuf> {
 
 #[test]
 #[ignore = "needs the git-ignored SPORE/ tree; run with --ignored"]
-fn the_documented_asset_resolves_two_images_and_one_typed_refusal() {
+fn the_documented_asset_resolves_three_images_with_measured_roles() {
     let Some(path) = package_path() else {
         eprintln!(
             "skipping: set OPENSPORE_SPORE_DATA to Spore_Content.package \
@@ -75,7 +90,11 @@ fn the_documented_asset_resolves_two_images_and_one_typed_refusal() {
         3,
         "the record lists three references"
     );
-    assert_eq!(resolved.resolved_count(), 2);
+    assert_eq!(
+        resolved.resolved_count(),
+        3,
+        "all three references resolve: the 0x15 family decodes"
+    );
 
     for (index, entry) in resolved.textures.iter().enumerate().take(2) {
         let texture = entry.as_ref().unwrap_or_else(|error| {
@@ -95,27 +114,65 @@ fn the_documented_asset_resolves_two_images_and_one_typed_refusal() {
         assert_eq!(texture.pixel_len(), 512 * 512 * 4);
     }
 
-    // The third reference is the luminance record: a typed refusal naming the
-    // fourcc, never an empty image.
-    let error = resolved.textures[2].as_ref().unwrap_err();
+    // The third reference is the `0x15` family: a tangent-space normal map,
+    // Z stored first. This is the record the old version of this test called
+    // 1024x1024 and refused. It is 512x512 and it decodes.
+    let normal = resolved.textures[2]
+        .as_ref()
+        .unwrap_or_else(|error| panic!("the 0x15 reference must resolve: {error}"));
     assert_eq!(
-        error,
-        &MaterialError::UnsupportedFourcc {
-            key: ResourceKey::new(RASTER_TYPE, LUMINANCE_GROUP, INSTANCE),
-            fourcc: 0x0000_0015,
-        }
+        normal.key,
+        ResourceKey::new(RASTER_TYPE, NORMAL_MAP_GROUP, INSTANCE)
     );
+    assert_eq!(normal.envelope.fourcc, 0x0000_0015);
+    assert_eq!(
+        (normal.envelope.width, normal.envelope.height),
+        (512, 512),
+        "512x512: this package contains no 1024^2 raster of either format"
+    );
+    assert_eq!(normal.mip_count, 10);
+    assert_eq!(
+        normal.layer_count, 1,
+        "the 0x15 family has one layer and no layer headers"
+    );
+    assert_eq!(normal.role, spore_material::TextureRole::TangentSpaceNormal);
+    assert_eq!(
+        normal.channels()[0].role,
+        spore_material::ChannelRole::NormalZ,
+        "file byte 0 is Z"
+    );
+    assert!(normal.pixels_decoded());
 
-    // One material, unnamed, with four non-findings and three unresolved roles.
-    assert_eq!(resolved.materials.len(), 1);
-    let material = &resolved.materials[0];
+    // And the model's own view of it: three roles in slot order, an even cut,
+    // and two independent statements of every ordinal in agreement.
+    assert_eq!(
+        resolved.roles(),
+        vec![vec![
+            spore_material::TextureRole::LayeredAlphaMask,
+            spore_material::TextureRole::LayeredAlphaMask,
+            spore_material::TextureRole::TangentSpaceNormal,
+        ]]
+    );
+    assert_eq!(
+        resolved.scope,
+        spore_material::BindingScope::PerMeshBlock { refs_per_mesh: 3 }
+    );
+    assert_eq!(
+        resolved.observed_shape,
+        spore_material::TexSetShape::MaskMaskNormal
+    );
+    assert!(resolved.ordinal_agreement.all_agree());
+    assert_eq!(resolved.ordinal_agreement.compared, 3);
+
+    // One mesh, unnamed, with five non-findings. A slot carries no role at all:
+    // a role is a property of the resolved record, and this is measured per
+    // record -- see `ResolvedTexture::role` and the role_census below.
+    assert_eq!(resolved.meshes.len(), 1);
+    let material = &resolved.meshes[0];
     assert_eq!(material.material_id, 0x407D_FDDB);
     assert_eq!(material.name, None, "no registry names this id");
-    assert!(material
-        .bindings
-        .iter()
-        .all(|binding| binding.role == SamplerRole::Unresolved));
-    assert_eq!(material.unknowns().count(), 4);
+    assert_eq!(material.slots.len(), 3);
+    assert_eq!(material.unknowns().count(), 5);
     let material_name = material.claim(claims::MATERIAL_NAME).expect("subject");
     assert!(material_name.fact.is_unavailable());
     assert_eq!(
