@@ -44,6 +44,12 @@ pub const ATTACHMENT_SCOPE: &str = "attachment_scope";
 /// Which transform is the rest pose.
 pub const REST_POSE: &str = "rest_pose_selection";
 
+/// Where the creature's anatomical vocabulary is actually used.
+pub const ANATOMY_LOCATION: &str = "anatomy_location";
+
+/// Bone identities in the whole-body `gmdl` layer.
+pub const GMDL_BONE_IDENTITY: &str = "gmdl_bone_identity";
+
 /// Every claim this crate records.
 pub fn all() -> Vec<Claim> {
     vec![
@@ -111,6 +117,27 @@ pub fn all() -> Vec<Claim> {
                  a part-to-part reference because the payload has zero slack \
                  ({REPORT_11} Â§6)"
             )),
+        },
+        Claim {
+            subject: ANATOMY_LOCATION,
+            fact: Fact::unavailable(
+                "where Spore's anatomical bone names (hip, knee, eye, iris, jaw, \
+                 shoulder) are used: the 244 recovered names are correct hashes, but \
+                 across the 677 bones in the 680 composed <blockref> parts the ONLY \
+                 recovered name is joint1 - no anatomy, no laterality, no \
+                 attach/csnap. The creator core's parts are simple articulated blocks, \
+                 so the anatomy belongs to a different record (report 11 section 11)",
+            ),
+        },
+        Claim {
+            subject: GMDL_BONE_IDENTITY,
+            fact: Fact::unavailable(
+                "bone identities in the whole-body gmdl layer: gmdl is NOT an RW4 \
+                 container, so 0 of the 4209 records carry a 0x70002 Skeleton section. \
+                 All 4209 live in Spore_Content.package. spore-gmdl already exposes \
+                 bone_ranges from the trailer but not bone identities, which would sit \
+                 in the anim data or baked deforms",
+            ),
         },
         Claim {
             subject: REST_POSE,

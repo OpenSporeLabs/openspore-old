@@ -409,6 +409,23 @@ bilateral L/R pairs:     none
 | symmetry is laterality | **UNRESOLVED for the creator core** — `wingL`/`wingR` etc. are in the vocabulary but **no composed part contains a bilateral pair** |
 | `attach` / `csnap` cross part boundaries | **UNRESOLVED** — and neither name occurs in any composed part |
 
+### Where the anatomy is not — the ruled-out candidates
+
+Measured while writing this correction:
+
+* **All 4209 `gmdl` (whole-body) records live in `Spore_Content.package`** — none
+  in `Spore_Graphics`, `Spore_Game` or `PatchData`.
+* **A `gmdl` record is not an RW4 container.** 0 of 4209 carry the `RW4w32` magic,
+  so **0 of 4209 carry a `0x70002` Skeleton section**. The body graph recovered in
+  §4 belongs to the part layer's containers, and the whole-body layer does not
+  share it. This rules out the most obvious candidate for "where the anatomy is".
+* `spore-gmdl` parses 4209/4209 records and exposes `bone_ranges` from the trailer
+  but no bone identities, which would be in the anim data or baked deforms.
+
+So the anatomy is in neither the block layer (only `joint1`) nor the `gmdl`
+Skeleton layer (no such sections). `docs/CREATOR-CORE.md` §13 poses the three
+remaining candidates and the single observation that settles each.
+
 ### The methodological lesson, recorded so it does not repeat
 
 A dictionary attack against a hash produces a *plausible, coherent* vocabulary.

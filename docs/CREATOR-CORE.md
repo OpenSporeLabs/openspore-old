@@ -933,3 +933,67 @@ plainly that a 4-byte block is float-*shaped* without being float-*correct* — 
 The fifth word of a bone-range entry is also not a constant: `4` in most entries,
 `0x02000000` and `0x03000000` elsewhere. It is carried verbatim as `tag` and
 claimed nothing, correcting report 09's "constant == 4, 1824/1824".
+
+---
+
+## 13. Where the anatomy is NOT — and the next question, posed properly
+
+Added 2026-10-04, after §12. This section exists because §11 refuted the anatomy
+reading, and a refutation without a direction is just a dead end.
+
+### 13.1 What was ruled out, with the counts
+
+The obvious candidate for "where the anatomy lives" is the whole-body `gmdl`
+layer. It is **not** the answer, and the reason is specific:
+
+* **All 4209 `gmdl` records are in `Spore_Content.package`** — none in
+  `Spore_Graphics`, `Spore_Game` or `PatchData`.
+* **A `gmdl` record is not an RW4 container.** 0 of 4209 begin with `RW4w32`, and
+  therefore **0 of 4209 carry a `0x70002` Skeleton section**. The bone graph
+  recovered in §10.2 is a property of the *part* layer's `rw4` containers, and the
+  whole-body layer does not share it.
+* `spore-gmdl` already parses 4209/4209 records and exposes `bone_ranges` from the
+  trailer, but **no bone identities**. Those would sit in the anim data or the
+  baked deforms, which that crate reads best-effort and does not yet interpret.
+
+So the creature's anatomy is in neither the `<sporemodel>` block layer (only
+`joint1`) nor the `gmdl` Skeleton layer (no such sections). It is somewhere this
+expedition has not looked.
+
+### 13.2 The three candidates that remain, in order
+
+1. **`gmdl`'s anim data / baked deforms.** The most likely. `spore-gmdl` reaches
+   the trailer; the bone identities are probably in the `GameModelAnimData` it
+   currently treats as opaque. This is *known work on existing code*, not new
+   research — the crate parses 4209/4209 already.
+2. **A `BlendShape` / `MorphHandle` pairing.** `docs/RENDERWARE-RESEARCH.md` §11
+   records `rw4_11` samples carrying `BlendShape (0xff0002)` +
+   `BlendShapeBuffer (0x200af)` and calls them "a morph-heavy creature/creature-part
+   model". Morph parameters are the vocabulary the anatomy names come from, and a
+   blend-shape set is where per-creature parameter channels would live.
+3. **The rigblock's own 4^k lattice.** Report 08 §7 item 1 asks what each
+   subdivision level drives. If the levels index morph parameters, then the
+   rigblock — not the skeleton — is where a part's parameters are enumerated, and
+   the recovered vocabulary would key them. That would make the anatomy a property
+   of the *bounds record* rather than the body graph, which would be a genuinely
+   surprising and very testable claim.
+
+### 13.3 What would settle each, cheaply
+
+| candidate | the single observation that settles it |
+|---|---|
+| gmdl anim data | histogram the 32-bit words in the anim-data section of a creature `gmdl` against the 2002-token vocabulary; a hit rate far above the ~29 expected chance collisions answers it |
+| blend shapes | read a `0xff0002` section's parameter name table and hash its entries |
+| rigblock lattice | correlate a rigblock's `k` and its cell occupancy against the number of morph parameters its part's `gmsh` channels imply |
+
+The first is a few dozen lines against a crate that already parses the records, and
+it is the obvious next move.
+
+### 13.4 One thing that is now settled independently of any of this
+
+The **authoring** graph is a chain, measured over the corpus: 520 of 680 blocks
+carry a `<childlist>`, 79 derived roots over 68 documents (so some documents are
+multi-rooted forests), maximum depth 19. That is consistent with the serial-chain
+description in the SIGGRAPH paper at the *authoring* layer, and it depends on no
+bone name at all — which is what makes it trustworthy while the anatomical
+question is open.
