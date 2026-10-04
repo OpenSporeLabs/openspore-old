@@ -41,6 +41,7 @@ use spore_core::ResourceKey;
 use crate::convert::{self, NormalMode};
 use crate::domain::materials::{MaterialRoute, MeshMaterialPlan, ModelMaterials};
 use crate::domain::model::{DecodeStatus, ModelDefinition, ModelInstance};
+use crate::domain::paint::{self, PaintBinding};
 use crate::domain::scene::{Layout, ObjectExtent, Scene};
 use crate::domain::world::ResourceWorld;
 use crate::domain::Bounds;
@@ -259,6 +260,19 @@ pub struct MaskChannelBinding {
     pub handle: Handle<Image>,
 }
 
+/// The colour one mesh was given, carried on the entity.
+///
+/// Kept beside [`MaskChannels`] for the same reason and with the same
+/// discipline: a decision that is not addressable at runtime is a decision a
+/// later reader cannot check. The [`crate::domain::paint::MeshPaint`] it holds
+/// carries its own evidence grade and its `paintregion` disposition, so
+/// "why is this mesh this colour" is answerable from the entity alone.
+#[derive(Component, Debug, Clone, PartialEq)]
+pub struct MeshPaintMarker {
+    /// The domain decision, verbatim and undecorated.
+    pub paint: crate::domain::paint::MeshPaint,
+}
+
 /// What happened when the scene was put on stage.
 #[derive(Resource, Debug, Clone, PartialEq)]
 pub struct SceneOutcome {
@@ -270,6 +284,8 @@ pub struct SceneOutcome {
     pub triangles: usize,
     /// Leaf entities carrying a bound normal map.
     pub parts_with_normal_maps: usize,
+    /// Leaf entities carrying a base colour from a `sporemodel` record.
+    pub parts_painted: usize,
     /// Mask planes uploaded.
     pub mask_channels: usize,
     /// The union of what was placed, for camera framing.
@@ -288,14 +304,15 @@ pub struct PrepareOutcome {
 }
 
 impl PrepareOutcome {
-    /// Every report line, in a fixed order: one `STAGED v1` and one
-    /// `MATERIAL v1` per record, then one `SCENE v1` summary.
+    /// Every report line, in a fixed order: one `STAGED v1`, one `MATERIAL v1`
+    /// and one `PAINT v1` per record, then one `SCENE v1` summary.
     pub fn report_lines(&self) -> Vec<String> {
         let records = self.reports.len();
-        let mut lines = Vec::with_capacity(records * 2 + 1);
+        let mut lines = Vec::with_capacity(records * 3 + 1);
         for (index, report) in self.reports.iter().enumerate() {
             lines.push(report.staged_line());
             lines.push(report.material_line(index, records));
+            lines.push(report.paint_line(index, records));
         }
         lines.push(self.scene_line());
         lines
@@ -306,10 +323,15 @@ impl PrepareOutcome {
         let parts: usize = self.loaded.models.iter().map(|m| m.parts.len()).sum();
         let normal_maps: usize = self.reports.iter().map(ModelReport::normal_maps).sum();
         let masks: usize = self.reports.iter().map(ModelReport::mask_channels).sum();
+        let painted = self
+            .reports
+            .iter()
+            .filter(|report| report.paint.is_bound())
+            .count();
         format!(
             "OPENSPORE-SCENE v1 objects={} models={} parts={} triangles={} \
              normal_maps_bound={normal_maps} mask_channels_bound={masks} \
-             packages={} mapped_bytes={}",
+             models_painted={painted} packages={} mapped_bytes={}",
             self.loaded.scene.len(),
             self.loaded.models.len(),
             parts,
@@ -349,6 +371,8 @@ pub struct ModelReport {
     pub plans: Vec<MeshMaterialPlan>,
     /// Which route produced the role table.
     pub route: Option<MaterialRoute>,
+    /// Where the colour came from, or why none was found.
+    pub paint: PaintBinding,
 }
 
 impl ModelReport {
@@ -363,6 +387,11 @@ impl ModelReport {
     /// Mask planes the plans call for.
     pub fn mask_channels(&self) -> usize {
         self.plans.iter().map(|plan| plan.masks.len()).sum()
+    }
+
+    /// The `OPENSPORE-PAINT v1` line for this record.
+    pub fn paint_line(&self, index: usize, records: usize) -> String {
+        self.paint.describe(&self.key, index, records)
     }
 
     /// The `OPENSPORE-STAGED v1` line for this record.
@@ -457,6 +486,12 @@ impl ModelReport {
 ///
 /// `textured` gates texture resolution, because resolving one reference costs a
 /// record read and a decode, and must stay opt-in.
+///
+/// `sporemodel` is the `--sporemodel` override. When it is `None` each record's
+/// colour is resolved from its own asset family; see
+/// [`crate::domain::paint`]. Colour resolution is **not** gated on `textured`:
+/// the two read different records in different packages, and a model can be
+/// untextured and still have a colour.
 pub fn prepare_scene(
     world: Arc<ResourceWorld>,
     mut scene: Scene,
@@ -464,6 +499,7 @@ pub fn prepare_scene(
     assumed_texture_type: u32,
     layout: Layout,
     gap: f32,
+    sporemodel: Option<ResourceKey>,
 ) -> Result<(PrepareOutcome, Vec<Option<ObjectExtent>>), AssetError> {
     let mut models: Vec<Arc<ModelDefinition>> = Vec::new();
     for key in scene.records() {
@@ -478,7 +514,10 @@ pub fn prepare_scene(
         } else {
             None
         };
-        models.push(Arc::new(ModelDefinition::from_loaded(&loaded, materials)));
+        let paint = paint::resolve(world.store(), &key, sporemodel);
+        models.push(Arc::new(ModelDefinition::from_loaded(
+            &loaded, materials, paint,
+        )));
     }
 
     let extents = object_extents(&scene, &models);
@@ -555,6 +594,7 @@ fn report_for(model: &ModelDefinition) -> ModelReport {
         materials,
         plans,
         route: model.materials.as_ref().map(|table| table.route),
+        paint: model.paint.clone(),
     }
 }
 
@@ -580,6 +620,7 @@ pub fn spawn_scene(
         parts: 0,
         triangles: loaded.triangles(),
         parts_with_normal_maps: 0,
+        parts_painted: 0,
         mask_channels: 0,
         bounds: loaded.bounds(),
     };
@@ -626,9 +667,22 @@ pub fn spawn_scene(
             for part in &model.parts {
                 let buffers = part.buffers();
                 let bevy_mesh = convert::to_bevy_mesh(&buffers, NORMAL_MODE);
-                let bound = plans
-                    .get(part.mesh_index as usize)
-                    .map(|plan| texture::bind_material(plan, textures, orientation, images));
+                // The colour comes from the record, never from a raster: no
+                // raster in this corpus decodes as an albedo, and the shader
+                // takes both of its colours as constants.
+                let mesh_paint = model.mesh_paint(part.mesh_index);
+                if mesh_paint.base_color.is_some() {
+                    outcome.parts_painted += 1;
+                }
+                let bound = plans.get(part.mesh_index as usize).map(|plan| {
+                    texture::bind_material(
+                        plan,
+                        textures,
+                        orientation,
+                        images,
+                        mesh_paint.base_color,
+                    )
+                });
                 let material = match &bound {
                     Some(bound) => {
                         if bound.surfaces.normal_map.is_some() {
@@ -640,6 +694,7 @@ pub fn spawn_scene(
                     None => materials.add(texture::standard_material(
                         &texture::SurfaceSet::default(),
                         None,
+                        mesh_paint.base_color,
                     )),
                 };
                 // The mask planes ride in the spawn bundle rather than being
@@ -683,6 +738,7 @@ pub fn spawn_scene(
                             mesh_index: part.mesh_index,
                             material_id: part.material_id,
                         },
+                        MeshPaintMarker { paint: mesh_paint },
                     ))
                     .id();
                 if let Some(channels) = channels {
@@ -743,11 +799,13 @@ fn spawn_loaded_scene(
     );
     info!(
         "staged {objects} object(s), {parts} mesh entity(ies), {triangles} triangle(s), \
-         {normals} with a bound normal map, {masks} mask plane(s)",
+         {normals} with a bound normal map, {painted} with a record colour, \
+         {masks} mask plane(s)",
         objects = outcome.objects,
         parts = outcome.parts,
         triangles = outcome.triangles,
         normals = outcome.parts_with_normal_maps,
+        painted = outcome.parts_painted,
         masks = outcome.mask_channels,
     );
     for report in loaded
@@ -760,6 +818,14 @@ fn spawn_loaded_scene(
             if let Some(normal) = &plan.normal_map {
                 info!("  normal map {}", normal.describe());
             }
+        }
+    }
+    // The colour decision is logged per model, with its grade, because "the
+    // creature is green" is only meaningful next to "green came from this
+    // record, and this record is the model's colour by inference".
+    for model in loaded.models.iter() {
+        for part in &model.parts {
+            info!("{}", model.mesh_paint(part.mesh_index).describe());
         }
     }
     commands.insert_resource(outcome);
@@ -878,6 +944,10 @@ mod tests {
                 })
                 .collect(),
             materials: None,
+            paint: PaintBinding::Unavailable {
+                reason: crate::domain::paint::PaintUnavailableReason::NoSporemodelRecords,
+                fact: spore_core::evidence::Fact::unavailable("unit test"),
+            },
             decode: DecodeStatus::Complete,
         })
     }

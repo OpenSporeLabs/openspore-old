@@ -11,6 +11,7 @@ use spore_gmdl::Mesh;
 
 use crate::convert::{self, MeshBuffers, NormalMode};
 use crate::domain::materials::ModelMaterials;
+use crate::domain::paint::{self, MeshPaint, PaintBinding};
 use crate::domain::{grow, mesh_triangles, union_bounds, Bounds};
 
 /// How far a record's decode got.
@@ -94,6 +95,14 @@ pub struct ModelDefinition {
     /// same as "the model has no textures" and not the same as "every reference
     /// failed". The report line distinguishes all three.
     pub materials: Option<ModelMaterials>,
+    /// Where this model's colour came from, and with what grade.
+    ///
+    /// [`PaintBinding::Unavailable`] means no `sporemodel` record was found. It
+    /// is **not** a colour and **not** a neutral tint: see
+    /// [`crate::domain::paint`]. Resolution is independent of `materials` — a
+    /// model can be fully textured and still have no colour, which is the
+    /// corpus's normal state for everything but the mask and normal families.
+    pub paint: PaintBinding,
     /// How far the decode got.
     pub decode: DecodeStatus,
 }
@@ -105,7 +114,15 @@ impl ModelDefinition {
     /// The material ids come from the gmdl record where there is one, and are
     /// **not** invented for a record that has none: a missing id is `0`, which
     /// is a bare word like any other and claims nothing.
-    pub fn from_loaded(model: &LoadedModel, materials: Option<ModelMaterials>) -> Self {
+    ///
+    /// `paint` is passed in rather than resolved here so the store is read once
+    /// per record by the caller, in one place, beside the model load it belongs
+    /// with.
+    pub fn from_loaded(
+        model: &LoadedModel,
+        materials: Option<ModelMaterials>,
+        paint: PaintBinding,
+    ) -> Self {
         let material_ids = model
             .gmdl
             .as_ref()
@@ -127,6 +144,7 @@ impl ModelDefinition {
             format: model.format,
             parts,
             materials,
+            paint,
             decode: match model.stopped_at.as_ref() {
                 None => DecodeStatus::Complete,
                 Some(stop) => DecodeStatus::Stopped {
@@ -183,6 +201,29 @@ impl ModelDefinition {
     /// The role table, when textures were resolved.
     pub fn materials(&self) -> Option<&ModelMaterials> {
         self.materials.as_ref()
+    }
+
+    /// The colour source bound to this model.
+    pub fn paint(&self) -> &PaintBinding {
+        &self.paint
+    }
+
+    /// One mesh's resolved base colour.
+    ///
+    /// The whole colour path, from the record's bytes to the numbers the
+    /// renderer multiplies into `base_color`, in one call — and callable with no
+    /// window, no GPU and no game install.
+    pub fn mesh_paint(&self, mesh_index: u32) -> MeshPaint {
+        paint::mesh_paint(&self.paint, mesh_index)
+    }
+
+    /// How many of this model's parts will be given a colour from a
+    /// `sporemodel` record.
+    pub fn parts_painted(&self) -> usize {
+        match &self.paint {
+            PaintBinding::Bound(_) => self.parts.len(),
+            PaintBinding::Unavailable { .. } => 0,
+        }
     }
 }
 
@@ -350,31 +391,56 @@ mod tests {
 
     #[test]
     fn bounds_are_the_union_and_absent_for_no_parts() {
-        let model =
-            ModelDefinition::from_loaded(&loaded(vec![triangle_mesh()]), Some(empty_materials()));
+        let model = ModelDefinition::from_loaded(
+            &loaded(vec![triangle_mesh()]),
+            Some(empty_materials()),
+            no_paint(),
+        );
         let (lo, hi) = model.bounds().unwrap();
         assert_eq!(lo, [0.0, -2.0, 0.0]);
         assert_eq!(hi, [1.0, 0.0, 1.0]);
-        let empty = ModelDefinition::from_loaded(&loaded(Vec::new()), Some(empty_materials()));
+        let empty =
+            ModelDefinition::from_loaded(&loaded(Vec::new()), Some(empty_materials()), no_paint());
         assert_eq!(empty.bounds(), None);
     }
 
     #[test]
     fn a_definition_whose_textures_were_never_requested_says_so() {
-        let model = ModelDefinition::from_loaded(&loaded(vec![triangle_mesh()]), None);
+        let model = ModelDefinition::from_loaded(&loaded(vec![triangle_mesh()]), None, no_paint());
         assert_eq!(model.materials(), None, "not asked is not 'none found'");
         assert!(model.plans().is_empty());
         assert_eq!(model.parts_with_normal_maps(), 0);
         assert_eq!(model.mask_channels(), 0);
 
-        let resolved =
-            ModelDefinition::from_loaded(&loaded(vec![triangle_mesh()]), Some(empty_materials()));
+        let resolved = ModelDefinition::from_loaded(
+            &loaded(vec![triangle_mesh()]),
+            Some(empty_materials()),
+            no_paint(),
+        );
         assert!(resolved.materials().is_some(), "asked, and looked");
         assert_eq!(resolved.materials().unwrap().attempted(), 0);
     }
 
     fn empty_materials() -> ModelMaterials {
         ModelMaterials::empty(None)
+    }
+
+    /// The binding a unit test means by "we did not look for a colour": the
+    /// unavailable variant, never a neutral tint.
+    fn no_paint() -> PaintBinding {
+        PaintBinding::Unavailable {
+            reason: crate::domain::paint::PaintUnavailableReason::NoSporemodelRecords,
+            fact: spore_core::evidence::Fact::unavailable("unit test"),
+        }
+    }
+
+    #[test]
+    fn a_definition_without_a_colour_source_paints_nothing_and_says_so() {
+        let model = ModelDefinition::from_loaded(&loaded(vec![triangle_mesh()]), None, no_paint());
+        assert!(!model.paint().is_bound());
+        assert_eq!(model.parts_painted(), 0);
+        // Not black, not a default tint: an absence the renderer can report.
+        assert_eq!(model.mesh_paint(0).base_color, None);
     }
 
     #[test]

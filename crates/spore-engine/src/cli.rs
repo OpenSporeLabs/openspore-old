@@ -161,9 +161,33 @@ pub struct SceneRequest {
     /// **UNKNOWN** which convention Spore authored in; the default is the only
     /// one the corpus supports evidence for.
     pub flip_normal_y: bool,
+    /// The `sporemodel` record to read colour from, instead of resolving one per
+    /// asset family.
+    ///
+    /// A colour override rather than a link: the record's numbers are read
+    /// verbatim, and the *association* to the model stays
+    /// [`spore_core::EvidenceLevel::Inferred`] either way, because no byte in
+    /// the corpus names a creature-part model from a `sporemodel` record. See
+    /// `crate::domain::paint`.
+    pub sporemodel: Option<ResourceKey>,
+    /// Extra packages searched only for `sporemodel` records.
+    ///
+    /// The colour records live in `Spore_Game.package` and
+    /// `PatchData.package`; `Spore_Content.package` holds none. These are
+    /// appended after `--package`, at the **lowest** resolution priority, so
+    /// naming them can never shadow a record the caller asked for explicitly.
+    pub sporemodel_packages: Vec<PathBuf>,
 }
 
 impl SceneRequest {
+    /// Every package to open, in resolution order: `--package` first, then the
+    /// `--sporemodel-package` companions.
+    pub fn all_packages(&self) -> Vec<PathBuf> {
+        let mut all = self.packages.clone();
+        all.extend(self.sporemodel_packages.iter().cloned());
+        all
+    }
+
     /// Every record the scene needs, in declaration order.
     pub fn records(&self) -> Vec<ResourceKey> {
         self.objects
@@ -281,6 +305,8 @@ pub enum CliError {
     NoRecordRequested,
     /// `--part` was given with no `--creature` to attach it to.
     OrphanPart,
+    /// `--sporemodel` was given more than once.
+    RepeatedSporemodel,
 }
 
 impl std::fmt::Display for CliError {
@@ -300,6 +326,11 @@ impl std::fmt::Display for CliError {
             Self::OrphanPart => write!(
                 f,
                 "`--part` needs a `--creature` before it: a part is attached to the creature it follows"
+            ),
+            Self::RepeatedSporemodel => write!(
+                f,
+                "`--sporemodel` may be given once: it names the colour source for the whole scene, \
+                 and a second value would silently win by flag order"
             ),
         }
     }
@@ -353,6 +384,18 @@ pub fn usage() -> String {
          \x20                       which convention Spore authored in, so off by\n\
          \x20                       default: as-stored is the only reading the corpus\n\
          \x20                       supports evidence for.\n\
+         \x20   --sporemodel <T:G:I>  Read this model's COLOUR from the named\n\
+         \x20                       `sporemodel` record, instead of resolving one\n\
+         \x20                       per asset family. The record's numbers are read\n\
+         \x20                       verbatim; the link to the model is still\n\
+         \x20                       INFERRED, because no record in the corpus names\n\
+         \x20                       a model from a `sporemodel`.\n\
+         \x20   --sporemodel-package <PATH>\n\
+         \x20                       An extra package searched for `sporemodel`\n\
+         \x20                       records, e.g. SPORE/Data/Spore_Game.package.\n\
+         \x20                       Spore_Content holds none, so a creature renders\n\
+         \x20                       its neutral tint without this. Repeatable, and\n\
+         \x20                       appended after --package at the lowest priority.\n\
          \x20   --placeholder        Show the built-in mesh with no game data at all\n\
          \x20   -h, --help           Print this text\n\
          \n\
@@ -374,12 +417,14 @@ where
 
 fn parse_vec(args: &[String]) -> Result<LaunchRequest, CliError> {
     let mut packages: Vec<PathBuf> = Vec::new();
+    let mut sporemodel_packages: Vec<PathBuf> = Vec::new();
     let mut objects: Vec<ObjectRequest> = Vec::new();
     let mut scale = 1.0f32;
     let mut window = WindowOptions::default();
     let mut info_only = false;
     let mut placeholder = false;
     let mut textured = false;
+    let mut sporemodel: Option<ResourceKey> = None;
     let mut assumed_texture_type = spore_core::record::type_id::RASTER;
     let mut layout = Layout::Row;
     let mut spacing = DEFAULT_GAP;
@@ -404,6 +449,19 @@ fn parse_vec(args: &[String]) -> Result<LaunchRequest, CliError> {
                 placeholder = true;
             }
             "--package" => packages.push(PathBuf::from(value_for("--package")?)),
+            "--sporemodel-package" => {
+                sporemodel_packages.push(PathBuf::from(value_for("--sporemodel-package")?));
+            }
+            "--sporemodel" => {
+                // One value for the whole scene. Repeating it would make the
+                // winner depend on flag order, which is a silent policy nobody
+                // would expect from a flag that looks per-object.
+                let raw = value_for("--sporemodel")?;
+                if sporemodel.is_some() {
+                    return Err(CliError::RepeatedSporemodel);
+                }
+                sporemodel = Some(parse_key("--sporemodel", &raw)?);
+            }
             "--record" => {
                 let raw = value_for("--record")?;
                 objects.push(ObjectRequest::Model {
@@ -522,11 +580,13 @@ fn parse_vec(args: &[String]) -> Result<LaunchRequest, CliError> {
         }
         return Ok(LaunchRequest::Scene(SceneRequest {
             packages,
+            sporemodel_packages,
             objects,
             scale,
             window,
             info_only,
             textured,
+            sporemodel,
             assumed_texture_type,
             layout,
             spacing,
@@ -813,6 +873,80 @@ mod tests {
     }
 
     #[test]
+    fn the_sporemodel_override_is_one_value_for_the_whole_scene() {
+        let request = scene(&[
+            "--record",
+            "1:2:3",
+            "--sporemodel",
+            "0x2b978c46:0x40626200:0x05e3df13",
+        ]);
+        assert_eq!(
+            request.sporemodel,
+            Some(ResourceKey::new(0x2B97_8C46, 0x4062_6200, 0x05E3_DF13))
+        );
+        assert_eq!(scene(&["--record", "1:2:3"]).sporemodel, None);
+        // Repeating it would make the winner depend on flag order, which is a
+        // silent policy nobody expects from a flag that looks per-object.
+        assert_eq!(
+            parse([
+                "--record",
+                "1:2:3",
+                "--sporemodel",
+                "1:2:3",
+                "--sporemodel",
+                "4:5:6",
+            ])
+            .unwrap_err(),
+            CliError::RepeatedSporemodel
+        );
+        assert!(matches!(
+            parse(["--record", "1:2:3", "--sporemodel", "nope"]).unwrap_err(),
+            CliError::BadValue { flag, .. } if flag == "--sporemodel"
+        ));
+    }
+
+    #[test]
+    fn sporemodel_packages_come_after_the_models_own_and_never_shadow_it() {
+        let request = scene(&[
+            "--package",
+            "/content.package",
+            "--sporemodel-package",
+            "/game.package",
+            "--sporemodel-package",
+            "/patch.package",
+            "--record",
+            "1:2:3",
+        ]);
+        assert_eq!(request.packages, vec![PathBuf::from("/content.package")]);
+        assert_eq!(
+            request.sporemodel_packages,
+            vec![
+                PathBuf::from("/game.package"),
+                PathBuf::from("/patch.package")
+            ]
+        );
+        // Order matters: `Spore_Content` wins an identity it holds, and the
+        // colour-only companion is consulted after it.
+        assert_eq!(
+            request.all_packages(),
+            vec![
+                PathBuf::from("/content.package"),
+                PathBuf::from("/game.package"),
+                PathBuf::from("/patch.package"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_sporemodel_package_alone_is_still_a_usage_error_without_a_record() {
+        // Naming game data but not what to show is still a typo, not a guess.
+        assert_eq!(
+            parse(["--sporemodel-package", "/game.package"]).unwrap_err(),
+            CliError::NoRecordRequested
+        );
+    }
+
+    #[test]
     fn usage_documents_every_flag_and_preset() {
         let text = usage();
         for flag in [
@@ -830,6 +964,8 @@ mod tests {
             "--info",
             "--texture",
             "--flip-normal-y",
+            "--sporemodel",
+            "--sporemodel-package",
             "--placeholder",
         ] {
             assert!(text.contains(flag), "usage must document {flag}: {text}");
@@ -848,6 +984,14 @@ mod tests {
         assert!(
             text.contains("REPEATABLE"),
             "multi-object loading must be documented: {text}"
+        );
+        assert!(
+            text.contains("Spore_Content holds none"),
+            "why a colour package is needed must be stated, not just offered: {text}"
+        );
+        assert!(
+            text.contains("INFERRED"),
+            "the model-to-colour link must be stated as inferred: {text}"
         );
     }
 }

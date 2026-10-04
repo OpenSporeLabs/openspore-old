@@ -21,17 +21,20 @@
 //! | creature | [`creature`] | no | one or more model instances in a frame |
 //! | scene | [`scene`] | no | objects, placements, layout |
 //! | materials | [`materials`] | no | which surface feeds which material slot |
+//! | paint | [`paint`] | no | which `sporemodel` record colours a model, and with what grade |
 //! | runtime | [`crate::loader`] | yes | `Assets<Mesh>` handles, entities |
 //!
 //! # The one rule that keeps the boundary honest
 //!
 //! Nothing below this module imports `bevy`. That is what makes
 //! `cargo test -p spore-engine` able to assert the whole asset path — including
-//! the material roles and the normal-map swizzle — with no window open.
+//! the material roles, the normal-map swizzle and the colour resolution — with
+//! no window open.
 
 pub mod creature;
 pub mod materials;
 pub mod model;
+pub mod paint;
 pub mod scene;
 pub mod world;
 

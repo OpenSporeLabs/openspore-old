@@ -374,7 +374,13 @@ impl ModelMaterials {
             BindingScope::PerMeshBlock { refs_per_mesh } => {
                 mesh_index as usize * refs_per_mesh + within
             }
-            BindingScope::WholeModel => within,
+            // `Undetermined` is the "the record contradicted the cut" case: the
+            // reference list is short, every mesh holds all of it, and a slot's
+            // flat position is its own index. `spore_material::BindingScope`
+            // states this as `applies_whole_set()`; it is the same arithmetic as
+            // `WholeModel`, and folding the two would hide the contradiction
+            // that the variant exists to keep visible.
+            BindingScope::WholeModel | BindingScope::Undetermined { .. } => within,
         }
     }
 
@@ -508,10 +514,14 @@ impl ModelMaterials {
 }
 
 /// The ordinal a slot would carry under a scope, if it carries one.
+///
+/// `Undetermined` states `None`: the cut was refused precisely *because* the
+/// record's ordinals contradict a derived one, so manufacturing one here would
+/// re-create the defect the variant was added to stop.
 fn stated_ordinal(scope: BindingScope, within: usize) -> Option<u32> {
     match scope {
         BindingScope::PerMeshBlock { .. } => Some(within as u32),
-        BindingScope::WholeModel => None,
+        BindingScope::WholeModel | BindingScope::Undetermined { .. } => None,
     }
 }
 
@@ -826,9 +836,53 @@ mod tests {
     #[test]
     fn both_scopes_report_their_inference() {
         // There is no proven binding in this build, so `is_inferred()` must be
-        // `true` for both variants or a caller would start trusting one.
+        // `true` for every variant or a caller would start trusting one.
         assert!(BindingScope::PerMeshBlock { refs_per_mesh: 3 }.is_inferred());
         assert!(BindingScope::WholeModel.is_inferred());
+        assert!(BindingScope::Undetermined {
+            collected: 2,
+            contradicted: 2
+        }
+        .is_inferred());
+    }
+
+    #[test]
+    fn an_undetermined_scope_hands_every_mesh_the_whole_set_and_states_no_ordinal() {
+        // The documented creature record: the material-info walk stops at the
+        // undocumented shader-data id `0x218`, so the flat list is short, the
+        // even division is wrong, and `spore-material` refuses the cut. Handing
+        // every mesh the whole short list is the conservative answer; slicing it
+        // would bind mesh 1 to a texture out of mesh 0's block.
+        let materials = ModelMaterials {
+            scope: BindingScope::Undetermined {
+                collected: 2,
+                contradicted: 2,
+            },
+            meshes: vec![MeshSlots {
+                mesh_index: 0,
+                material_id: 1,
+                slots: vec![
+                    spore_gmdl::GmdlTextureRef {
+                        instance_id: 1,
+                        group_id: 0x4062_2900,
+                    },
+                    spore_gmdl::GmdlTextureRef {
+                        instance_id: 1,
+                        group_id: 0x4062_2901,
+                    },
+                ],
+            }],
+            ..ModelMaterials::empty(None)
+        };
+        assert_eq!(materials.flat_index(0, 1), 1);
+        assert_eq!(materials.flat_index(0, 0), 0);
+        // A refused cut states no ordinal, so the engine cannot manufacture a
+        // conflict out of the refusal itself.
+        let plan = materials.plans()[0].clone();
+        assert_eq!(plan.ordinal_conflicts, 0);
+        assert_eq!(materials.scope.as_str(), "undetermined");
+        assert!(!materials.scope.divides_by_mesh());
+        assert!(materials.scope.applies_whole_set());
     }
 
     #[test]

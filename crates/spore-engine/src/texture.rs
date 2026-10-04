@@ -9,6 +9,18 @@
 //! collapse to exactly two RGB triples. There is no base-colour map in this
 //! corpus, so **no texture is bound as one here.**
 //!
+//! # Where the base colour comes from instead
+//!
+//! From the model's `sporemodel` record, and only from there:
+//! [`crate::domain::paint`] resolves the record and hands this module a linear
+//! RGB triple. Two consequences this module enforces:
+//!
+//! * `base_color_texture` stays `None` even when `base_color` carries a real
+//!   colour — the value came out of an XML record, not a texel.
+//! * `None` for the colour is an **absence**, not a grey. The renderer falls
+//!   back to [`UNTEXURED_TINT`] so the normal map stays readable, and the
+//!   report line says `state=unavailable reason=...`. Never `(0, 0, 0)`.
+//!
 //! # The three bindings, and what each one is
 //!
 //! | record role | Bevy slot | evidence |
@@ -339,10 +351,18 @@ pub fn upload(surface: &SurfaceImage, images: &mut Assets<Image>) -> Handle<Imag
 /// function stays a pure mapping from a [`SurfaceSet`] to a material and can be
 /// asserted on with no asset collection.
 ///
+/// `base_color` is the **linear** RGB triple the `sporemodel` record supplied,
+/// or `None` when no such record was found. `None` is an absence, not a colour:
+/// it falls back to [`UNTEXURED_TINT`], which is what makes the normal map's
+/// shading readable. It is never `(0, 0, 0)`, because black is a colour a
+/// record can carry and this is not one.
+///
 /// # What is deliberately absent
 ///
-/// * **No base-colour texture.** No raster record in this corpus decodes as
-///   one; see the module docs. The colour is [`UNTEXURED_TINT`].
+/// * **No base-colour *texture*.** No raster record in this corpus decodes as
+///   one; see the module docs. `base_color_texture` stays `None` even when
+///   `base_color` carries a record's colour, because that colour came from an
+///   XML record and not from a texel.
 /// * **No metallic/roughness texture.** The only full-range channels available
 ///   are the mask planes, and their purpose is `UNKNOWN`.
 /// * **No alpha blending.** The mask planes are not established as coverage, so
@@ -353,6 +373,7 @@ pub fn upload(surface: &SurfaceImage, images: &mut Assets<Image>) -> Handle<Imag
 pub fn standard_material(
     surfaces: &SurfaceSet,
     normal_map: Option<Handle<Image>>,
+    base_color: Option<[f32; 3]>,
 ) -> StandardMaterial {
     debug_assert_eq!(
         normal_map.is_some(),
@@ -360,7 +381,12 @@ pub fn standard_material(
         "a handle must be supplied for exactly the surface that exists"
     );
     StandardMaterial {
-        base_color: UNTEXURED_TINT,
+        // The shader's `editorColors.mColor1.rgb` is a `float4` constant, i.e.
+        // already linear, and so is this upload path's albedo. `Color::srgb`
+        // here would apply a transfer curve a second time.
+        base_color: base_color.map_or(UNTEXURED_TINT, |rgb| {
+            Color::linear_rgb(rgb[0], rgb[1], rgb[2])
+        }),
         base_color_texture: None,
         normal_map_texture: normal_map,
         // Deliberately `false`, for every orientation. The convention is
@@ -412,11 +438,18 @@ impl BoundMaterial {
 ///
 /// `images` is passed in rather than fetched from the world so the whole
 /// binding is callable — and assertable — with no `App`.
+///
+/// `base_color` is the linear triple from the `sporemodel` record, threaded
+/// straight through to [`standard_material`]. It is deliberately **not**
+/// consulted while building surfaces: a record colour is not a texture, and
+/// letting it influence which surface is uploaded would make the texture path
+/// depend on the colour path.
 pub fn bind_material(
     plan: &MeshMaterialPlan,
     textures: &[MaterialTexture],
     orientation: NormalMapOrientation,
     images: &mut Assets<Image>,
+    base_color: Option<[f32; 3]>,
 ) -> BoundMaterial {
     let surfaces = build_surfaces(plan, textures, orientation);
     let handle = surfaces
@@ -433,7 +466,7 @@ pub fn bind_material(
         .collect();
     BoundMaterial {
         plan: plan.clone(),
-        material: standard_material(&surfaces, handle),
+        material: standard_material(&surfaces, handle, base_color),
         surfaces,
         mask_handles,
     }
@@ -725,7 +758,7 @@ mod tests {
         let plan = plan_with_masks();
         let textures = vec![mask_entry(MASK_GROUP)];
         let surfaces = build_surfaces(&plan, &textures, NormalMapOrientation::AsStored);
-        let material = standard_material(&surfaces, None);
+        let material = standard_material(&surfaces, None, None);
         assert!(material.base_color_texture.is_none());
         assert_eq!(material.base_color, UNTEXURED_TINT);
         assert_eq!(material.alpha_mode, AlphaMode::Opaque);
@@ -734,6 +767,46 @@ mod tests {
         assert!(material.normal_map_texture.is_none());
         assert_eq!(material.perceptual_roughness, UNTEXURED_ROUGHNESS);
         assert!(material.double_sided);
+    }
+
+    #[test]
+    fn a_record_colour_reaches_base_color_verbatim_and_stays_linear() {
+        // 0x2b978c46:0x40626200:0x05e3df13 <skincolor1>0.498039,0.803922,0.474510
+        let rgb = [0.498_039f32, 0.803_922, 0.474_510];
+        let surfaces = SurfaceSet::default();
+        let material = standard_material(&surfaces, None, Some(rgb));
+        assert_eq!(
+            material.base_color,
+            Color::linear_rgb(0.498_039, 0.803_922, 0.474_510)
+        );
+        // Linear, never through the sRGB transfer curve: the shader's
+        // `editorColors.mColor1` is a `float4` constant, already linear, and a
+        // second decode would darken and desaturate it.
+        assert_ne!(
+            material.base_color,
+            Color::srgb(0.498_039, 0.803_922, 0.474_510)
+        );
+        // The colour came from an XML record, so the base-colour *texture* slot
+        // is still empty: this is the invariant the previous revision broke.
+        assert!(material.base_color_texture.is_none());
+    }
+
+    #[test]
+    fn an_absent_record_colour_falls_back_to_the_neutral_tint_and_not_to_black() {
+        let surfaces = SurfaceSet::default();
+        let material = standard_material(&surfaces, None, None);
+        assert_eq!(material.base_color, UNTEXURED_TINT);
+        assert_ne!(material.base_color, Color::BLACK);
+    }
+
+    #[test]
+    fn a_zero_record_colour_is_still_black_because_black_is_a_colour_a_record_can_carry() {
+        // `0,0,0` appears verbatim in the corpus's paint lists, so it must not
+        // be mistaken for the "nothing found" fallback. This is the pair of
+        // facts that `Option<[f32; 3]>` exists to keep apart.
+        let material = standard_material(&SurfaceSet::default(), None, Some([0.0, 0.0, 0.0]));
+        assert_eq!(material.base_color, Color::BLACK);
+        assert_ne!(material.base_color, UNTEXURED_TINT);
     }
 
     #[test]
@@ -746,6 +819,7 @@ mod tests {
             &textures,
             NormalMapOrientation::AsStored,
             &mut images,
+            None,
         );
         let handle = bound.material.normal_map_texture.clone().expect("a handle");
         let image = images
@@ -778,6 +852,7 @@ mod tests {
             &textures,
             NormalMapOrientation::AsStored,
             &mut images,
+            None,
         );
         assert!(bound.material.normal_map_texture.is_none());
         assert_eq!(bound.mask_count(), 2);
@@ -798,7 +873,7 @@ mod tests {
     #[test]
     fn the_orientation_is_applied_once_in_the_bytes_and_never_in_the_shader() {
         let surfaces = SurfaceSet::default();
-        let as_stored = standard_material(&surfaces, None);
+        let as_stored = standard_material(&surfaces, None, None);
         assert!(!as_stored.flip_normal_map_y);
     }
 

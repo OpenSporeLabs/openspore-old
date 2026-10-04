@@ -214,8 +214,18 @@ fn texture_bearing_model(key: ResourceKey) -> Arc<ModelDefinition> {
             material_id: 0x407D_FDDB,
         }],
         materials: Some(materials),
+        paint: no_paint(),
         decode: DecodeStatus::Complete,
     })
+}
+
+/// The colour binding a fixture means by "we did not look for a colour": the
+/// unavailable variant, never a neutral tint and never black.
+fn no_paint() -> spore_engine::domain::paint::PaintBinding {
+    spore_engine::domain::paint::PaintBinding::Unavailable {
+        reason: spore_engine::domain::paint::PaintUnavailableReason::NoSporemodelRecords,
+        fact: spore_core::evidence::Fact::unavailable("test fixture"),
+    }
 }
 
 /// A one-mesh model whose textures were never requested.
@@ -230,6 +240,7 @@ fn bare_model(key: ResourceKey) -> Arc<ModelDefinition> {
             material_id: 0,
         }],
         materials: None,
+        paint: no_paint(),
         decode: DecodeStatus::Complete,
     })
 }

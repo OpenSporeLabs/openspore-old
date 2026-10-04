@@ -136,7 +136,11 @@ impl Decoded {
 /// resolution and roles, so the headless path and the visible path cannot
 /// disagree.
 pub fn prepare(scene: &SceneRequest) -> Decoded {
-    let world = match domain::world::ResourceWorld::open(&scene.packages) {
+    // `--sporemodel-package` companions are appended at the LOWEST priority:
+    // they exist so `Spore_Game.package` can be searched for `sporemodel`
+    // records, and a package named only for that must never shadow a record the
+    // caller asked for by `--package`.
+    let world = match domain::world::ResourceWorld::open(&scene.all_packages()) {
         Ok(world) => Arc::new(world),
         Err(error) => return Decoded::Failed(loader::describe(&error)),
     };
@@ -153,6 +157,7 @@ pub fn prepare(scene: &SceneRequest) -> Decoded {
         scene.assumed_texture_type,
         scene.layout,
         scene.spacing,
+        scene.sporemodel,
     ) {
         Ok((outcome, _extents)) => {
             info!(
@@ -301,6 +306,7 @@ mod tests {
     fn request(objects: Vec<ObjectRequest>, textured: bool) -> SceneRequest {
         SceneRequest {
             packages: Vec::new(),
+            sporemodel_packages: Vec::new(),
             objects,
             scale: 1.0,
             window: WindowOptions::default(),
@@ -309,6 +315,7 @@ mod tests {
             layout: domain::Layout::Row,
             spacing: domain::scene::DEFAULT_GAP,
             flip_normal_y: false,
+            sporemodel: None,
             assumed_texture_type: spore_core::record::type_id::RASTER,
         }
     }
