@@ -55,6 +55,7 @@
 #![deny(unsafe_code)]
 #![warn(missing_debug_implementations)]
 
+pub mod color;
 pub mod error;
 pub mod graph;
 pub mod manifest;
@@ -62,6 +63,10 @@ pub mod model;
 pub mod package;
 pub mod store;
 
+pub use color::{
+    extract as extract_model_colors, ColorError, ModelColors, Paint, PaintList, PaintRegion,
+    UnitRgb,
+};
 pub use error::AssetError;
 pub use graph::{
     read_reference_table, DanglingReference, Edge, EdgeKind, EdgeSummary, GraphOptions,
