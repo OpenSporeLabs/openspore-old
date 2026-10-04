@@ -16,7 +16,7 @@
 
 use thiserror::Error;
 
-use crate::{DXT5_FOURCC, ENVELOPE_SIZE};
+use crate::{DXT5_FOURCC, ENVELOPE_SIZE, LUMINANCE_FOURCC};
 
 /// Every way decoding a Spore raster texture record can fail.
 ///
@@ -37,15 +37,21 @@ pub enum TextureError {
         available: usize,
     },
 
-    /// The envelope's `fourcc` is not `DXT5`.
+    /// The envelope's `fourcc` names a format this build does not decode.
     ///
-    /// The `0x15xx` family is luminance, not BC3: it is a *different* format,
-    /// not an unrecognised one, and this build has no decoder for it (see
-    /// `docs/MATERIALS-DESIGN.md` §1). It is rejected by name rather than fed
-    /// to the block codec, which would produce plausible-looking garbage.
+    /// **Narrowed on 2026-10-04**, when the `0x15` family stopped being refused:
+    /// it is decoded by [`crate::decode_raster`] and documented in
+    /// `docs/LUMINANCE-RASTER.md`. What remains here is genuinely unsupported —
+    /// above all the **306 `DXT1` (`0x31545844`) records** in
+    /// `Spore_Content.package`, whose framing this build has *measured not to
+    /// fit* the DXT5 rule (a 256²/9-mip record leaves 12 bytes over the DXT5
+    /// layer stride), and therefore refuses rather than guesses. The message
+    /// names both decoded formats so a refusal says what was available.
     #[error(
-        "texture: unsupported fourcc 0x{fourcc:08X} (want 0x{DXT5_FOURCC:08X} = 'DXT5'; \
-         the 0x15xx luminance family is a different format and is out of scope)"
+        "texture: unsupported fourcc 0x{fourcc:08X} (this build decodes 0x{DXT5_FOURCC:08X} \
+         = 'DXT5' and 0x{LUMINANCE_FOURCC:08X}, the uncompressed normal-map family; \
+         0x31545844 = 'DXT1' is present in the corpus but its framing does not fit \
+         either rule and is not decoded)"
     )]
     UnsupportedFourcc {
         /// The `fourcc` word as read from the envelope.
@@ -159,6 +165,116 @@ pub enum TextureError {
         size: usize,
         /// Bytes in the record.
         record_size: usize,
+    },
+
+    // ---- luminance (0x15) framing --------------------------------------
+    /// The record is not exactly as long as its own envelope implies.
+    ///
+    /// Unlike the DXT5 family, whose layer count is *derived* by dividing, the
+    /// `0x15` family's whole payload length is determined: it is
+    /// `28 + base + sum over the remaining mips of (4 + that mip's size)`. A
+    /// record whose size differs is a record whose framing we do not understand,
+    /// so it is refused with both numbers rather than decoded on a hunch.
+    ///
+    /// Establishes that the identity is exact, not approximate: over all 901
+    /// records of the family in `Spore_Content.package` the two agree to the
+    /// byte.
+    #[error(
+        "luminance: record is {record_size} bytes but the envelope implies {expected} \
+         (width={width}, height={height}, mip_count={mip_count})"
+    )]
+    LuminanceRecordSize {
+        /// Bytes actually present.
+        record_size: usize,
+        /// Bytes the envelope's own geometry requires.
+        expected: usize,
+        /// Envelope width.
+        width: u32,
+        /// Envelope height.
+        height: u32,
+        /// Envelope mip count.
+        mip_count: u32,
+    },
+
+    /// A mip's little-endian length prefix disagrees with that mip's geometry.
+    ///
+    /// The prefix is the only per-level length the record carries, and it exists
+    /// precisely so a reader does not have to derive it. A prefix that is not
+    /// `mip_width * mip_height * 4` means the record is not laid out the way
+    /// [`crate::luminance`] describes, and guessing past it would splice two
+    /// different records together.
+    #[error(
+        "luminance: mip {mip} declares {declared} bytes at offset {offset} but its \
+         {width}x{height} geometry needs {expected}"
+    )]
+    LuminanceLengthPrefix {
+        /// Mip index the prefix belongs to.
+        mip: u32,
+        /// Byte count the record declares.
+        declared: usize,
+        /// Byte count the mip's dimensions require.
+        expected: usize,
+        /// Offset the prefix was read from.
+        offset: usize,
+        /// Mip width.
+        width: u32,
+        /// Mip height.
+        height: u32,
+    },
+
+    /// A mip's length prefix, or its payload, runs past the end of the record.
+    #[error(
+        "luminance: mip {mip} needs {needed} bytes at offset {offset}, \
+         but the record is {record_size} bytes"
+    )]
+    LuminanceSlicePastRecord {
+        /// Mip index the slice belongs to.
+        mip: u32,
+        /// Offset the slice starts at.
+        offset: usize,
+        /// Bytes the slice needs.
+        needed: usize,
+        /// Bytes in the record.
+        record_size: usize,
+    },
+
+    /// A mip's payload is shorter than `width * height * 4`.
+    ///
+    /// `0x15` is uncompressed, so unlike [`TextureError::ShortBlockChain`] there
+    /// is no codec that could absorb the difference: a short payload means the
+    /// record is truncated or mis-framed, and there is nothing to decode.
+    #[error("luminance: mip payload of {available} bytes < {needed} for {width}x{height}")]
+    ShortLuminanceMip {
+        /// Payload bytes available.
+        available: usize,
+        /// Payload bytes the mip's dimensions require.
+        needed: usize,
+        /// Mip width.
+        width: u32,
+        /// Mip height.
+        height: u32,
+    },
+
+    /// The two ways this module states "four bytes per texel" disagreed.
+    ///
+    /// **Unreachable through the public API**: [`crate::luminance_mip_size`] and
+    /// the output allocation in [`crate::decode_luminance_mip`] are both
+    /// `w * h * 4` from the same two arguments. The variant exists so that
+    /// changing one of those formulas without the other becomes a typed refusal
+    /// rather than a caller indexing past its own buffer.
+    #[error(
+        "luminance: internal size invariant failed for {width}x{height} \
+         (mip payload {needed}, output {out_len})"
+    )]
+    LuminanceInvariant {
+        /// Requested width.
+        width: u32,
+        /// Requested height.
+        height: u32,
+        /// Payload bytes the mip's geometry requires.
+        needed: usize,
+        /// Output bytes the allocation produced.
+        out_len: usize,
     },
 
     // ---- block codec ---------------------------------------------------

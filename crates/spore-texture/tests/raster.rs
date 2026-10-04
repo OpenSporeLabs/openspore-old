@@ -215,20 +215,51 @@ fn the_builder_reproduces_the_oracle_record_byte_for_byte() {
 // Rejections
 // ---------------------------------------------------------------------------
 
-/// A `fourcc` other than DXT5 is refused by name, including the `0x15xx`
-/// luminance family, which is a different format rather than an unknown one.
+/// A `fourcc` this build does not decode is refused by name.
+///
+/// The set shrank when the `0x15` family stopped being refused: it is decoded
+/// now. What remains is genuinely unsupported — the `DXT1` records that are
+/// present in the corpus and whose framing was *measured not to fit* either
+/// rule, plus anything unrecognised. The refusal names both decoded formats so
+/// the message says what was available.
 #[test]
 fn an_unsupported_fourcc_is_refused_by_name() {
-    // The 256x256 luminance record from docs/MATERIALS-DESIGN.md section 1.
-    for fourcc in [0x1500_0000u32, 0x0000_0015, 0x3554_5843, 0] {
+    for fourcc in [
+        0x3154_5844u32, // 'DXT1': 306 records in Spore_Content.package
+        0x1500_0000,    // the byte-swapped spelling of 0x15, which is not it
+        0x3554_5843,    // 'DXT3'
+        0,
+    ] {
         let mut bytes = record();
         bytes[0x14..0x18].copy_from_slice(&fourcc.to_le_bytes());
         assert_eq!(
-            decode_raster(&bytes).expect_err("only DXT5 is decoded"),
+            decode_raster(&bytes).expect_err("only DXT5 and 0x15 are decoded"),
             TextureError::UnsupportedFourcc { fourcc },
             "fourcc 0x{fourcc:08X}"
         );
     }
+}
+
+/// `0x15` is no longer a refusal, so the old "refuse the luminance family" test
+/// has become "the DXT5 body's bytes are not a `0x15` record": the same input
+/// now fails with the framing error instead of the format error, and it is worth
+/// pinning that the two errors are genuinely different rather than the same
+/// refusal under a new name.
+#[test]
+fn the_dxt5_body_is_not_a_luminance_record_and_says_so() {
+    let mut bytes = record();
+    bytes[0x14..0x18].copy_from_slice(&0x0000_0015u32.to_le_bytes());
+    // 8x8 with 2 mips would be 28 + 256 + 4 + 64 = 352 bytes; the record is 144.
+    assert_eq!(
+        decode_raster(&bytes).expect_err("the framing does not close"),
+        TextureError::LuminanceRecordSize {
+            record_size: 144,
+            expected: 352,
+            width: SYNTHETIC_WIDTH,
+            height: SYNTHETIC_HEIGHT,
+            mip_count: SYNTHETIC_MIPS,
+        }
+    );
 }
 
 /// A zero dimension is refused before any allocation, and named.

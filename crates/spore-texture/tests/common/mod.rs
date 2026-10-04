@@ -199,6 +199,107 @@ pub fn unhex(hex: &str) -> Vec<u8> {
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// The 0x15 family (docs/LUMINANCE-RASTER.md)
+// ---------------------------------------------------------------------------
+
+/// Bytes in the `0x15` header: seven words, so four bytes shorter than DXT5's.
+pub const LUM_HEADER_SIZE: usize = 28;
+
+/// Width and height of the synthetic `0x15` record: 4x4, the smallest shape for
+/// which "mip 0 has no prefix and every later mip does" is actually exercised
+/// (a 1-mip record would have no prefix at all).
+pub const LUM_WIDTH: u32 = 4;
+/// Height of the synthetic `0x15` record (equal to [`LUM_WIDTH`]).
+pub const LUM_HEIGHT: u32 = 4;
+
+/// Mip count of the synthetic `0x15` record: 4x4, 2x2, 1x1.
+pub const LUM_MIPS: u32 = 3;
+
+/// The texel `(255, 128, 128, mask)` repeated over a `w * h` base level.
+///
+/// This is the **flat tangent normal**: lane 0 is Z at 1.0, lanes 1 and 2 are X
+/// and Y at 0.0, encoded 0..255 with 128 as zero. Seven real records in
+/// `Spore_Content.package` are *exactly* this constant over their whole base
+/// level (`40652902:04bafc1e`, `40642902:0fbd1396`, `40642902:19ed05ad`,
+/// `40632902:0675f7af`, `40632902:06804c10`, `40632902:06804c15`,
+/// `40632902:06804c1a`), which is the single strongest piece of evidence that
+/// lanes 0-2 are a normal map with Z first. No Spore bytes are embedded here;
+/// the constant is transcribed from the measurement.
+pub const FLAT_NORMAL_TEXEL: [u8; 4] = [0xFF, 0x80, 0x80, 0xFF];
+
+/// A texel that is *not* the flat normal, used to tell mip levels and layers
+/// apart: `Z=0xFF`, `X=0x00`, `Y=0xFF`, mask `0x7F`.
+pub const TILTED_NORMAL_TEXEL: [u8; 4] = [0xFF, 0x00, 0xFF, 0x7F];
+
+/// The synthetic `0x15` record every luminance test decodes.
+///
+/// Layout, matching the family's own framing — no layer headers, and a
+/// little-endian byte count in front of every mip past the base level:
+///
+/// ```text
+/// 0x00  envelope  4x4, mip_count = 3                 (28 bytes)
+/// 0x1c  mip 0 payload: 16 texels, flat normal       (64 bytes)
+/// 0x5c  mip 1 byte count: 16                        ( 4 bytes)
+/// 0x60  mip 1 payload: 4 texels, flat normal        (16 bytes)
+/// 0x70  mip 2 byte count: 4                         ( 4 bytes)
+/// 0x74  mip 2 payload: 1 texel,  tilted normal       ( 4 bytes)
+/// ```
+///
+/// 120 bytes total. `luminance_record_size(4, 4, 3)` is `28 + 64 + (4+16) + (4+4)`
+/// = 120, so `layer_count_for` must derive **1** layer from it and the walk must
+/// consume it exactly.
+///
+/// The payload start at `0x1c` is the load-bearing detail: it is where
+/// `RasterEnvelope::field_1c` reports the first texel (`0xFF8080FF`), which is
+/// why the header of this family is 28 bytes and not 32.
+pub fn luminance_record() -> Vec<u8> {
+    let mut record = Vec::new();
+    push_u32(&mut record, 1); // version
+    push_u32(&mut record, LUM_WIDTH);
+    push_u32(&mut record, LUM_HEIGHT);
+    push_u32(&mut record, LUM_MIPS);
+    push_u32(&mut record, 8); // field_10: observed constant, never read
+    push_u32(&mut record, 0x0000_0015); // fourcc 0x15
+    push_u32(&mut record, LUM_WIDTH * LUM_HEIGHT * 4); // field_18 = w*h*4
+
+    // Mip 0: no length prefix. Its length is already in the header.
+    for _ in 0..(LUM_WIDTH * LUM_HEIGHT) {
+        record.extend_from_slice(&FLAT_NORMAL_TEXEL);
+    }
+    // Mip 1: 2x2, prefixed.
+    push_u32(&mut record, 2 * 2 * 4);
+    for _ in 0..4 {
+        record.extend_from_slice(&FLAT_NORMAL_TEXEL);
+    }
+    // Mip 2: 1x1, prefixed, and deliberately a *different* texel so a walk that
+    // lost its cursor cannot pass by returning the same bytes twice.
+    push_u32(&mut record, 4);
+    record.extend_from_slice(&TILTED_NORMAL_TEXEL);
+    record
+}
+
+/// The synthetic `0x15` record with a single mip, 92 bytes long.
+///
+/// `28 + 16 * 4` = 92. It exists for the same reason
+/// [`single_layer_record`] does for DXT5: a record with a *different* layer
+/// count and a byte-identical envelope, which is what makes the derived count a
+/// fact about the record rather than a constant read from a field.
+pub fn luminance_single_mip_record() -> Vec<u8> {
+    let mut record = Vec::new();
+    push_u32(&mut record, 1);
+    push_u32(&mut record, LUM_WIDTH);
+    push_u32(&mut record, LUM_HEIGHT);
+    push_u32(&mut record, 1);
+    push_u32(&mut record, 8);
+    push_u32(&mut record, 0x0000_0015);
+    push_u32(&mut record, LUM_WIDTH * LUM_HEIGHT * 4);
+    for _ in 0..(LUM_WIDTH * LUM_HEIGHT) {
+        record.extend_from_slice(&TILTED_NORMAL_TEXEL);
+    }
+    record
+}
+
 /// The 4x4 decode of [`FOUR_COLOUR_ALPHA_RAMP`], byte for byte, as produced by
 /// `tools/spore/dxt5/dxt5.py`.
 ///
