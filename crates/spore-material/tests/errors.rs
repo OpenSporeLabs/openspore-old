@@ -4,7 +4,7 @@
 mod support;
 
 use spore_assets::AssetError;
-use spore_core::evidence::{EvidenceLevel, FactState};
+use spore_core::evidence::EvidenceLevel;
 use spore_core::ResourceKey;
 use spore_gmdl::{GmdlError, GmdlTextureRef};
 use spore_material::{
@@ -392,9 +392,8 @@ fn the_claims_table_and_the_error_variants_agree_on_the_luminance_wording() {
         .expect("the texture crate declares the claim")
         .meaning
         .clone();
-    assert_eq!(
-        republished.state(),
-        spore_core::evidence::FactState::Available,
+    assert!(
+        republished.is_available(),
         "the 0x15 family is decoded, so its fact is available"
     );
 
