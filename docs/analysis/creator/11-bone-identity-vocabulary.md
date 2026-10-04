@@ -354,3 +354,71 @@ bone names the editor queries.
 * No asset byte is reproduced. No external project was consulted for the format;
   the only historical input is the paper named in the brief, and it is confined
   to §3 and treated as hypothesis.
+
+---
+
+## 11. CORRECTION — the anatomy claim does not survive contact with the composed creature
+
+**Added 2026-10-04, after the `spore-morphology` vertical slice was run over the
+whole corpus. This corrects §3 of this report and `docs/CREATOR-CORE.md` §10.3.**
+
+The hash finding stands: bone identity words **are** FNV-1 hashes of
+morph-parameter names, and 244 of 2002 are recovered with graded evidence. That is
+all still true and independently verified.
+
+**What is wrong is the inference from that to anatomy.** §3 presented the
+recovered vocabulary — `hip`, `knee`, `eye`, `iris`, `jaw`, `shoulder`, `wing`,
+`foot`, `hand` — as evidence that Spore's body graph carries anatomical semantics.
+Measured against the bones that actually occur in the **680 `<blockref>` parts the
+creator core places**, that vocabulary is almost entirely absent:
+
+```
+68 documents, 680 blocks, 79 roots, 520 internal nodes, max depth 19
+677 bones in the composed parts
+557 of those 677 bones have a recovered name
+and every single one of the 557 is `joint1`
+
+anatomical names present: none
+parts carrying `attach`:  0
+parts carrying `csnap`:  0
+bilateral L/R pairs:     none
+```
+
+### What this means
+
+* The creator core's parts are **simple articulated blocks** whose bones are named
+  `joint1`…`jointN`. That is the whole vocabulary in use at this layer.
+* The anatomical names are **real hashes of real strings** — they are in the
+  vocabulary because the search recovered them — but they **do not occur** in the
+  part layer the creator core composes. They must belong to whatever Spore uses to
+  assemble an actual creature's anatomy, which is a *different record* from the
+  EditorRigblock part layer.
+* So the body graph **topology** is recovered (§4, VERIFIED: a rooted, parented,
+  acyclic forest, 6270/6270) and the **anatomy** is not. Those are different claims
+  and this report conflated them.
+
+### What survives from §3, restated honestly
+
+| claim | status after the slice |
+|---|---|
+| a per-skeleton rooted parent forest exists | **VERIFIED** — 6270/6270 |
+| bone identity is a name hash | **VERIFIED** — FNV-1, 244 recovered |
+| the vocabulary *available* is anatomical | **VERIFIED as a fact about the vocabulary** |
+| the vocabulary *used by composed parts* is anatomical | **REFUTED** — only `joint1` |
+| caps / anatomical capability is recoverable from the part layer | **UNRESOLVED**, and now with a negative measurement against it |
+| symmetry is laterality | **UNRESOLVED for the creator core** — `wingL`/`wingR` etc. are in the vocabulary but **no composed part contains a bilateral pair** |
+| `attach` / `csnap` cross part boundaries | **UNRESOLVED** — and neither name occurs in any composed part |
+
+### The methodological lesson, recorded so it does not repeat
+
+A dictionary attack against a hash produces a *plausible, coherent* vocabulary.
+`hip`, `knee` and `iris` read like anatomy, and the surrounding measured
+structure (one root per skeleton, acyclic chains) reads like a body graph. Both
+invite the conclusion. Neither was checked against **which bones the creator
+actually uses**, which is the only population that matters for the question being
+asked.
+
+The check is one assertion — *is every recovered name `joint1`?* — and it was
+written only after running the whole slice. It should have been written before
+claiming the anatomy, not after. `spore_morphology`'s slice test now asserts it in
+the negative, so the false claim cannot come back.

@@ -713,25 +713,40 @@ strings against 2002 targets, i.e. **29.0 expected accidental collisions** again
 witnessed grades, so a caller cannot accidentally print an unproven word as
 anatomy — which is exactly how `kiomq` stayed out of a creature's skeleton.
 
-The recovered vocabulary is anatomical (`root`, `body`, `head`, `eye`, `pupil`,
-`iris`, `jaw1..3`, `neck1..2`, `shoulder`, `arm1..3`, `hand`, `hip`, `knee`,
-`ankle`, `elbow`, `tail`, `wing`, `fin`, `toe`, `weapon`, `mast`), mechanical
-(`joint1..9`, `joint20..29`, `base1..6`, `node1..6`, `stem0..5`, `shaft1..5`,
-`bolt1..4`, `bulb1..4`, `ring1..3`, `bounce`, `rotate`, `spin`, `radius`), and
-positional (`xpos`, `xneg`, `ypos`, `yneg`, `z_up`, `j_up`, `mid`, `tip`,
-`top1..4`).
+The recovered vocabulary *available* is anatomical (`root`, `body`, `head`, `eye`,
+`pupil`, `iris`, `jaw1..3`, `neck1..2`, `shoulder`, `arm1..3`, `hand`, `hip`,
+`knee`, `ankle`, `elbow`, `tail`, `wing`, `fin`, `toe`, `weapon`, `mast`),
+mechanical (`joint1..9`, `joint20..29`, `base1..6`, `node1..6`, `stem0..5`,
+`shaft1..5`, `bolt1..4`, `bulb1..4`, `ring1..3`, `bounce`, `rotate`, `spin`,
+`radius`), and positional (`xpos`, `xneg`, `ypos`, `yneg`, `z_up`, `j_up`,
+`mid`, `tip`, `top1..4`).
+
+> **CORRECTION (2026-10-04).** The paragraph above describes the vocabulary the
+> **search** recovered. It is *not* the vocabulary the creator core **uses**.
+> Measured over the 677 bones in the 680 composed `<blockref>` parts, the only
+> recovered name that occurs is **`joint1`** — 557 of 677 bones, and nothing else.
+> No `hip`, `knee`, `eye`, `body`, `root` or `wing`; no bilateral L/R pair; no
+> `attach` or `csnap` in any composed part. The anatomy reading of §10.3 is
+> therefore **REFUTED for this layer**: these parts are simple articulated blocks
+> named `joint<N>`, and the anatomical vocabulary belongs to a different record.
+> See `docs/analysis/creator/11` §11 for the correction and its reasoning.
 
 ### 10.4 Two questions the corpus answered, against history
 
-**Symmetry is laterality, not an operation.** There is no symmetry flag, mirror
-node or reflection relationship anywhere: the skeleton payload is three arrays
-with zero slack. But complete left/right name pairs *are* present —
-`wingL`/`wingR`, `sideL`/`sideR`, `hipL`/`hipR`, `kneeL`/`kneeR`. So the editor
-operation is **not** serialized and its **result** is, the way any other part is.
-A "mirror this part" rule would be invented behaviour.
+**Symmetry is laterality in the vocabulary, but the creator core does not use
+it.** There is no symmetry flag, mirror node or reflection relationship anywhere:
+the skeleton payload is three arrays with zero slack. Complete left/right name
+pairs *are* in the vocabulary — `wingL`/`wingR`, `sideL`/`sideR`, `hipL`/`hipR`,
+`kneeL`/`kneeR` — but **no composed part contains a bilateral pair**, because no
+composed part contains any name but `joint1`. So for the creator core, symmetry is
+**UNRESOLVED** rather than established; the laterality evidence is real but
+belongs to parts outside the 680 the documents place. A "mirror this part" rule
+would be invented behaviour either way.
 
 **Attachment is still open, and precisely so.** `attach` (36 bones) and `csnap`
-(46) are recovered names, but both live *inside* one part's skeleton. The other
+(46) are recovered names — but note that **neither occurs in any of the 677
+composed bones**, so they are properties of the wider vocabulary, not of the
+creator core's parts. Both would live *inside* one part's skeleton anyway. The other
 candidate is the `<blockref>` childlist one level up. No array in `0x70002`
 stores a part-to-part reference, so the honest answer today is: the minimal
 persisted relationship for composing a creature is the **`<blockref>` childlist

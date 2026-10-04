@@ -379,3 +379,195 @@ fn the_resolved_and_unresolved_counts_agree_with_the_rigblock_layer() {
     let (lookups, misses) = part_source().counters();
     let _ = (lookups, misses);
 }
+
+/// Tree shape and vocabulary, aggregated over every composed document.
+#[derive(Default, Debug)]
+struct Anatomy {
+    documents: usize,
+    blocks: usize,
+    roots: usize,
+    max_depth: usize,
+    depth_total: usize,
+    internal_nodes: usize,
+    named_bone_histogram: std::collections::BTreeMap<&'static str, usize>,
+    named_bones: usize,
+    bones_total: usize,
+    parts_with_attach: usize,
+    parts_with_csnap: usize,
+    bilateral: std::collections::BTreeMap<&'static str, usize>,
+}
+
+#[test]
+#[ignore = "needs SPORE/"]
+fn the_composed_block_trees_are_chains_and_the_vocabulary_is_anatomical() {
+    let Some(root) = install_root() else {
+        eprintln!("SKIP: no install");
+        return;
+    };
+    let source = part_source();
+    let Ok(game) = std::fs::read(root.join("SPORE/Data/Spore_Game.package")) else {
+        eprintln!("SKIP: no Spore_Game.package");
+        return;
+    };
+    let Ok(index) = PackageIndex::parse(&game) else {
+        eprintln!("SKIP: unparseable");
+        return;
+    };
+
+    let mut anatomy = Anatomy::default();
+    let mut per_document: Vec<(usize, usize, usize)> = Vec::new();
+
+    for entry in index.entries() {
+        if !FAMILIES
+            .iter()
+            .any(|(type_id, _)| *type_id == entry.type_id)
+        {
+            continue;
+        }
+        let Ok(bytes) = extract_record(&game, entry) else {
+            continue;
+        };
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            continue;
+        };
+        let family = FAMILIES
+            .iter()
+            .find(|(type_id, _)| *type_id == entry.type_id)
+            .map(|(_, family)| *family)
+            .expect("matched above");
+        let document = parse_sporemodel(family, text).expect("parses");
+        let composition = compose(&document, &source).expect("composes");
+
+        // Tree shape, from the document's own childlists.
+        let root_indices = document.roots();
+        let mut deepest = 0usize;
+        let mut internal = 0usize;
+        for index_in_doc in 0..document.blocks.len() {
+            if document.blocks[index_in_doc].writes_children() {
+                internal += 1;
+            }
+            deepest = deepest.max(document.ancestors(index_in_doc).len());
+        }
+
+        anatomy.documents += 1;
+        anatomy.blocks += document.blocks.len();
+        anatomy.roots += root_indices.len();
+        anatomy.internal_nodes += internal;
+        anatomy.max_depth = anatomy.max_depth.max(deepest);
+        anatomy.depth_total += deepest;
+        per_document.push((document.blocks.len(), root_indices.len(), deepest));
+
+        // Vocabulary, from the resolved parts' body graphs.
+        for part in composition.resolved() {
+            let named: Vec<&'static str> = part.named_bones().into_iter().map(|(n, _)| n).collect();
+            anatomy.named_bones += named.len();
+            anatomy.bones_total += part.bones().map(<[spore_rigblock::Bone]>::len).unwrap_or(0);
+            for name in &named {
+                *anatomy.named_bone_histogram.entry(name).or_default() += 1;
+            }
+            if named.contains(&"attach") {
+                anatomy.parts_with_attach += 1;
+            }
+            if named.contains(&"csnap") {
+                anatomy.parts_with_csnap += 1;
+            }
+            for stem in ["wing", "side", "hip", "knee", "arm", "leg", "eye", "ear"] {
+                let left: &'static str = Box::leak(format!("{stem}L").into_boxed_str());
+                let right: &'static str = Box::leak(format!("{stem}R").into_boxed_str());
+                if named.contains(&left) && named.contains(&right) {
+                    *anatomy
+                        .bilateral
+                        .entry(left.trim_end_matches('L'))
+                        .or_default() += 1;
+                }
+            }
+        }
+    }
+
+    assert_eq!(anatomy.documents, 68);
+    assert_eq!(anatomy.blocks, 680);
+    // 79 roots over 68 documents: the census measured 79 derived roots, so some
+    // documents are **multi-rooted forests** rather than trees. Assuming one root
+    // per document would have been a plausible guess and wrong by 11.
+    assert_eq!(
+        anatomy.roots, 79,
+        "the derived-root count moved; 68 documents hold 79 root blocks"
+    );
+    assert!(
+        anatomy.roots > anatomy.documents,
+        "if every document had exactly one root this would be equal, not greater"
+    );
+    // Chains, not flat lists: most blocks hang off something.
+    assert!(
+        anatomy.internal_nodes > anatomy.blocks / 2,
+        "a block tree this flat would not be a chain: {} internal of {}",
+        anatomy.internal_nodes,
+        anatomy.blocks
+    );
+    assert!(anatomy.max_depth >= 4, "shallow trees would not be chains");
+
+    eprintln!(
+        "{} documents, {} blocks, {} roots (so some documents are multi-rooted), \
+         {} internal nodes, max depth {}",
+        anatomy.documents, anatomy.blocks, anatomy.roots, anatomy.internal_nodes, anatomy.max_depth
+    );
+    eprintln!(
+        "{} named bones over resolved parts; {} parts carry `attach`, {} carry `csnap`",
+        anatomy.named_bones, anatomy.parts_with_attach, anatomy.parts_with_csnap
+    );
+    eprintln!("bilateral pairs per stem: {:?}", anatomy.bilateral);
+    let mut histogram: Vec<(&'static str, usize)> = anatomy
+        .named_bone_histogram
+        .iter()
+        .map(|(k, v)| (*k, *v))
+        .collect();
+    histogram.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+    let top: Vec<_> = histogram
+        .iter()
+        .take(18)
+        .map(|(name, count)| format!("{name}:{count}"))
+        .collect();
+    eprintln!("most common named bones: {top:?}");
+
+    // **This is the load-bearing assertion of this test, and it is negative.**
+    //
+    // Reports 11 and CREATOR-CORE 10 treated the recovered bone vocabulary as
+    // anatomical evidence, because the recovered names include `hip`, `knee`,
+    // `eye`, `iris`, `jaw` and `shoulder`. Measured against the bones that
+    // actually occur in the 680 `<blockref>` parts, that vocabulary is **almost
+    // entirely absent**: the only strong name that ever appears is `joint1`.
+    //
+    // So the recovered names are correct as *hashes* and wrong as an anatomy
+    // claim for this layer. The creator core's parts are simple articulated
+    // blocks with `joint<N>` bones; the anatomical vocabulary must live in
+    // whatever Spore uses to assemble an actual creature's anatomy, which is a
+    // different record from the rigblock part layer.
+    //
+    // Asserting the measurement rather than the hope is the point: written as
+    // "the vocabulary is anatomical", this test would have shipped a false claim
+    // behind a weaker assertion.
+    let non_joint: Vec<&str> = anatomy
+        .named_bone_histogram
+        .keys()
+        .copied()
+        .filter(|name| !name.starts_with("joint"))
+        .collect();
+    assert!(
+        non_joint.is_empty(),
+        "non-`joint` names appear in the composed bones: {non_joint:?} - the \
+         'the vocabulary is anatomical' claim in report 11 would need revisiting"
+    );
+    assert_eq!(
+        anatomy.named_bone_histogram.get("joint1").copied(),
+        Some(anatomy.named_bones),
+        "every recovered name in a composed part is joint1"
+    );
+    eprintln!(
+        "every recovered name in a composed part is `joint1` ({anatomy} of {total} bones)",
+        anatomy = anatomy.named_bones,
+        total = anatomy.bones_total
+    );
+
+    per_document.sort_unstable();
+    eprintln!("largest documents (blocks, roots, depth): {per_document:?}");
+}

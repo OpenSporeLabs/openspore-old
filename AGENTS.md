@@ -150,6 +150,17 @@ cargo test -p spore-differential --release -- --ignored --nocapture
   And the bone-range table is stored **unsorted in 599 of 1824 records**, so a
   tiling check written in file order fails on a third of the corpus.
 
+- **A recovered name vocabulary is not a vocabulary in use.** The 2002 bone
+  identity words in an EditorRigblock part skeleton are FNV-1 hashes of
+  morph-parameter names, and 244 are recoverable — the set includes `hip`, `knee`,
+  `eye`, `iris`, `jaw`, `shoulder` and four complete L/R pairs. But across the
+  677 bones in the 680 `<blockref>` parts the creator core actually composes,
+  **every recovered name is `joint1`** and nothing else: no anatomy, no laterality,
+  no `attach`/`csnap`. A dictionary attack against a hash yields a *plausible,
+  coherent* vocabulary, and coherent is not the same as used. Always check a
+  recovered vocabulary against the population that matters before building on it.
+  `spore_morphology`'s slice test asserts this in the negative on purpose.
+
 ### Evidence discipline (unchanged by the migration, now enforced in code)
 
 - `spore_core::EvidenceLevel` is the canonical 7-rung scale. Attach a grade to
