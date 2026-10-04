@@ -53,12 +53,17 @@ impl Json {
 
     /// Appends a key. Only meaningful on [`Json::Obj`].
     ///
+    /// The value is taken as `impl Into<Json>` so a call site can write
+    /// `.push("name", "raster")` instead of `.push("name", Json::from("raster"))`.
+    /// That is a convenience and nothing else: every value still goes through one
+    /// conversion, so two spellings of the same value cannot render differently.
+    ///
     /// Panics on a non-object, which is a programming error in this crate
     /// rather than a runtime condition: every call site builds the object it
     /// extends.
-    pub fn push<K: Into<String>>(mut self, key: K, value: Json) -> Self {
+    pub fn push<K: Into<String>, V: Into<Json>>(mut self, key: K, value: V) -> Self {
         match &mut self {
-            Json::Obj(pairs) => pairs.push((key.into(), value)),
+            Json::Obj(pairs) => pairs.push((key.into(), value.into())),
             other => panic!("Json::push on {other:?}"),
         }
         self

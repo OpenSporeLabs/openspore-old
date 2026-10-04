@@ -24,10 +24,14 @@
 //! no decoder for type 0x011989b7", never a mesh count.
 
 pub mod describe;
+pub mod diff;
 pub mod extract;
 pub mod find;
+pub mod graph;
 pub mod list;
 pub mod manifest;
+pub mod stats;
+pub mod texture;
 pub mod types;
 pub mod verify;
 

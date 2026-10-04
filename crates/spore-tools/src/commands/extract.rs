@@ -117,6 +117,103 @@ pub fn validate_out_dir(raw: &str) -> Result<PathBuf, crate::CliError> {
     Ok(PathBuf::from(trimmed))
 }
 
+/// Validates `--out` for a command that writes **one file** rather than a
+/// directory.
+///
+/// Two extra refusals over [`validate_out_dir`], both about where the bytes end
+/// up rather than what the path is spelled like:
+///
+/// * the empty string and a path with no file name at all (`out/`), because
+///   those do not name a file this tool could create;
+/// * **any path that resolves inside this repository.** Every tool in this
+///   workspace writes only where it was told to, and "told to" is not enough for
+///   a command whose output is megabytes of expanded texture: a plausible
+///   `--out foo.png` run from the repository root would otherwise drop a
+///   megabyte next to the sources, where it is neither ignored nor reviewable.
+///
+/// The repository root is [`env!("CARGO_MANIFEST_DIR")`]'s parent, baked in at
+/// build time. When that directory does not exist — an installed binary built
+/// elsewhere — the comparison is textual and simply matches nothing, so the guard
+/// is inert rather than wrong.
+pub fn validate_out_file(raw: &str) -> Result<PathBuf, crate::CliError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(crate::CliError::UnsafeOutFile(raw.to_owned()));
+    }
+    let path = PathBuf::from(trimmed);
+    if path.file_name().is_none() {
+        return Err(crate::CliError::UnsafeOutFile(raw.to_owned()));
+    }
+    if inside_repository(&path) {
+        return Err(crate::CliError::OutFileInsideRepository(trimmed.to_owned()));
+    }
+    Ok(path)
+}
+
+/// Whether `path`, resolved lexically against the working directory, is inside
+/// this repository.
+///
+/// Lexical rather than filesystem-based on purpose: the file does not exist yet,
+/// so `canonicalize` would fail, and following symlinks is not what "inside the
+/// repository" means to a caller reading a command line. `.` and `..` are
+/// resolved by hand, which is the standard `Path::components` walk and needs no
+/// filesystem access.
+pub fn inside_repository(path: &Path) -> bool {
+    let Some(root) = repository_root() else {
+        return false;
+    };
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(path),
+            Err(_) => return false,
+        }
+    };
+    normalise(&absolute).starts_with(normalise(&root))
+}
+
+/// This checkout's root.
+///
+/// Found by walking up from the build-time manifest directory for the ancestor
+/// that holds **both** a `Cargo.toml` and a `crates/` directory. The first
+/// version of this took one `.parent()` and got `crates/` — which is not the
+/// repository, so `--out in-repo.png` run from the repository root was accepted
+/// and wrote 256 KB next to the sources. The two-marker test is what makes the
+/// answer correct rather than merely plausible, and it is why the walk exists
+/// instead of a hard-coded `../..`.
+///
+/// When no such ancestor exists — an installed binary built elsewhere — `None`
+/// is returned and the guard is inert rather than wrong.
+fn repository_root() -> Option<PathBuf> {
+    static ROOT: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .find(|dir| dir.join("Cargo.toml").is_file() && dir.join("crates").is_dir())
+            .map(Path::to_path_buf)
+    })
+    .clone()
+}
+
+/// Resolves `.` and `..` textually, leaving a leading `/` and any prefix alone.
+fn normalise(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    out.push(Component::ParentDir);
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,5 +299,98 @@ mod tests {
         // Trailing whitespace is trimmed rather than becoming a path with a
         // space in it -- a shell-quoting accident, not an intent.
         assert_eq!(validate_out_dir("  out  ").unwrap(), PathBuf::from("out"));
+    }
+
+    #[test]
+    fn normalising_resolves_dot_and_dot_dot_without_touching_the_filesystem() {
+        assert_eq!(normalise(Path::new("/a/./b/../c")), PathBuf::from("/a/c"));
+        assert_eq!(normalise(Path::new("/a/b/../..")), PathBuf::from("/"));
+        // A leading `..` with nothing to pop is kept, not silently dropped.
+        assert_eq!(normalise(Path::new("../a")), PathBuf::from("../a"));
+    }
+
+    #[test]
+    fn the_repository_root_is_the_workspace_root_and_not_the_crates_directory() {
+        // The bug this pins: `CARGO_MANIFEST_DIR`'s immediate parent is
+        // `crates/`, and treating that as "the repository" let `--out
+        // in-repo.png` through. Two markers, one walk, and this assertion.
+        let root = repository_root().expect("the workspace root must be findable");
+        assert_eq!(
+            root.file_name().and_then(|name| name.to_str()),
+            Some(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .ancestors()
+                    .nth(2)
+                    .and_then(|p| p.file_name())
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("?")
+            ),
+            "the root is two levels above the manifest directory"
+        );
+        assert!(root.join("Cargo.toml").is_file(), "{}", root.display());
+        assert!(root.join("crates").is_dir(), "{}", root.display());
+        assert!(root.join("crates/spore-tools/Cargo.toml").is_file());
+    }
+
+    #[test]
+    fn a_path_inside_this_repository_is_refused_as_an_out_file() {
+        // Absolute, because the guard compares against an absolute root and a
+        // relative spelling would only pass by accident of the working
+        // directory.
+        let root = repository_root().expect("the workspace root must be findable");
+        for inside in [
+            root.join("in-repo.png"),
+            root.join("crates/spore-tools/src/out.png"),
+            root.join("target/out.png"),
+        ] {
+            assert!(
+                inside_repository(&inside),
+                "{} must be inside",
+                inside.display()
+            );
+            assert!(validate_out_file(inside.to_str().unwrap()).is_err());
+        }
+        // Including through a `..` that comes back out, and through the exact
+        // root: both resolve inside, which is the point of normalising first.
+        assert!(inside_repository(&root.join("crates/../docs/x.png")));
+        assert!(inside_repository(
+            &root.join("crates/spore-tools/../spore-tools/y.png")
+        ));
+        // And a bare relative name resolves against the working directory, which
+        // is the repository when the tests run.
+        assert!(inside_repository(Path::new("in-repo.png")));
+        assert!(validate_out_file("in-repo.png").is_err());
+    }
+
+    #[test]
+    fn a_path_outside_this_repository_is_accepted() {
+        let root = repository_root().expect("the workspace root must be findable");
+        let outside_dir = root
+            .parent()
+            .filter(|parent| *parent != root)
+            .map(|parent| parent.join("elsewhere"))
+            .unwrap_or_else(std::env::temp_dir);
+        let outside = outside_dir.join("x.png");
+        assert!(!inside_repository(&outside), "{}", outside.display());
+        assert!(validate_out_file(outside.to_str().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn an_out_file_that_names_no_file_is_refused() {
+        // Note the honest limit: a trailing separator cannot be detected
+        // lexically, because a `Path` normalises `/tmp/` to `/tmp`. So `--out
+        // /tmp/` names a *directory* and the write itself fails with an I/O
+        // error naming it, which is a worse message than the refusal would be.
+        // That is a documented gap, not an oversight.
+        for refused in ["", "   "] {
+            assert!(
+                matches!(
+                    validate_out_file(refused),
+                    Err(crate::CliError::UnsafeOutFile(_))
+                ),
+                "`{refused}` must be refused"
+            );
+        }
+        assert!(validate_out_file("/tmp/out.png").is_ok());
     }
 }

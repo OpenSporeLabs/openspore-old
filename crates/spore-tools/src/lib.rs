@@ -50,6 +50,7 @@
 
 pub mod commands;
 pub mod json;
+pub mod png;
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -135,12 +136,16 @@ pub struct ManifestRequest {
 }
 
 /// `verify`: walk every record of a type and count what happened to it.
+///
+/// [`VerifyRequest::explain`] replaces the walk with a diagnosis of one record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifyRequest {
     /// Package path.
     pub package: PathBuf,
     /// Restrict the walk to one record type id.
     pub type_id: Option<u32>,
+    /// Diagnose this one record instead of walking.
+    pub explain: Option<ResourceKey>,
 }
 
 /// `types`: print the canonical type/group tables and a package histogram.
@@ -150,6 +155,81 @@ pub struct TypesRequest {
     pub group: bool,
     /// Additionally print a per-package type histogram.
     pub package: Option<PathBuf>,
+}
+
+/// `texture`: decode one raster record and write a PNG.
+///
+/// The write is mandatory: there is no default destination, and
+/// [`commands::extract::validate_out_file`] refuses a path inside this
+/// repository. See [`commands::texture`] for the `0x15` channel-order trap this
+/// command is built around.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextureRequest {
+    /// Package path.
+    pub package: PathBuf,
+    /// The identity to decode.
+    pub key: ResourceKey,
+    /// Where to write the PNG. Required, and never inside this repository.
+    pub out_file: PathBuf,
+    /// Which layer to write; `0` is the first.
+    pub layer: usize,
+    /// Which mip level to write; `0` is the base level.
+    pub mip: usize,
+    /// What to do with the decoded channel order.
+    pub channels: commands::texture::ChannelOrder,
+    /// Emit the decode facts as one JSON object on stdout.
+    pub json: bool,
+}
+
+/// `graph`: the resource dependency graph around one record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphRequest {
+    /// Package paths. More than one changes what resolves, so the loaded set is
+    /// printed.
+    pub packages: Vec<PathBuf>,
+    /// The record to walk from.
+    pub key: ResourceKey,
+    /// Breadth-first depth bound. `0` returns the root alone.
+    pub depth: u32,
+    /// Which edge kinds to build and follow. Empty means the asset layer's
+    /// default: every kind except sibling adjacency.
+    pub kinds: Vec<spore_assets::EdgeKind>,
+    /// Also print the records that name the root.
+    pub dependants: bool,
+    /// Cap on printed rows per list. `0` means every row.
+    pub limit: usize,
+    /// Append one JSON object with the summary.
+    pub json: bool,
+}
+
+/// `stats`: corpus statistics over one or more packages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatsRequest {
+    /// Package paths. A record is counted once per package it appears in, so
+    /// passing a package twice double-counts it; the per-package table says how
+    /// many rows each contributed.
+    pub packages: Vec<PathBuf>,
+    /// Restrict the walk to one record type id.
+    pub type_id: Option<u32>,
+    /// Cap on the `types` and `groups` histograms. `0` means every row.
+    pub limit: usize,
+    /// Emit the whole census as one JSON document on stdout.
+    pub json: bool,
+}
+
+/// `diff`: record-level differences between two packages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffRequest {
+    /// The left package.
+    pub left: PathBuf,
+    /// The right package.
+    pub right: PathBuf,
+    /// Also compare decompressed content, not only the index rows.
+    pub bytes: bool,
+    /// Cap on each difference list. `0` means every row.
+    pub limit: usize,
+    /// Append one JSON object with every difference.
+    pub json: bool,
 }
 
 /// What a command line asks for.
@@ -171,6 +251,14 @@ pub enum Request {
     Verify(VerifyRequest),
     /// See [`TypesRequest`].
     Types(TypesRequest),
+    /// See [`TextureRequest`].
+    Texture(TextureRequest),
+    /// See [`GraphRequest`].
+    Graph(GraphRequest),
+    /// See [`StatsRequest`].
+    Stats(StatsRequest),
+    /// See [`DiffRequest`].
+    Diff(DiffRequest),
 }
 
 /// Every way a command line can be wrong.
@@ -231,6 +319,14 @@ pub enum CliError {
     },
     /// `--out` for `extract` names a directory this tool refuses to write into.
     UnsafeOutDir(String),
+    /// `--out` for `texture` names something that is not a file.
+    UnsafeOutFile(String),
+    /// `--out` for `texture` resolves inside this repository.
+    ///
+    /// Separate from [`CliError::UnsafeOutFile`] because the two say different
+    /// things: one is a malformed path, the other is a well-formed path this tool
+    /// will not write to.
+    OutFileInsideRepository(String),
 }
 
 /// The subcommand that was being parsed, for error messages.
@@ -248,21 +344,45 @@ const SYNOPSIS_FIND: &str = "<package> <T:G:I> [--json]";
 const SYNOPSIS_DESCRIBE: &str = "<package> <T:G:I>";
 const SYNOPSIS_EXTRACT: &str = "<package> <T:G:I> --out <dir>";
 const SYNOPSIS_MANIFEST: &str = "<package...> [--out <file>] [--json] [--stats]";
-const SYNOPSIS_VERIFY: &str = "<package> [--type 0x..]";
+const SYNOPSIS_VERIFY: &str = "<package> [--type 0x..] [--explain <T:G:I>]";
 const SYNOPSIS_TYPES: &str = "[--group] [--package <p>]";
+const SYNOPSIS_TEXTURE: &str = "<package> <T:G:I> --out <file.png> [--layer N] [--mip N] \
+                              [--channels auto|stored] [--json]";
+const SYNOPSIS_GRAPH: &str = "<T:G:I> --package <p> [--package <p>...] [--depth N] \
+                             [--kinds a,b,...] [--dependants] [--limit N] [--json]";
+const SYNOPSIS_STATS: &str = "<package...> [--type 0x..] [--limit N] [--json]";
+const SYNOPSIS_DIFF: &str = "<packageA> <packageB> [--bytes] [--limit N] [--json]";
 
 /// The default `list` row cap, and the value `0` replaces.
 pub const DEFAULT_LIST_LIMIT: usize = 50;
 
+/// Every subcommand, in the order `usage()` lists them.
+///
+/// One list, built from the same strings the parser dispatches on, so a
+/// subcommand cannot be documented without being implemented or implemented
+/// without being documented.
+const SUBCOMMANDS: &[&str] = &[
+    "list", "find", "describe", "extract", "manifest", "verify", "types", "texture", "graph",
+    "stats", "diff",
+];
+
+/// The subcommand names as one comma-separated string, for an error message.
+fn subcommand_list() -> String {
+    SUBCOMMANDS.join(", ")
+}
+
 impl std::fmt::Display for CliError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NoCommand => f.write_str(
-                "no subcommand given; try `osptool --help`, or one of: list, find, describe, extract, manifest, verify, types",
+            Self::NoCommand => write!(
+                f,
+                "no subcommand given; try `osptool --help`, or one of: {list}",
+                list = subcommand_list()
             ),
             Self::UnknownCommand(name) => write!(
                 f,
-                "unknown subcommand `{name}`; expected one of: list, find, describe, extract, manifest, verify, types"
+                "unknown subcommand `{name}`; expected one of: {list}",
+                list = subcommand_list()
             ),
             Self::MissingValue { flag } => write!(f, "`{flag}` needs a value"),
             Self::BadValue {
@@ -288,6 +408,15 @@ impl std::fmt::Display for CliError {
             Self::UnsafeOutDir(raw) => write!(
                 f,
                 "`--out {raw}` is refused: it is the filesystem root, `.`, or ends in a `..` component"
+            ),
+            Self::UnsafeOutFile(raw) => {
+                write!(f, "`--out {raw}` is refused: it does not name a file to create")
+            }
+            Self::OutFileInsideRepository(raw) => write!(
+                f,
+                "`--out {raw}` is refused: it resolves inside this repository. This tool writes \
+                 only where it was told to, and expanded assets next to the sources are neither \
+                 ignored nor reviewable. Pick a path under /tmp or your home directory."
             ),
         }
     }
@@ -331,6 +460,29 @@ pub fn usage() -> String {
          \x20        Print the canonical type table; `--group` (a flag, no value) adds the canonical group\n\
          \x20        table; `--package <p>` adds a per-package histogram merged with that package's own\n\
          \x20        0x01C7AC81:0x01C7AC81 prop directory, which maps TYPE IDS TO NAMES.\n\
+         \x20   texture {SYNOPSIS_TEXTURE}\n\
+         \x20        Decode one raster record and write a real PNG: RGBA8, filter 0, deflate stored blocks.\n\
+         \x20        The 0x15 family is stored Z, X, Y, mask and is swizzled to R=X, G=Y, B=Z by default;\n\
+         \x20        `--channels stored` writes the file order unchanged and says so. The report always\n\
+         \x20        states which was applied, because a swizzled-wrong PNG looks perfectly plausible.\n\
+         \x20        `--out` is required and is refused when it resolves inside this repository.\n\
+         \x20        The decode report goes to stderr; stdout carries only `--json`.\n\
+         \x20   graph {SYNOPSIS_GRAPH}\n\
+         \x20        Print the resource dependency graph around one record. Edges come from\n\
+         \x20        spore-assets' ResourceGraph with their evidence grades; `--kinds` selects what is\n\
+         \x20        BUILT, not only what is followed. Dangling references are reported per edge kind\n\
+         \x20        with counts, because a dangling edge is the normal case when the referring package\n\
+         \x20        is not loaded. Records that could not be read are listed with their reason.\n\
+         \x20   stats {SYNOPSIS_STATS}\n\
+         \x20        Corpus statistics: type and group histograms, raster fourcc and geometry censuses,\n\
+         \x20        per-record decode outcomes, gmdl walk outcomes (including the 0x218 stops) and\n\
+         \x20        texture-set sizes. Deterministic and sorted; an empty section says it is not a\n\
+         \x20        measurement of zero.\n\
+         \x20   diff {SYNOPSIS_DIFF}\n\
+         \x20        Record-level differences by T:G:I. Compares revision SETS, so two revisions of one\n\
+         \x20        identity inside one package are not reported as identical. Index rows by default;\n\
+         \x20        `--bytes` also compares decompressed content and reports records the index calls\n\
+         \x20        identical whose bytes differ. Differences are the output, so the exit code is 0.\n\
          \x20   -h, --help           Print this text\n\
          \n\
          EXIT CODES:\n\
@@ -341,13 +493,23 @@ pub fn usage() -> String {
          \x20   {EXIT_IO}  an I/O failure\n\
          \n\
          NOTES:\n\
-         \x20   A type with no decoder in this build exits {EXIT_OK} from `describe`: the record was found and\n\
-         \x20   its extent read, which is a complete answer to the question asked. `verify` also exits\n\
-         \x20   {EXIT_OK} when records fail, because it is a measurement: the failures are its output.\n\
+         \x20   A type with no decoder in this build exits {EXIT_OK} from `describe` and from\n\
+         \x20   `verify --explain`: the record was found and its extent read, which is a complete answer\n\
+         \x20   to the question asked. `verify`, `stats`, `graph` and `diff` also exit {EXIT_OK} when they\n\
+         \x20   count failures or differences, because they are measurements: the numbers are the output.\n\
          \x20   `find` exits {EXIT_OK} when the record was located even if the record does not decode; the verdict\n\
          \x20   is printed. Use `describe` when a decode failure should be fatal.\n\
+         \x20   `texture` exits {EXIT_DECODE} when the requested `--layer` or `--mip` does not exist in the\n\
+         \x20   record, naming the range that does: the record was read and the layer asked for is not in\n\
+         \x20   it. `graph` walks every gmdl record of the loaded packages, which is the slow part of a\n\
+         \x20   `--package`-heavy run; narrow it with `--kinds`.\n\
+         \x20   `graph` exits {EXIT_OK} for a root that is in no loaded package, and says `root present no`.\n\
+         \x20   A record can be named by loaded records while itself being absent, and \"which records\n\
+         \x20   reference this missing texture?\" is a question worth answering; the loaded set is printed\n\
+         \x20   so the answer can be read with its context.\n\
          \x20   Every id field in a `--json` document is a 0x-prefixed hex string, so a value copied out of\n\
-         \x20   one is directly usable as a `T:G:I` argument.\n"
+         \x20   one is directly usable as a `T:G:I` argument. With `--json`, stdout is the JSON document\n\
+         \x20   alone and the human report moves to stderr; without it, stdout is the human report.\n"
     )
 }
 
@@ -381,6 +543,10 @@ where
         "manifest" => parse_manifest(&mut cursor).map(Request::Manifest),
         "verify" => parse_verify(&mut cursor).map(Request::Verify),
         "types" => parse_types(&mut cursor).map(Request::Types),
+        "texture" => parse_texture(&mut cursor).map(Request::Texture),
+        "graph" => parse_graph(&mut cursor).map(Request::Graph),
+        "stats" => parse_stats(&mut cursor).map(Request::Stats),
+        "diff" => parse_diff(&mut cursor).map(Request::Diff),
         "help" => Ok(Request::Help),
         _ => Err(CliError::UnknownCommand(command)),
     }
@@ -536,6 +702,7 @@ fn parse_manifest(cursor: &mut Lexer) -> Result<ManifestRequest, CliError> {
 fn parse_verify(cursor: &mut Lexer) -> Result<VerifyRequest, CliError> {
     let mut package = None;
     let mut type_id = None;
+    let mut explain = None;
     let mut positional = 0usize;
 
     while let Some(token) = cursor.next_token() {
@@ -549,6 +716,17 @@ fn parse_verify(cursor: &mut Lexer) -> Result<VerifyRequest, CliError> {
             }
             Token::Flag(flag) => match flag.as_str() {
                 "--type" => type_id = Some(cursor.hex_flag("--type", "a type id like 0x00e6bce5")?),
+                "--explain" => {
+                    let raw = cursor.value("--explain")?;
+                    explain =
+                        Some(
+                            ResourceKey::parse_tgi(&raw).map_err(|_| CliError::BadValue {
+                                flag: "--explain".to_owned(),
+                                value: raw,
+                                expected: "a T:G:I triple such as 0x00e6bce5:0x40637e03:0x067a07f0",
+                            })?,
+                        );
+                }
                 other => return Err(unknown_flag("verify", other)),
             },
         }
@@ -557,6 +735,226 @@ fn parse_verify(cursor: &mut Lexer) -> Result<VerifyRequest, CliError> {
     Ok(VerifyRequest {
         package: require_package("verify", SYNOPSIS_VERIFY, positional, package)?,
         type_id,
+        explain,
+    })
+}
+
+fn parse_texture(cursor: &mut Lexer) -> Result<TextureRequest, CliError> {
+    let mut package = None;
+    let mut key = None;
+    let mut out_file = None;
+    let mut layer = 0usize;
+    let mut mip = 0usize;
+    let mut channels = commands::texture::ChannelOrder::Auto;
+    let mut json = false;
+    let mut positional = 0usize;
+
+    while let Some(token) = cursor.next_token() {
+        match token {
+            Token::Positional(value) => {
+                positional += 1;
+                match positional {
+                    1 => package = Some(PathBuf::from(value)),
+                    2 => key = Some(cursor.tgi(value)?),
+                    _ => return Err(positional_error("texture", SYNOPSIS_TEXTURE, positional)),
+                }
+            }
+            Token::Flag(flag) => match flag.as_str() {
+                "--out" => {
+                    let raw = cursor.value("--out")?;
+                    out_file = Some(commands::extract::validate_out_file(&raw)?);
+                }
+                "--layer" => layer = parse_count(cursor, "--layer")?,
+                "--mip" => mip = parse_count(cursor, "--mip")?,
+                "--channels" => {
+                    let raw = cursor.value("--channels")?;
+                    channels = commands::texture::ChannelOrder::parse(&raw).ok_or_else(|| {
+                        CliError::BadValue {
+                            flag: "--channels".to_owned(),
+                            value: raw,
+                            expected: "`auto` or `stored`",
+                        }
+                    })?;
+                }
+                "--json" => json = true,
+                other => return Err(unknown_flag("texture", other)),
+            },
+        }
+    }
+
+    Ok(TextureRequest {
+        package: require_package("texture", SYNOPSIS_TEXTURE, positional, package)?,
+        key: require_key("texture", SYNOPSIS_TEXTURE, positional, key)?,
+        out_file: out_file.ok_or(CliError::MissingValue {
+            flag: "--out".to_owned(),
+        })?,
+        layer,
+        mip,
+        channels,
+        json,
+    })
+}
+
+fn parse_graph(cursor: &mut Lexer) -> Result<GraphRequest, CliError> {
+    let mut packages: Vec<PathBuf> = Vec::new();
+    let mut key = None;
+    let mut depth = commands::graph::DEFAULT_DEPTH;
+    let mut kinds: Vec<spore_assets::EdgeKind> = Vec::new();
+    let mut dependants = false;
+    let mut limit = commands::graph::DEFAULT_ROW_LIMIT;
+    let mut json = false;
+    let mut positional = 0usize;
+
+    while let Some(token) = cursor.next_token() {
+        match token {
+            Token::Positional(value) => {
+                positional += 1;
+                if positional > 1 {
+                    return Err(positional_error("graph", SYNOPSIS_GRAPH, positional));
+                }
+                key = Some(cursor.tgi(value)?);
+            }
+            Token::Flag(flag) => match flag.as_str() {
+                // Repeatable by design: the loaded package set changes what
+                // resolves, so accumulating is the only reading that makes sense.
+                // `types` refuses a repeated `--package` because there one
+                // package is the whole scope.
+                "--package" => packages.push(PathBuf::from(cursor.value("--package")?)),
+                "--depth" => depth = parse_count(cursor, "--depth")? as u32,
+                "--kinds" => kinds = parse_kinds(cursor)?,
+                "--dependants" => dependants = true,
+                "--limit" => limit = parse_count(cursor, "--limit")?,
+                "--json" => json = true,
+                other => return Err(unknown_flag("graph", other)),
+            },
+        }
+    }
+
+    if packages.is_empty() {
+        return Err(CliError::MissingValue {
+            flag: "--package".to_owned(),
+        });
+    }
+
+    Ok(GraphRequest {
+        packages,
+        key: require_key("graph", SYNOPSIS_GRAPH, positional, key)?,
+        depth,
+        kinds,
+        dependants,
+        limit,
+        json,
+    })
+}
+
+/// Parses `--kinds`, a comma-separated list of canonical edge-kind spellings.
+///
+/// An unrecognised name is refused rather than dropped: dropping it would build a
+/// graph the caller did not ask for and report it as the one they did.
+fn parse_kinds(cursor: &mut Lexer) -> Result<Vec<spore_assets::EdgeKind>, CliError> {
+    let raw = cursor.value("--kinds")?;
+    let mut out = Vec::new();
+    for token in raw.split(',') {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let kind = spore_assets::EdgeKind::parse(token).ok_or_else(|| CliError::BadValue {
+            flag: "--kinds".to_owned(),
+            value: raw.clone(),
+            expected: EXPECTED_KINDS,
+        })?;
+        if !out.contains(&kind) {
+            out.push(kind);
+        }
+    }
+    if out.is_empty() {
+        return Err(CliError::BadValue {
+            flag: "--kinds".to_owned(),
+            value: raw,
+            expected: EXPECTED_KINDS,
+        });
+    }
+    Ok(out)
+}
+
+/// The closed `--kinds` vocabulary, spelled once for both the parser's error and
+/// the usage text.
+const EXPECTED_KINDS: &str =
+    "a comma-separated list of `gmdl->texture`, `gmdl->reference`, `model->texture-set`, `group-sibling`";
+
+fn parse_stats(cursor: &mut Lexer) -> Result<StatsRequest, CliError> {
+    let mut packages = Vec::new();
+    let mut type_id = None;
+    let mut limit = commands::stats::DEFAULT_ROW_LIMIT;
+    let mut json = false;
+
+    while let Some(token) = cursor.next_token() {
+        match token {
+            Token::Positional(value) => packages.push(PathBuf::from(value)),
+            Token::Flag(flag) => match flag.as_str() {
+                "--type" => type_id = Some(cursor.hex_flag("--type", "a type id like 0x00e6bce5")?),
+                "--limit" => limit = parse_count(cursor, "--limit")?,
+                "--json" => json = true,
+                other => return Err(unknown_flag("stats", other)),
+            },
+        }
+    }
+
+    if packages.is_empty() {
+        return Err(positional_error("stats", SYNOPSIS_STATS, 0));
+    }
+    Ok(StatsRequest {
+        packages,
+        type_id,
+        limit,
+        json,
+    })
+}
+
+fn parse_diff(cursor: &mut Lexer) -> Result<DiffRequest, CliError> {
+    let mut left = None;
+    let mut right = None;
+    let mut bytes = false;
+    let mut limit = commands::diff::DEFAULT_ROW_LIMIT;
+    let mut json = false;
+    let mut positional = 0usize;
+
+    while let Some(token) = cursor.next_token() {
+        match token {
+            Token::Positional(value) => {
+                positional += 1;
+                match positional {
+                    1 => left = Some(PathBuf::from(value)),
+                    2 => right = Some(PathBuf::from(value)),
+                    _ => return Err(positional_error("diff", SYNOPSIS_DIFF, positional)),
+                }
+            }
+            Token::Flag(flag) => match flag.as_str() {
+                "--bytes" => bytes = true,
+                "--limit" => limit = parse_count(cursor, "--limit")?,
+                "--json" => json = true,
+                other => return Err(unknown_flag("diff", other)),
+            },
+        }
+    }
+
+    Ok(DiffRequest {
+        left: require_package("diff", SYNOPSIS_DIFF, positional, left)?,
+        right: require_package("diff", SYNOPSIS_DIFF, positional, right)?,
+        bytes,
+        limit,
+        json,
+    })
+}
+
+/// Reads a non-negative count flag. `0` is a value, not a missing argument.
+fn parse_count(cursor: &mut Lexer, flag: &str) -> Result<usize, CliError> {
+    let raw = cursor.value(flag)?;
+    raw.parse::<usize>().map_err(|_| CliError::BadValue {
+        flag: flag.to_owned(),
+        value: raw,
+        expected: "a non-negative count (0 means unlimited)",
     })
 }
 
@@ -890,6 +1288,13 @@ where
             commands::verify::run(&request, out, err, progress)
         }
         Request::Types(request) => commands::types::run(&request, out),
+        Request::Texture(request) => commands::texture::run(&request, out, err),
+        Request::Graph(request) => commands::graph::run(&request, out, err),
+        Request::Stats(request) => {
+            let progress = commands::stats::stderr_is_terminal();
+            commands::stats::run(&request, out, err, progress)
+        }
+        Request::Diff(request) => commands::diff::run(&request, out, err),
     }
 }
 

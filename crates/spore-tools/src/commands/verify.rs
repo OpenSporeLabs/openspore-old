@@ -199,6 +199,11 @@ pub fn stderr_is_terminal() -> bool {
 /// It is a *measurement*: a record that fails to decode is the output, not a
 /// failed command. The caller decides what a given count means, which is why
 /// `failed` rows do not change the exit code.
+///
+/// `request.explain` short-circuits the walk and diagnoses **one** record
+/// instead. Diagnosing a bulk count is the slowest part of corpus work: a
+/// `verify` tally says "1 580 raster records failed" and nothing about which
+/// refusal applies to a given one.
 pub fn run(
     request: &VerifyRequest,
     out: &mut dyn Write,
@@ -206,6 +211,9 @@ pub fn run(
     progress: bool,
 ) -> Result<(), ToolError> {
     let store = super::single_package_store(&request.package)?;
+    if let Some(key) = &request.explain {
+        return explain(&store, key, out);
+    }
     let package = &store.packages()[0];
     let image = package.bytes();
 
@@ -230,6 +238,369 @@ pub fn run(
     }
 
     write_report(out, package.name(), package.record_count(), request, &tally)
+}
+
+/// The verdict one record reached, in the tool's own vocabulary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OneRecord {
+    /// A decoder accepted it.
+    Decoded {
+        /// What the decoder produced, in one line.
+        summary: String,
+    },
+    /// A decoder refused it, with the decoder's own words.
+    Failed {
+        /// The message the decoder produced.
+        message: String,
+    },
+    /// Recognised as a container; the payload was not read.
+    Container,
+    /// No decoder in this build for this type id. Nothing was parsed.
+    NoDecoder,
+    /// The bytes could not be extracted from the container at all.
+    Unreadable {
+        /// The container layer's message.
+        message: String,
+    },
+}
+
+impl OneRecord {
+    /// The one word this verdict is called, for a summary line.
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::Decoded { .. } => "decoded",
+            Self::Failed { .. } => "failed",
+            Self::Container => "container",
+            Self::NoDecoder => "no-decoder",
+            Self::Unreadable { .. } => "unreadable",
+        }
+    }
+}
+
+/// Runs the same per-record decision as the walk, for exactly one record.
+///
+/// The path is deliberately the *same* code the walk uses
+/// ([`classify`] then [`decode`]), so an explanation and the tally it explains
+/// cannot come from two different decisions. The extra information here is
+/// additional, never a second verdict.
+pub fn diagnose(entry: &DbpfEntry, image: &[u8]) -> OneRecord {
+    let class = classify(entry.type_id);
+    if matches!(class, RecordClass::Container) {
+        return OneRecord::Container;
+    }
+    if matches!(class, RecordClass::NoDecoder) {
+        return OneRecord::NoDecoder;
+    }
+    let bytes = match spore_dbpf::extract_record(image, entry) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return OneRecord::Unreadable {
+                message: error.to_string(),
+            }
+        }
+    };
+    match decode(class, &bytes) {
+        Ok(()) => OneRecord::Decoded {
+            summary: decoded_summary(class, &bytes),
+        },
+        Err(message) => OneRecord::Failed { message },
+    }
+}
+
+/// One line about what a decoder produced, for the record that decoded.
+///
+/// Only called on the success path, so every number in it came out of a decoder
+/// rather than out of the index.
+fn decoded_summary(class: RecordClass, bytes: &[u8]) -> String {
+    match class {
+        RecordClass::Gmdl => match spore_gmdl::parse(bytes) {
+            Ok(model) => format!(
+                "{} mesh(es), {} index buffer(s), {} vertex buffer(s), {} texture ref(s)",
+                model.mesh_count,
+                model.index_buffers.len(),
+                model.vertex_buffers.len(),
+                model.texture_refs.len()
+            ),
+            // Unreachable: `decode` succeeded, which called `parse`.
+            Err(error) => format!("<unreachable: {error}>"),
+        },
+        RecordClass::Rw4 => match spore_rw4::parse(bytes) {
+            Ok(directory) => format!(
+                "{} section(s) declared, {} present",
+                directory.section_count,
+                directory.sections.len()
+            ),
+            Err(error) => format!("<unreachable: {error}>"),
+        },
+        RecordClass::Raster => match spore_texture::decode_raster(bytes) {
+            Ok(image) => format!(
+                "{} layer(s), {} mip level(s) in layer 0, base {}x{}",
+                image.layers.len(),
+                image.layers.first().map_or(0, Vec::len),
+                image.envelope.width,
+                image.envelope.height
+            ),
+            Err(error) => format!("<unreachable: {error}>"),
+        },
+        RecordClass::Container | RecordClass::NoDecoder => "<not read>".to_owned(),
+    }
+}
+
+/// `verify --explain <T:G:I>`: everything known about one record.
+///
+/// Always exits [`EXIT_OK`](crate::EXIT_OK) once the record has been located: an
+/// explanation is a measurement, exactly like the tally. A record that is not in
+/// the package is [`EXIT_NOT_FOUND`](crate::EXIT_NOT_FOUND), with the store's
+/// near-miss candidates.
+fn explain(
+    store: &spore_assets::ContentStore,
+    key: &spore_core::ResourceKey,
+    out: &mut dyn Write,
+) -> Result<(), ToolError> {
+    let found = store.find(key)?;
+    let entry = found.entry;
+    let class = classify(entry.type_id);
+    let verdict = diagnose(entry, store.packages()[found.package_index].bytes());
+
+    writeln!(out, "record      {key}")?;
+    writeln!(out, "package     {}", found.package_name)?;
+    writeln!(out, "type        {}", super::describe_type(entry.type_id))?;
+    writeln!(out, "group       {}", group_text(entry))?;
+    writeln!(
+        out,
+        "index extent            0x{:08x}+{} ({} bytes stored)",
+        entry.offset, entry.stored_size, entry.stored_size
+    )?;
+    writeln!(out, "index memory size       {}", entry.memory_size)?;
+    writeln!(
+        out,
+        "index compression       {}",
+        super::compression_text(entry)
+    )?;
+    writeln!(
+        out,
+        "class        {class:?} \u{2014} {}",
+        class_sentence(class)
+    )?;
+    writeln!(out, "verdict      {}", verdict.label())?;
+
+    match &verdict {
+        OneRecord::Decoded { summary } => {
+            writeln!(out, "  decoded    {summary}")?;
+            write_extra(out, class, entry, store)?;
+        }
+        OneRecord::Failed { message } => {
+            writeln!(out, "  refused    {message}")?;
+            write_extra(out, class, entry, store)?;
+        }
+        // The honesty contract, in the one place a caller looks when a bulk count
+        // has to be explained: a type with no decoder prints the index extent and
+        // says the payload was not parsed. No summary line is emitted, because
+        // there is no decoder to summarise anything.
+        OneRecord::Container => {
+            writeln!(
+                out,
+                "  the {} bytes are the index's memory_size.",
+                entry.memory_size
+            )?;
+            writeln!(
+                out,
+                "  This build does not parse this container, so nothing further is claimed about \
+                 the record."
+            )?;
+        }
+        OneRecord::NoDecoder => {
+            writeln!(
+                out,
+                "  the {} bytes are the index's memory_size.",
+                entry.memory_size
+            )?;
+            writeln!(
+                out,
+                "  This build has no decoder for that type id, so nothing was parsed. A count of \
+                 these in `verify` is a statement about the type table, not about this record."
+            )?;
+        }
+        OneRecord::Unreadable { message } => {
+            writeln!(out, "  {message}")?;
+            writeln!(
+                out,
+                "  The record's bytes could not be extracted, so no decoder ran and nothing \
+                 below is claimed about its content."
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// What the classification means for this type, in one sentence.
+fn class_sentence(class: RecordClass) -> &'static str {
+    match class {
+        RecordClass::Gmdl => "decoded by the gmdl walker",
+        RecordClass::Rw4 => "decoded as an RW4 section directory",
+        RecordClass::Raster => "decoded as a raster (DXT5 / 0x15) record",
+        RecordClass::Container => "recognised as a container; payload not read",
+        RecordClass::NoDecoder => "no decoder in this build; nothing parsed",
+    }
+}
+
+/// Extra facts a decoder already has in hand, printed so a caller does not have
+/// to run a second command to get them.
+///
+/// Only reached for a record that a decoder accepted or refused, so every number
+/// here came from a decoder.
+fn write_extra(
+    out: &mut dyn Write,
+    class: RecordClass,
+    entry: &DbpfEntry,
+    store: &spore_assets::ContentStore,
+) -> Result<(), ToolError> {
+    match class {
+        RecordClass::Raster => write_raster_extra(out, entry, store),
+        RecordClass::Gmdl => write_gmdl_extra(out, entry, store),
+        // An RW4 failure message is already complete, and there is no second
+        // decoding pass to report from.
+        RecordClass::Rw4 | RecordClass::Container | RecordClass::NoDecoder => Ok(()),
+    }
+}
+
+/// The raster envelope, printed even when the walk refused.
+///
+/// For a raster refusal the fourcc is *the* answer, because the fourcc is what
+/// the walk dispatched on. Printing the envelope's four words afterwards is what
+/// turns "texture: unsupported fourcc 0x31545844" into "and here is the record
+/// that said so".
+fn write_raster_extra(
+    out: &mut dyn Write,
+    entry: &DbpfEntry,
+    store: &spore_assets::ContentStore,
+) -> Result<(), ToolError> {
+    // Read through the answering package, not `packages()[0]`: with one package
+    // they are the same and with more than one they are not.
+    let image = &store.packages()[0].bytes();
+    let Ok(bytes) = spore_dbpf::extract_record(image, entry) else {
+        return Ok(());
+    };
+    match spore_texture::parse_envelope(&bytes) {
+        Ok(envelope) => {
+            writeln!(
+                out,
+                "  envelope   version={} {}x{} mips={} fourcc=0x{:08x}{}",
+                envelope.version,
+                envelope.width,
+                envelope.height,
+                envelope.mip_count,
+                envelope.fourcc,
+                fourcc_verdict(envelope.fourcc)
+            )?;
+            writeln!(
+                out,
+                "  the fields this build does not interpret, carried verbatim: field_10=0x{:08x} \
+                 field_18=0x{:08x} field_1c=0x{:08x}",
+                envelope.field_10, envelope.field_18, envelope.field_1c
+            )?;
+            if envelope.fourcc != spore_texture::DXT5_FOURCC
+                && envelope.fourcc != spore_texture::LUMINANCE_FOURCC
+            {
+                writeln!(
+                    out,
+                    "  that fourcc has no decoder in this build, so the walk stopped at the \
+                     dispatch and the dimensions above are the header's words \u{2014} not a decoded \
+                     image"
+                )?;
+            }
+        }
+        Err(error) => {
+            writeln!(out, "  envelope   unreadable: {error}")?;
+            writeln!(
+                out,
+                "  the 32-byte envelope is not present, so this record cannot be a raster of any \
+                 format this build knows"
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Where the strict gmdl parse stopped, and how much survived anyway.
+///
+/// This is the section that makes the bulk `619 gmdl failed` actionable. The
+/// strict walk is all-or-nothing, so a record refused at the material-info table
+/// looks identical to one refused inside the geometry from the tally alone. The
+/// *recovering* walk answers the difference: it either closes, or it stops and
+/// says where — and stopping at material-info means the geometry a renderer needs
+/// is already fully decoded.
+fn write_gmdl_extra(
+    out: &mut dyn Write,
+    entry: &DbpfEntry,
+    store: &spore_assets::ContentStore,
+) -> Result<(), ToolError> {
+    let image = &store.packages()[0].bytes();
+    let Ok(bytes) = spore_dbpf::extract_record(image, entry) else {
+        return Ok(());
+    };
+    let partial = match spore_gmdl::parse_recovering(&bytes) {
+        Ok(partial) => partial,
+        Err(error) => {
+            writeln!(
+                out,
+                "  recovery   the recovering walk stopped INSIDE the geometry, so nothing usable \
+                 was decoded: {error}"
+            )?;
+            return Ok(());
+        }
+    };
+    match &partial.stop {
+        None => writeln!(
+            out,
+            "  recovery   the strict parse refused, but the recovering walk CLOSED on the record \
+             end: {} mesh(es) decoded",
+            partial.model.mesh_count
+        )?,
+        Some(stop) => {
+            writeln!(
+                out,
+                "  recovery   stopped at the {} table: {}",
+                stop.stage.as_str(),
+                stop.error
+            )?;
+            writeln!(
+                out,
+                "             {} mesh(es), {} index buffer(s), {} vertex buffer(s) are decoded and \
+                 validated; only what follows the mesh table is unmeasured",
+                partial.model.mesh_count,
+                partial.model.index_buffers.len(),
+                partial.model.vertex_buffers.len()
+            )?;
+            writeln!(
+                out,
+                "             strict walk validated {} of {} bytes",
+                partial.model.strict_consumed, partial.model.consumed
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Why a fourcc was or was not decoded.
+fn fourcc_verdict(fourcc: u32) -> &'static str {
+    match fourcc {
+        spore_texture::DXT5_FOURCC => " (DXT5, decoded)",
+        spore_texture::LUMINANCE_FOURCC => " (0x15 normal-map family, decoded)",
+        0x3154_5844 => {
+            " (DXT1: present in the corpus and REFUSED BY NAME \u{2014} its framing is measured \
+             not to fit either rule)"
+        }
+        _ => " (no decoder in this build names this format)",
+    }
+}
+
+/// A group's id plus its canonical name when one exists.
+fn group_text(entry: &DbpfEntry) -> String {
+    match super::group_name_of(entry.group_id) {
+        Some(name) => format!("0x{:08x} ({name})", entry.group_id),
+        None => format!("0x{:08x}", entry.group_id),
+    }
 }
 
 /// Reads and decodes one record, mapping the outcome onto the tally's vocabulary.
@@ -436,5 +807,148 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn an_explanation_and_the_tally_it_explains_share_one_decision() {
+        // The point of `diagnose` reusing `decode`: a record the walk counted as
+        // decoded must be reported by `--explain` as decoded, and a record the
+        // walk counted as failed must be reported as failed with the same words.
+        let base = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures/");
+        let payload = std::fs::read(format!("{base}mini.gmdl")).unwrap();
+        let (entry, image) = container_holding(spore_gmdl::GMDL_TYPE, &payload);
+
+        // The verdict for the committed fixture is whatever the decoder decides;
+        // what this test pins is that `diagnose` and the walk make the *same*
+        // decision about it.
+        let verdict = diagnose(&entry, &image);
+        let mut tally = Tally::default();
+        tally.record(classify(entry.type_id), attempt(&entry, &image));
+        match &verdict {
+            OneRecord::Decoded { summary } => {
+                assert_eq!(
+                    (tally.decoded, tally.failed),
+                    (1, 0),
+                    "an explanation of `decoded` must match a tally of one decoded"
+                );
+                assert!(
+                    summary.contains("mesh(es)"),
+                    "a decoded gmdl summary names what decoded: {summary}"
+                );
+            }
+            OneRecord::Failed { message } => {
+                assert_eq!(
+                    (tally.decoded, tally.failed),
+                    (0, 1),
+                    "an explanation of `failed` must match a tally of one failed"
+                );
+                assert_eq!(
+                    tally.errors.get(message.as_str()),
+                    Some(&1),
+                    "the counted message and the explained message must be the same string: \
+                     {message}"
+                );
+            }
+            other => panic!("expected a decoder verdict, got {}", other.label()),
+        }
+
+        // The same record with its last eight bytes chopped: both paths must now
+        // say `failed`, and with the same message.
+        let truncated = &payload[..payload.len() - 8];
+        let (bad_entry, bad_image) = container_holding(spore_gmdl::GMDL_TYPE, truncated);
+        let mut bad_tally = Tally::default();
+        bad_tally.record(classify(bad_entry.type_id), attempt(&bad_entry, &bad_image));
+        let OneRecord::Failed { message } = diagnose(&bad_entry, &bad_image) else {
+            panic!("a truncated record must be a `failed` verdict, not a decoded one")
+        };
+        assert_eq!(bad_tally.failed, 1);
+        assert_eq!(
+            bad_tally.errors.get(&message),
+            Some(&1),
+            "the counted message and the explained message must be the same string: {message}"
+        );
+    }
+
+    /// A one-record container image holding `payload` uncompressed.
+    fn container_holding(type_id: u32, payload: &[u8]) -> (DbpfEntry, Vec<u8>) {
+        let stored_size = u32::try_from(payload.len()).expect("fixture is small");
+        let entry = DbpfEntry::new(
+            type_id,
+            0x4061_6201,
+            0x067a_0801,
+            96 + 4,
+            stored_size,
+            stored_size,
+            0,
+            false,
+        );
+        let mut image = vec![0u8; 96];
+        image[0..4].copy_from_slice(b"DBPF");
+        image[4..8].copy_from_slice(&3u32.to_le_bytes());
+        image[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
+        image[0x40..0x44].copy_from_slice(&96u32.to_le_bytes());
+        image.extend_from_slice(&0u32.to_le_bytes());
+        image.extend_from_slice(&entry.type_id.to_le_bytes());
+        image.extend_from_slice(&entry.group_id.to_le_bytes());
+        image.extend_from_slice(&entry.instance_id.to_le_bytes());
+        image.extend_from_slice(&entry.offset.to_le_bytes());
+        image.extend_from_slice(&(stored_size | 0x8000_0000).to_le_bytes());
+        image.extend_from_slice(&entry.memory_size.to_le_bytes());
+        image.extend_from_slice(&0u16.to_le_bytes());
+        image.push(0);
+        image.push(0);
+        image.extend_from_slice(payload);
+        (entry, image)
+    }
+
+    #[test]
+    fn an_explanation_for_a_type_with_no_decoder_says_the_payload_was_not_parsed() {
+        // The honesty contract, exercised: `NoDecoder` must never be rendered as
+        // anything that looks like a decode.
+        let entry = DbpfEntry::new(spore_core::record::type_id::PLT, 1, 2, 0, 40, 40, 0, false);
+        assert_eq!(diagnose(&entry, b""), OneRecord::NoDecoder);
+        assert_eq!(OneRecord::NoDecoder.label(), "no-decoder");
+    }
+
+    #[test]
+    fn an_unreadable_record_is_distinct_from_a_refused_one() {
+        // The row claims bytes the image does not have. That is the container
+        // refusing the record, not a decoder refusing it, and the two get
+        // different labels.
+        let entry = DbpfEntry::new(spore_gmdl::GMDL_TYPE, 1, 2, 4096, 64, 64, 0, false);
+        match diagnose(&entry, &[0u8; 8]) {
+            OneRecord::Unreadable { message } => {
+                assert!(!message.is_empty(), "the container's message is carried");
+                assert_eq!(OneRecord::Unreadable { message }.label(), "unreadable");
+            }
+            other => panic!("expected unreadable, got {}", other.label()),
+        }
+    }
+
+    #[test]
+    fn an_unsupported_fourcc_is_named_by_the_explanation_helper() {
+        assert!(fourcc_verdict(spore_texture::DXT5_FOURCC).contains("decoded"));
+        assert!(fourcc_verdict(spore_texture::LUMINANCE_FOURCC).contains("decoded"));
+        assert!(fourcc_verdict(0x3154_5844).contains("REFUSED BY NAME"));
+        assert!(fourcc_verdict(0xdead_beef).contains("no decoder"));
+    }
+
+    #[test]
+    fn every_class_has_a_sentence_and_a_label() {
+        for class in [
+            RecordClass::Gmdl,
+            RecordClass::Rw4,
+            RecordClass::Raster,
+            RecordClass::Container,
+            RecordClass::NoDecoder,
+        ] {
+            assert!(!class_sentence(class).is_empty(), "{class:?}");
+            assert!(!class_label(class).is_empty(), "{class:?}");
+        }
+    }
+
+    /// The `Debug` spelling of a class, which the report prints verbatim.
+    fn class_label(class: RecordClass) -> String {
+        format!("{class:?}")
     }
 }

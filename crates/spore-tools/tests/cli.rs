@@ -95,6 +95,96 @@ fn every_subcommand_parses_its_documented_form() {
         (&["types"], "types"),
         (&["types", "--group"], "types"),
         (&["types", "--package", MINI_PACKAGE], "types"),
+        (
+            &[
+                "texture",
+                MINI_PACKAGE,
+                "0x58545354:0x11111111:0x22222222",
+                "--out",
+                "/tmp/osptool-cli.png",
+            ],
+            "texture",
+        ),
+        (
+            &[
+                "texture",
+                MINI_PACKAGE,
+                "0x58545354:0x11111111:0x22222222",
+                "--out",
+                "/tmp/osptool-cli.png",
+                "--layer",
+                "1",
+                "--mip",
+                "2",
+                "--channels",
+                "stored",
+                "--json",
+            ],
+            "texture",
+        ),
+        (
+            &[
+                "graph",
+                "0x58545354:0x11111111:0x22222222",
+                "--package",
+                MINI_PACKAGE,
+            ],
+            "graph",
+        ),
+        (
+            &[
+                "graph",
+                "0x58545354:0x11111111:0x22222222",
+                "--package",
+                MINI_PACKAGE,
+                "--package",
+                MINI_PACKAGE,
+                "--depth",
+                "3",
+                "--kinds",
+                "gmdl->texture,group-sibling",
+                "--dependants",
+                "--limit",
+                "0",
+                "--json",
+            ],
+            "graph",
+        ),
+        (&["stats", MINI_PACKAGE], "stats"),
+        (
+            &[
+                "stats",
+                MINI_PACKAGE,
+                "--type",
+                "0x58545354",
+                "--limit",
+                "0",
+                "--json",
+            ],
+            "stats",
+        ),
+        (&["diff", MINI_PACKAGE, MINI_PACKAGE], "diff"),
+        (
+            &[
+                "diff",
+                MINI_PACKAGE,
+                MINI_PACKAGE,
+                "--bytes",
+                "--limit",
+                "0",
+                "--json",
+            ],
+            "diff",
+        ),
+        (
+            &[
+                "verify",
+                MINI_PACKAGE,
+                "--explain",
+                "0x58545354:0x11111111:0x22222222",
+            ],
+            "verify",
+        ),
     ];
     for (args, expected) in cases {
         let request = parse(args.iter().map(|a| (*a).to_owned()))
@@ -107,6 +197,10 @@ fn every_subcommand_parses_its_documented_form() {
             Request::Manifest(_) => "manifest",
             Request::Verify(_) => "verify",
             Request::Types(_) => "types",
+            Request::Texture(_) => "texture",
+            Request::Graph(_) => "graph",
+            Request::Stats(_) => "stats",
+            Request::Diff(_) => "diff",
             Request::Help => "help",
         };
         assert_eq!(actual, *expected, "{args:?}");
@@ -140,6 +234,10 @@ fn every_documented_error_path_is_a_typed_parse_error() {
         ("manifest", vec!["p"]),
         ("verify", vec!["p"]),
         ("types", vec![]),
+        ("stats", vec!["p"]),
+        ("diff", vec!["p", "q"]),
+        ("graph", vec!["1:2:3"]),
+        ("texture", vec!["p", "1:2:3", "--out", "/tmp/x.png"]),
     ] {
         let mut args = vec![command];
         args.extend(extra);
@@ -167,12 +265,24 @@ fn every_documented_error_path_is_a_typed_parse_error() {
         CliError::BadValue { ref flag, .. } if flag == "--group"
     ));
     // A triple that is not a triple.
-    for command in ["find", "describe", "extract"] {
+    for command in ["find", "describe", "extract", "graph", "verify"] {
         for bad in ["1:2", "1:2:3:4", "a:b:c", "", "0x1:0x2:"] {
-            let mut args = vec![command, "p"];
+            // `graph` takes the identity first and its packages by flag; the
+            // rest take a package first and the identity second. `verify`'s
+            // identity arrives on `--explain`.
+            let mut args = match command {
+                "graph" => vec![command],
+                _ => vec![command, "p"],
+            };
+            if command == "verify" {
+                args.push("--explain");
+            }
             args.push(bad);
             if command == "extract" {
                 args.extend(["--out", "/tmp/whatever"]);
+            }
+            if command == "graph" {
+                args.extend(["--package", "p"]);
             }
             assert!(
                 matches!(parse_error(&args), CliError::BadValue { .. }),
