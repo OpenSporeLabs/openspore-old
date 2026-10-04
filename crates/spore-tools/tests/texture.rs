@@ -112,6 +112,21 @@ fn stored_mode_writes_the_file_order_unchanged_and_says_so() {
         "`--channels stored` must not re-index anything"
     );
     assert!(stderr.contains("stored byte order, unchanged"), "{stderr}");
+    // The report must describe what it *did*, and with `--channels stored` it did
+    // not re-index anything. Saying "this tool re-indexes the lanes" here would
+    // describe a step it skipped.
+    assert!(
+        !stderr.contains("re-indexed the lanes") && !stderr.contains("re-indexes the lanes"),
+        "the report must not claim a swizzle it did not apply: {stderr}"
+    );
+    assert!(
+        stderr.contains("swizzle     not applied, because `--channels stored` was given"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("luminance_0x15_channel_swizzle"),
+        "and the unestablished question is still carried: {stderr}"
+    );
 }
 
 #[test]
@@ -212,7 +227,7 @@ fn a_mip_level_can_be_selected_and_an_absent_one_is_refused_by_name() {
         "7",
     ]);
     assert_eq!(code, EXIT_DECODE, "{stderr}");
-    assert!(stderr.contains("has 2 mip level(s)"), "{stderr}");
+    assert!(stderr.contains("chain 0 has 2 mip level(s)"), "{stderr}");
     assert!(stdout.is_empty());
     assert!(
         !absent.exists(),
@@ -230,7 +245,10 @@ fn a_mip_level_can_be_selected_and_an_absent_one_is_refused_by_name() {
         "3",
     ]);
     assert_eq!(code, EXIT_DECODE);
-    assert!(stderr.contains("has 1 layer(s)"), "{stderr}");
+    assert!(
+        stderr.contains("this record has 1 mip chain(s)"),
+        "{stderr}"
+    );
 }
 
 #[test]
@@ -355,12 +373,185 @@ fn the_channels_vocabulary_is_closed_and_a_bad_word_is_a_usage_error() {
     assert!(stderr.contains("`auto` or `stored`"), "{stderr}");
 }
 
+/// A synthetic **DXT1** (BC1) record: 4x4, one mip level, one block.
+///
+/// Its single block is built by hand so the decode is predictable rather than a
+/// ramp: `colour0 = 0xf800` (red), `colour1 = 0x001f` (blue), `colour0 >
+/// colour1`, so both endpoints are palette entries and the two blends are
+/// two-thirds and one-fifth of the colour difference rather than a half each.
+/// The index bytes are four copies of `0b11_10_01_00`: BC1 packs sixteen 2-bit
+/// indices into bytes 4..8, **four texels per byte, row-major**, so one copy
+/// would only colour the block's first row. BC1 carries no alpha, so every texel
+/// must come out `A = 255` whatever the block says.
+fn dxt1_record() -> Vec<u8> {
+    let mut block = [0u8; 8];
+    block[0..2].copy_from_slice(&0xf800u16.to_le_bytes()); // colour0: red
+    block[2..4].copy_from_slice(&0x001fu16.to_le_bytes()); // colour1: blue
+    block[4..8].copy_from_slice(&[0b11_10_01_00; 4]); // four texels per index byte
+
+    let mut record = Vec::new();
+    for value in [
+        1u32,
+        4,
+        4,
+        1,
+        8,
+        spore_texture::DXT1_FOURCC,
+        // field_18: the base level's own byte count. 4x4 is one block of 8.
+        8,
+        0,
+    ] {
+        record.extend_from_slice(&value.to_le_bytes());
+    }
+    record.extend_from_slice(&block);
+    record
+}
+
+const DXT1_KEY: &str = "0x2f4e681c:0x40662900:0x00000001";
+
+#[test]
+fn a_dxt1_record_decodes_as_bc1_and_is_written_without_a_swizzle() {
+    // Before the framing was corrected this build called DXT1 "present in the
+    // corpus, refused by name" while decoding all 306 of its records, so the
+    // command has to prove it decodes a BC1 record into the pixels BC1 defines —
+    // and that it applies no channel re-index to it.
+    let image = package_of(&[Row::new(
+        spore_texture::RASTER_TYPE,
+        0x4066_2900,
+        1,
+        dxt1_record(),
+    )]);
+    let file = common::temp_package("texture-dxt1", &image);
+    let path = file.path().display().to_string();
+    let out_dir = common::TempDir::new("texture-dxt1-out");
+    let out = out_dir.path().join("dxt1.png");
+    let (code, stdout, stderr) = osptool(&[
+        "texture",
+        &path,
+        DXT1_KEY,
+        "--out",
+        &out.display().to_string(),
+    ]);
+    assert_eq!(code, EXIT_OK, "{stderr}");
+    assert!(
+        stdout.is_empty(),
+        "stdout carries only what was asked for: {stdout}"
+    );
+
+    // Named as BC1 with its 8-byte block, never as refused.
+    assert!(
+        stderr.contains("0x31545844 DXT1/BC1 \u{2014} 8 bytes per 4x4 block"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("refus"),
+        "DXT1 decodes; the report must not call it refused: {stderr}"
+    );
+    // Not swizzled, and it says so rather than printing the 0x15 lane claim.
+    assert!(stderr.contains("stored byte order, unchanged"), "{stderr}");
+    assert!(
+        !stderr.contains("swizzled from"),
+        "a BC1 record is written exactly as decoded: {stderr}"
+    );
+    assert!(
+        stderr.contains("not_applicable_to_this_fourcc"),
+        "and it says the Z, X, Y, mask layout is not a claim about this format: {stderr}"
+    );
+    assert!(
+        stderr.contains("A=255"),
+        "BC1 has no alpha, so the opaque alpha is worth stating: {stderr}"
+    );
+
+    // The pixels, from an independent read of the file. One block covers the
+    // whole 4x4 level, so all four rows carry the block's single index row.
+    let decoded = spore_tools::png::verify(&std::fs::read(&out).unwrap()).expect("valid PNG");
+    assert_eq!((decoded.width, decoded.height), (4, 4));
+    let row: Vec<u8> = [
+        [255u8, 0, 0, 255], // index 0: colour0, red
+        [0, 0, 255, 255],   // index 1: colour1, blue
+        [170, 0, 85, 255],  // index 2: 2/3 colour0 + 1/3 colour1
+        [85, 0, 170, 255],  // index 3: 1/3 colour0 + 2/3 colour1
+    ]
+    .concat();
+    for index in 0..4 {
+        assert_eq!(
+            &decoded.pixels[index * 16..index * 16 + 16],
+            row.as_slice(),
+            "row {index}: every texel is opaque, so no blend can reach alpha"
+        );
+    }
+    // And the same bytes under `--channels stored`, because for a block format
+    // the two modes must be identical.
+    let stored = out_dir.path().join("dxt1-stored.png");
+    let (code, _stdout, stderr) = osptool(&[
+        "texture",
+        &path,
+        DXT1_KEY,
+        "--out",
+        &stored.display().to_string(),
+        "--channels",
+        "stored",
+    ]);
+    assert_eq!(code, EXIT_OK, "{stderr}");
+    assert_eq!(
+        std::fs::read(&stored).unwrap(),
+        std::fs::read(&out).unwrap(),
+        "`auto` and `stored` must be byte-identical for a format this tool never swizzles"
+    );
+}
+
+#[test]
+fn a_dxt1_json_document_carries_no_lane_layout_value() {
+    let image = package_of(&[Row::new(
+        spore_texture::RASTER_TYPE,
+        0x4066_2900,
+        1,
+        dxt1_record(),
+    )]);
+    let file = common::temp_package("texture-dxt1-json", &image);
+    let path = file.path().display().to_string();
+    let out_dir = common::TempDir::new("texture-dxt1-json-out");
+    let out = out_dir.path().join("dxt1.png");
+    let (code, stdout, stderr) = osptool(&[
+        "texture",
+        &path,
+        DXT1_KEY,
+        "--out",
+        &out.display().to_string(),
+        "--json",
+    ]);
+    assert_eq!(code, EXIT_OK, "{stderr}");
+    let document = spore_tools::json::parse(&stdout).expect("valid JSON");
+    let spore_tools::json::Json::Obj(pairs) = &document else {
+        panic!("expected an object")
+    };
+    let get = |key: &str| {
+        pairs
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.clone())
+            .unwrap_or_else(|| panic!("no key {key}"))
+    };
+    assert_eq!(get("channels"), spore_tools::json::Json::from("stored"));
+    assert_eq!(get("fourcc"), spore_tools::json::Json::from("0x31545844"));
+    assert_eq!(get("width"), spore_tools::json::Json::from(4u32));
+    // The `0x15` lane claim must be a non-finding, not a value a caller could read
+    // a normal map out of.
+    let spore_tools::json::Json::Obj(layout) = get("stored_lane_layout") else {
+        panic!("expected an object")
+    };
+    assert!(layout
+        .iter()
+        .any(|(k, v)| k == "state" && *v == spore_tools::json::Json::from("unavailable")));
+    assert!(!layout.iter().any(|(k, _)| k == "value"), "{stdout}");
+}
+
 #[test]
 fn a_dxt5_record_is_written_verbatim_with_its_signature_called_out() {
     // Spore's DXT5 decode is black/red by construction. The image looks broken
     // and is not, so the report has to say so every time rather than leaving a
     // reader to conclude the tool is wrong.
-    let image = common::synthetic_raster(8, 8, 1, 1);
+    let image = common::synthetic_raster(8, 8, 1);
     let file = common::temp_package(
         "texture-dxt5",
         &common::package_of(&[Row::new(spore_texture::RASTER_TYPE, 0x4066_2900, 1, image)]),

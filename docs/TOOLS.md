@@ -27,10 +27,11 @@ partition in `commands::verify`, and tests that assert the absence of a summary
 line.
 
 **2. Unavailable is never zero, empty, or `false`.** Every optional fact is
-carried in `spore_core::Fact` and printed in its envelope. `layers=unavailable`
-is not `layers=0`; a missing `value` key is not `"UNKNOWN"`; a `null` fourcc is
-not fourcc `0`. An empty histogram says *"no record of this scope produced a row
-here — this is not a measurement of zero"* rather than printing `0`.
+carried in `spore_core::Fact` and printed in its envelope. A missing `value` key
+is not `"UNKNOWN"`; a `null` fourcc is not fourcc `0`; a fourcc with no measured
+framing rule is an **absence**, not a verdict on the record. An empty histogram
+says *"no record of this scope produced a row here — this is not a measurement of
+zero"* rather than printing `0`.
 
 ## Exit codes
 
@@ -95,10 +96,41 @@ The JSON therefore carries
 and `--channels stored` writes the file order unchanged for anyone who wants to
 see it.
 
-**DXT5 is never swizzled.** Its documented decode produces red in `{0, 8}` with
+**The `0x15` lane claims are scoped to the `0x15` family.** Both block formats are
+written exactly as decoded, and for them the report says the lane layout is *not
+applicable* (`not_applicable_to_this_fourcc`) rather than printing the normal-map
+claim or staying silent. Silence would read as "settled for this format"; it is
+the opposite of the truth. `stored_lane_layout` is an `unavailable` fact in the
+JSON for those records, so it carries no `value` a caller could mistake for a
+claim.
+
+**All three formats in the corpus decode, and the report names each one.**
+
+| `fourcc` | codec | block | corpus records in `Spore_Content.package` |
+|---|---|---|---|
+| `0x35545844` | DXT5/BC3 | **16** bytes per 4x4 block | 1 747 |
+| `0x31545844` | DXT1/BC1 | **8** bytes per 4x4 block | 306 |
+| `0x00000015` | uncompressed | four bytes per texel | 901 |
+
+`DXT5` is never swizzled. Its documented decode produces red in `{0, 8}` with
 green and blue `0` on every texel, because Spore's blocks depart from BC3 in four
 documented ways. That image looks broken and is not, so the report says so every
 time rather than leaving a reader to conclude the tool is wrong.
+
+`DXT1` is also never swizzled, and it is **not** a mask: BC1 carries no alpha, so
+every texel is written `A = 255`, and a real corpus record expands to thousands of
+distinct RGBA values. Until a corpus byte count corrected the framing this tool
+named the format *"present in the corpus, refused by name"* while decoding all 306
+of its records — a census that calls a decodable format refused is a confident
+falsehood, and `stats`, `describe` and `verify --explain` now all say `DXT1/BC1`
+with its 8-byte block.
+
+**Measured over the corpus.** `osptool stats SPORE/Data/Spore_Content.package`
+reports 2 954 raster records: 1 747 DXT5, 901 `0x15`, 306 DXT1, and **2 954
+decoded, zero refusals**. For `0x2f4e681c:0x40652902:0x0e5c7ee1` (a 512² `0x15`
+record) the stored-order PNG is red-dominant on 262 144 of 262 144 texels and the
+swizzled PNG is blue-dominant on 262 144 of 262 144 — the whole point of the
+command, and the number a re-run should reproduce.
 
 **Where it writes.** `--out` is required and `validate_out_file` refuses any path
 that resolves inside this repository (found by walking up for the ancestor
@@ -145,21 +177,49 @@ osptool stats <package...> [--type 0x..] [--limit N] [--json]
 
 Every number here was, at some point, produced by a throwaway probe in this
 workspace. Sections: `types`, `groups`, `raster fourcc`, `raster geometry`,
-`raster layer splits`, `decodes`, `gmdl walk outcomes`, `texture-set sizes`.
+`raster framing`, `decodes`, `gmdl walk outcomes`, `texture-set sizes`.
 
 Two properties are structural rather than hopeful:
 
-* **Coverage.** The fourcc census and the geometry census sum to the raster count
-  in the type histogram, and the gmdl-walk section sums to the gmdl count. A
-  record whose envelope was read is in both even when the derived layer split
-  refuses, because its fourcc and its three geometry words are established by the
-  envelope itself; the refusal is reported by name in `raster layer splits`.
+* **Coverage.** The fourcc census sums to the raster count in the type histogram,
+  and the gmdl-walk section sums to the gmdl count. A record whose envelope was
+  read is in the fourcc *and* geometry censuses even when its framing does not
+  close, because its fourcc and its three geometry words are established by the
+  envelope itself; the disagreement is reported by name in `raster framing`.
   (The first run over `Spore_Content.package` caught a hole in exactly this
   property: 373 records were falling out of the census, and the census then read
-  "1374 DXT5" where the truth is 1747.)
+  "1374 DXT5" where the truth is 1747. The framing is now correct so the corpus
+  can no longer exercise the hole, and `tests/stats.rs` pins the property with a
+  synthetic record whose length deliberately disagrees with its own envelope.)
 * **Determinism.** Every histogram is sorted by `(count descending, label
   ascending)`, so equal counts cannot be ordered differently in two sections, and
   two runs are byte-identical.
+
+### `raster framing`, and the premise it replaced
+
+This section **replaced** `raster layer splits`. That section's rows were either
+`derived` or the exact layer-split refusal, and its geometry histogram was keyed on
+a *derived* layer count — and once the framing was corrected it could print nothing
+but `derived 2954`. A section that can only ever print one thing is not a
+measurement.
+
+What is there now is the measurement that refuted it, so it is reproducible from
+the tool rather than asserted in a comment. Two independent axes, because "the
+length closes" and "the header agrees with the length" are separate claims and one
+verdict would let either mask the other:
+
+* **`record length: exact`** — the record is exactly as long as
+  `framing::record_size(fourcc, width, height, mip_count)` requires. That identity
+  is *determined* (header, bare base level, bare level 1 for the block formats,
+  then a `u32` count and that many bytes per level from
+  `first_prefixed_level` on), which is why a disagreement is a refusal with both
+  numbers rather than a remainder.
+* **`field_18: the base level's byte count`** — verified in **all three** formats.
+  It read as "format-specific" before only because the block size was wrong.
+
+Over `Spore_Content.package` both close on 2 954 of 2 954. A fourcc with no
+measured framing rule gets its own row worded as an **absence**, and gets no
+`field_18` verdict at all, because with no frame there is no base level to size.
 
 One record is decoded at a time and dropped; only counters survive. Progress goes
 to stderr every 10 000 records and only when stderr is a terminal.
@@ -218,10 +278,14 @@ cargo test  -p spore-tools
 cargo clippy -p spore-tools --all-targets -- -D warnings
 ```
 
-310 tests, all hermetic: synthetic packages built byte by byte in
-`tests/common/mod.rs`, synthetic `0x15` records carrying the corpus's own flat
-normal, and no game install, no window and no GPU. `crates/spore-tools` is
-Bevy-free and must stay so.
+323 tests, all hermetic: synthetic packages built byte by byte in
+`tests/common/mod.rs`, synthetic raster records built by
+`spore_texture::framing`'s own sizing functions (the builder asserts its output is
+exactly the length the framing identity requires, so a builder that disagreed with
+the decoder would fail at build time rather than produce a record the decoder
+refuses), synthetic `0x15` records carrying the corpus's own flat normal, and no
+game install, no window and no GPU. `crates/spore-tools` is Bevy-free and must stay
+so.
 
 Corpus tests live in `tests/real_corpus.rs`, `#[ignore]`d, and **return early
 with a printed note** when `SPORE/` is absent:
@@ -230,10 +294,11 @@ with a printed note** when `SPORE/` is absent:
 cargo test -p spore-tools --release --test real_corpus -- --ignored --nocapture
 ```
 
-## Known cross-crate findings
+## Cross-crate findings
 
-These were found while building these commands and are **not** fixed here; each
-belongs to the crate that owns the format.
+Each was found while building these commands. **2 is resolved** — the owning crate
+fixed it and this crate stopped reporting the old model; **1, 3 and 4 are open**
+and each belongs to the crate that owns the format.
 
 1. **`tests/fixtures/mini.gmdl` encodes its `refCount` key words
    little-endian.** `spore-gmdl` now reads the whole table big-endian, which the
@@ -245,18 +310,34 @@ belongs to the crate that owns the format.
    `spore_gmdl::parse`'s own output, because the byte order is not this crate's
    claim.
 
-2. **373 of 2 954 `raster` records in `Spore_Content.package` have a readable
-   envelope whose record length is not a multiple of the derived DXT5 layer
-   stride** — 306 at 256²/9 mips and 67 at 64²/7 mips — and `spore-texture`
-   refuses them. Their `field_18` says `0x40000` and `0x1000` respectively, i.e.
-   exactly two base levels, so the *records* believe there are two layers; it is
-   the derivation (or the "all layer headers first" layout assumption it encodes)
-   that does not close. `osptool stats` names every one of them:
+2. **The old raster layer model is gone, and `osptool` no longer reports it.**
+   The previous build charged 8 bytes per 4x4 block and divided the payload by
+   `16 + chain`, which is how it derived *two layers* for every DXT5 record — two
+   errors that cancelled exactly: a 16-byte block read at 8 bytes per block is two
+   half-pictures, and two of them make one picture. It refused 373 of the 2 954
+   `raster` records in `Spore_Content.package` for "payload bytes is not a multiple
+   of the 43720-byte layer stride", and `describe` printed a derived layer count of
+   2 with two identical-looking per-layer dimension lists.
 
-   ```
-   306  texture: 87436 payload bytes is not a multiple of the 43720-byte layer stride
-    67  texture: 5508 payload bytes is not a multiple of the 2760-byte layer stride
-   ```
+   **Fixed in `spore-texture`**, whose corpus measurement is the authority: one
+   chain, no layer headers, 16 bytes per block for DXT5 and 8 for DXT1, and
+   `field_18` as the base level's own byte count in all three formats. This crate's
+   job was to stop *reporting* the refuted model:
+
+   * `stats` no longer has a `raster layer splits` section — it could only print
+     `derived` — and its geometry histogram has no layer column;
+   * `describe` prints `mip chains 1` with the reason inline, says `field_18` is
+     read and checked (it used to say "UNRESOLVED, never read by any decoder" about
+     the field that gates every raster decode), and says `field_1c` is not a header
+     field at all in the 28-byte `0x15` header;
+   * `find`, `verify` and `verify --explain` print "one chain" rather than a
+     layer count;
+   * `texture --layer N` still exists, refuses `N != 0` by name, and says a raster
+     record is one chain.
+
+   `osptool stats SPORE/Data/Spore_Content.package --type 0x2f4e681c` now reports
+   `2954 raster decoded` with no refusal row, and `raster framing` closes on
+   2 954 of 2 954 on both axes.
 
 3. **All 132 dangling `gmdl->texture` references in `Spore_Content.package` name
    the same target**, `0x2f4e681c:0x00000000:0x552a5077` — group id `0`. Either

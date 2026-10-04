@@ -17,7 +17,7 @@ use spore_tools::{json, EXIT_OK};
 ///
 /// The point is to prove the explanation agrees with the tally on a sample, not
 /// to re-walk the corpus one record at a time.
-const SAMPLED: usize = 25;
+const SAMPLED: usize = 40;
 
 fn content_package() -> Option<PathBuf> {
     let path =
@@ -70,11 +70,12 @@ impl Drop for Scratch {
     }
 }
 
-/// The first `wanted` identities of `type_id`, in index order.
+/// Every identity of `type_id`, in index order.
 ///
-/// The `list` table is `idx type_id group_id instance stored memory comp`, so the
-/// identity is fields 1..4 and field 0 is the index-row ordinal, which is easy to
-/// mistake for one of them.
+/// `limit` `0` means every row. A prefix would be a bad sample: the first 40
+/// raster records of `Spore_Content.package` are all DXT5, and the formats are not
+/// interleaved in index order, so a prefix search for a DXT1 record can never
+/// find one however far it is extended.
 fn identities(package: &Path, type_id: u32, wanted: usize) -> Vec<String> {
     let (code, out, err) = run(vec![
         "list".to_owned(),
@@ -85,6 +86,12 @@ fn identities(package: &Path, type_id: u32, wanted: usize) -> Vec<String> {
         wanted.to_string(),
     ]);
     assert_eq!(code, EXIT_OK, "{err}");
+    identity_rows(&out)
+}
+
+/// The identities in a `list` table, which is
+/// `idx type_id group_id instance stored memory comp`.
+fn identity_rows(out: &str) -> Vec<String> {
     out.lines()
         .skip(2)
         .filter_map(|line| {
@@ -95,6 +102,26 @@ fn identities(package: &Path, type_id: u32, wanted: usize) -> Vec<String> {
             Some(format!("{}:{}:{}", parts[1], parts[2], parts[3]))
         })
         .collect()
+}
+
+/// A bounded, spread-out sample of `type_id`'s identities.
+///
+/// `[`first_record_of_fourcc`] probes at most `SAMPLED` records, so the sample has
+/// to cover the whole type rather than its first `SAMPLED` rows: the raster
+/// records are grouped by format in index order, so a prefix finds DXT5 and
+/// nothing else.
+fn sampled_identities(package: &Path, type_id: u32) -> Vec<String> {
+    let all = identities(package, type_id, 0);
+    if all.len() <= SAMPLED {
+        return all;
+    }
+    let stride = all.len().div_ceil(SAMPLED);
+    println!(
+        "probing {} of {type_id:#010x}'s {} record(s), one every {stride}",
+        all.len().div_ceil(stride),
+        all.len()
+    );
+    all.into_iter().step_by(stride).collect()
 }
 
 /// The first record of `type_id` in the package.
@@ -216,12 +243,216 @@ fn the_015_family_writes_a_png_whose_channels_are_the_swizzled_ones() {
     );
 }
 
-/// The first `raster` record whose envelope declares `fourcc`, found by asking
-/// `verify --explain` — bounded, so a package without such a record fails with a
-/// clear panic instead of walking 2 954 records.
+#[test]
+#[ignore = "needs SPORE/Data/Spore_Content.package"]
+fn every_raster_record_in_the_corpus_decodes_and_the_census_says_so() {
+    // The finding that refuted the two-layer reading, re-checked through the
+    // tool rather than through a probe: over the 2954 raster records of
+    // `Spore_Content.package` the framing identity closes on every one, `field_18`
+    // is the base level's byte count on every one, and every record decodes.
+    let Some(package) = content_package() else {
+        return;
+    };
+    let (code, out, err) = run(vec![
+        "stats".to_owned(),
+        package.display().to_string(),
+        "--type".to_owned(),
+        format!("{:#010x}", spore_texture::RASTER_TYPE),
+    ]);
+    assert_eq!(code, EXIT_OK, "{err}");
+
+    let walked: i64 = out
+        .lines()
+        .find_map(|line| line.strip_prefix("records walked "))
+        .and_then(|value| value.trim().parse().ok())
+        .expect("a walked count");
+
+    let section_rows = |title: &str, next: &str| -> Vec<(u64, String)> {
+        let body = out
+            .split_once(title)
+            .unwrap_or_else(|| panic!("no `{title}` section in:\n{out}"))
+            .1;
+        let body = body.split_once(next).map_or(body, |(head, _)| head);
+        body.lines()
+            .filter_map(|line| {
+                let rest = line.trim_start();
+                let count: u64 = rest.split_whitespace().next()?.parse().ok()?;
+                Some((count, rest[count.to_string().len()..].trim().to_owned()))
+            })
+            .collect()
+    };
+
+    let fourcc = section_rows("raster fourcc", "raster geometry");
+    let decoded: u64 = fourcc
+        .iter()
+        .filter(|(_, label)| label.ends_with("(decoded)"))
+        .map(|(count, _)| *count)
+        .sum();
+    assert_eq!(
+        decoded, walked as u64,
+        "every format in the corpus decodes, so the fourcc census must not hide a refusal: \
+         {fourcc:?}"
+    );
+    for (_, label) in &fourcc {
+        assert!(
+            !label.contains("refus"),
+            "a decodable format labelled refused is a confident falsehood: {label}"
+        );
+    }
+    // The block sizes, which are the numbers the refuted reading got wrong.
+    assert!(
+        fourcc.iter().any(
+            |(_, label)| label.contains("DXT5/BC3") && label.contains("16 bytes per 4x4 block")
+        ),
+        "{fourcc:?}"
+    );
+    assert!(
+        fourcc
+            .iter()
+            .any(|(_, label)| label.contains("DXT1/BC1") && label.contains("8 bytes per 4x4 block")),
+        "{fourcc:?}"
+    );
+
+    // The framing cross-check: two axes, both closed on every record.
+    let framing = section_rows("raster framing", "decodes  (one full decode");
+    assert_eq!(
+        framing
+            .iter()
+            .filter(|(_, label)| label == "record length: exact")
+            .map(|(count, _)| *count)
+            .sum::<u64>(),
+        walked as u64,
+        "the framing identity must close on every raster record: {framing:?}"
+    );
+    assert_eq!(
+        framing
+            .iter()
+            .filter(|(_, label)| label == "field_18: the base level's byte count")
+            .map(|(count, _)| *count)
+            .sum::<u64>(),
+        walked as u64,
+        "field_18 must be the base level's own byte count in all three formats: {framing:?}"
+    );
+
+    // No layer count anywhere: the refuted premise.
+    let geometry = section_rows("raster geometry", "raster framing");
+    assert!(
+        geometry.iter().all(|(_, label)| !label.contains("layer")),
+        "{geometry:?}"
+    );
+    for (count, label) in &fourcc {
+        println!("  {count:>5}  {label}");
+    }
+    println!("{walked} raster record(s): framing and field_18 both close on all of them");
+}
+
+#[test]
+#[ignore = "needs SPORE/Data/Spore_Content.package"]
+fn a_dxt1_record_in_the_corpus_decodes_as_bc1_and_is_written_verbatim() {
+    // The corpus holds 306 DXT1 records and this build used to name the format
+    // "present in the corpus, refused by name". This drives the whole command line
+    // on a real one: a 256x256 BC1 record is a colour image, it is written exactly
+    // as decoded, and its pixels are not the DXT5 alpha-mask signature.
+    let Some(package) = content_package() else {
+        return;
+    };
+    let Some(key) = first_record_of_fourcc(&package, spore_texture::DXT1_FOURCC) else {
+        panic!("the package must hold DXT1 raster records");
+    };
+    println!("{key} is a DXT1 record");
+    let scratch = Scratch::new("dxt1");
+    let out = scratch.file("dxt1.png");
+    let (code, stdout, stderr) = run(vec![
+        "texture".to_owned(),
+        package.display().to_string(),
+        key.clone(),
+        "--out".to_owned(),
+        out.display().to_string(),
+        "--json".to_owned(),
+    ]);
+    assert_eq!(code, EXIT_OK, "{stderr}");
+    let document = json::parse(&stdout).expect("valid JSON");
+    let json::Json::Obj(pairs) = &document else {
+        panic!("expected an object")
+    };
+    let get = |name: &str| {
+        pairs
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| panic!("no key {name}"))
+    };
+    assert_eq!(get("fourcc"), json::Json::from("0x31545844"));
+    assert_eq!(
+        get("channels"),
+        json::Json::from("stored"),
+        "a block format is never swizzled"
+    );
+
+    let bytes = std::fs::read(&out).expect("the png must exist");
+    let decoded = spore_tools::png::verify(&bytes).expect("the file must be a valid PNG");
+    assert_eq!(get("width"), json::Json::from(decoded.width));
+    assert_eq!(get("height"), json::Json::from(decoded.height));
+    assert_eq!(
+        decoded.pixels.len(),
+        (decoded.width * decoded.height * 4) as usize
+    );
+
+    // BC1 has no alpha channel, so every texel is opaque. That alone separates
+    // this decode from the DXT5 alpha-mask signature, and it is checkable without
+    // deciding what the picture depicts.
+    let opaque = decoded
+        .pixels
+        .chunks_exact(4)
+        .filter(|texel| texel[3] == 255)
+        .count();
+    let total = (decoded.width * decoded.height) as usize;
+    assert_eq!(
+        opaque, total,
+        "BC1 carries no alpha, so every texel must be written A=255"
+    );
+    // And it is a real colour image, not a two-value mask: a synthetic ramp would
+    // be one texel repeated, and this decode is thousands of distinct values.
+    let mut distinct = std::collections::HashSet::new();
+    for texel in decoded.pixels.chunks_exact(4) {
+        distinct.insert([texel[0], texel[1], texel[2], texel[3]]);
+    }
+    println!(
+        "{key}: {total} texels, {} distinct RGBA values",
+        distinct.len()
+    );
+    assert!(
+        distinct.len() > 64,
+        "a BC1 colour image is not a two-value mask: {} distinct values",
+        distinct.len()
+    );
+
+    // `--channels stored` must be byte-identical for a format that is never
+    // swizzled.
+    let raw = scratch.file("dxt1-stored.png");
+    let (code, _stdout, stderr) = run(vec![
+        "texture".to_owned(),
+        package.display().to_string(),
+        key.clone(),
+        "--out".to_owned(),
+        raw.display().to_string(),
+        "--channels".to_owned(),
+        "stored".to_owned(),
+    ]);
+    assert_eq!(code, EXIT_OK, "{stderr}");
+    assert_eq!(
+        std::fs::read(&raw).unwrap(),
+        bytes,
+        "`auto` and `stored` are the same bytes for a BC1 record"
+    );
+}
+
+/// A record of `type_id` whose envelope declares `fourcc`, found by asking
+/// `verify --explain` over a bounded, spread-out sample — so a format this package
+/// holds is always findable, and a package without such a record fails with a clear
+/// panic instead of walking every raster record.
 fn first_record_of_fourcc(package: &Path, fourcc: u32) -> Option<String> {
-    const TRIED: usize = 40;
-    for key in identities(package, spore_texture::RASTER_TYPE, TRIED) {
+    for key in sampled_identities(package, spore_texture::RASTER_TYPE) {
         let (code, out, err) = run(vec![
             "verify".to_owned(),
             package.display().to_string(),

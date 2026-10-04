@@ -17,6 +17,7 @@
 //! | `groups` | the index | the type table |
 //! | `raster fourcc` | the first 32 bytes of each raster record | those records |
 //! | `raster geometry` | the same 32 bytes | those records |
+//! | `raster framing` | the record length and `field_18`, against the framing identity | those records |
 //! | `decodes` | a full decode of each record of a decodable type | those records |
 //! | `gmdl walk` | `spore_gmdl::parse_recovering` on each gmdl record | those records |
 //! | `texture-set sizes` | the same recovering walk | those records |
@@ -25,12 +26,35 @@
 //! about the index, and one in `decodes` is about bytes that were actually
 //! decoded. Neither is printed as the other.
 //!
+//! # `raster framing`, and the premise it replaced
+//!
+//! This command used to print a `raster layer splits` section whose rows were
+//! either `derived` or the exact layer-split refusal, and a geometry histogram
+//! keyed on a *derived* layer count. **A corpus byte count refuted both.** There
+//! is no layer count in a raster record: every raster record measured is one
+//! chain of mip levels, so the "split" closed on 2 954 of 2 954 records and the
+//! section could print nothing but `derived`.
+//!
+//! What replaced it is the measurement that refuted it, so it is reproducible
+//! from this tool rather than asserted in a comment:
+//!
+//! * **`record length`** — the record is exactly as long as
+//!   `framing::record_size(fourcc, width, height, mip_count)` requires. That
+//!   identity is *determined*, not approximate, which is why a disagreement is a
+//!   refusal with both numbers rather than a remainder.
+//! * **`field_18`** — the header word equals the base level's own byte count, in
+//!   all three formats. It read as "format-specific" before only because the
+//!   block size was wrong.
+//!
+//! A record whose fourcc has no frame gets its own row, because a format this
+//! build cannot frame is an **absence**, not a refusal.
+//!
 //! # Unavailable is not zero
 //!
 //! A raster record too short to hold an envelope is counted under
-//! `fourcc <unreadable>` with its own row, not silently dropped from the census
-//! and not folded into `DXT5`. A gmdl record whose walk stops before the mesh
-//! table is counted as a failure with the decoder's own words attached. Every
+//! `fourcc <envelope unreadable>` with its own row, not silently dropped from the
+//! census and not folded into `DXT5`. A gmdl record whose walk stops before the
+//! mesh table is counted as a failure with the decoder's own words attached. Every
 //! section therefore covers every record it claims to cover, and where a count is
 //! genuinely not applicable the section says so rather than printing `0`.
 //!
@@ -64,13 +88,11 @@ pub const DEFAULT_ROW_LIMIT: usize = 40;
 ///
 /// Three states, kept apart because collapsing them invents data:
 ///
-/// * `Shape` — the envelope was read. `layers` is `Some` when the derived layer
-///   split closed, and `None` when it did not; `split` then says why, in the
-///   crate's own words.
+/// * `Shape` — the envelope was read, so a fourcc and three geometry words exist.
 /// * `Short` — the record is shorter than a 32-byte envelope, so no fourcc and no
 ///   geometry exist to report at all.
 ///
-/// # Why a refused split still appears in the censuses
+/// # Why a refused framing still appears in the censuses
 ///
 /// The fourcc and the three geometry words come *out of the envelope*, so they
 /// are established even when the record length does not match the framing the
@@ -78,8 +100,13 @@ pub const DEFAULT_ROW_LIMIT: usize = 40;
 /// the census cover fewer records than the type histogram says exist — a silent
 /// hole in the very numbers this command exists to produce, and one the first run
 /// over the real corpus opened: 373 of 2 954 `raster` records in
-/// `Spore_Content.package` are exactly this case. So they are counted, with
-/// `layers` unavailable and the refusal reported by name in its own section.
+/// `Spore_Content.package` were exactly this case. So they are counted, with the
+/// disagreement reported by name in the `raster framing` section.
+///
+/// That hole is now closed at the source rather than papered over here: the
+/// framing is correct, so the refusal is gone too. The property above is
+/// therefore no longer observable in the corpus, and is instead pinned by a
+/// synthetic record whose length deliberately disagrees with its own envelope.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RasterReading {
     /// The envelope was read.
@@ -92,10 +119,8 @@ enum RasterReading {
         height: u32,
         /// Offset `0x0c`.
         mips: u32,
-        /// Derived from the record size, or `None` when no rule closed.
-        layers: Option<usize>,
-        /// `derived`, or the exact refusal.
-        split: String,
+        /// The framing cross-check, keyed by label in the census.
+        framing: Vec<(&'static str, String)>,
     },
     /// The record is shorter than a 32-byte envelope.
     Short,
@@ -112,12 +137,18 @@ pub struct Census {
     pub groups: BTreeMap<u32, u64>,
     /// Raster fourcc to record count, `None` when the envelope was not read.
     pub fourcc: BTreeMap<Option<u32>, u64>,
-    /// `(width, height, mip_count, layers)` to raster record count. `layers` is
-    /// `None` when no layer-count rule closed, which is a non-finding rather than
-    /// a count of zero. See [`raster_splits`] for why.
-    pub raster_geometry: BTreeMap<(u32, u32, u32, Option<usize>), u64>,
-    /// `derived`, or the exact layer-split refusal, to record count.
-    pub raster_splits: BTreeMap<String, u64>,
+    /// `(width, height, mip_count)` to raster record count. There is **no**
+    /// layer-count column, because a raster record has no layer count and none
+    /// is derived; see the module documentation for the refutation.
+    pub raster_geometry: BTreeMap<(u32, u32, u32), u64>,
+    /// Which framing cross-check, and with what outcome, to record count.
+    ///
+    /// Keys are the cross-check's name and a verdict: `("record length", "exact")`
+    /// when the record is exactly as long as its own envelope implies, or the
+    /// decoder's own words when it is not. Two axes rather than one map, because
+    /// "the identity closes" and "`field_18` is the base level's byte count" are
+    /// two independent claims and a single verdict would let one hide the other.
+    pub raster_framing: BTreeMap<(String, String), u64>,
     /// `(class name, outcome)` to count, where outcome is the decoder's message
     /// or `"decoded"`.
     ///
@@ -211,15 +242,19 @@ fn walk_record(entry: &DbpfEntry, image: &[u8], census: &mut Census) {
                     width,
                     height,
                     mips,
-                    layers,
-                    split,
+                    framing,
                 }) => {
                     *census.fourcc.entry(Some(fourcc)).or_insert(0) += 1;
                     *census
                         .raster_geometry
-                        .entry((width, height, mips, layers))
+                        .entry((width, height, mips))
                         .or_insert(0) += 1;
-                    *census.raster_splits.entry(split).or_insert(0) += 1;
+                    for (check, verdict) in framing {
+                        *census
+                            .raster_framing
+                            .entry((check.to_owned(), verdict))
+                            .or_insert(0) += 1;
+                    }
                 }
                 Ok(RasterReading::Short) => {
                     // Read and counted: the envelope was not there. Not a
@@ -373,19 +408,24 @@ fn extract(entry: &DbpfEntry, image: &[u8]) -> Result<Vec<u8>, String> {
     spore_dbpf::extract_record(image, entry).map_err(|error| error.to_string())
 }
 
-/// Reads a raster record's envelope and derives its layer count.
+/// Reads a raster record's envelope and runs the two framing cross-checks.
 ///
-/// Two different reasons produce `layers: None`, and
-/// [`RasterReading::Shape::split`] keeps them apart:
+/// # The two checks, and why they are separate
 ///
-/// * the fourcc has **no** layer-count rule in this build (`DXT1`) — not a
-///   failure, just no rule, so `split` says exactly that;
-/// * the rule exists and **refused**, which is a per-record disagreement between
-///   the record's length and the framing its own envelope implies, and is
-///   reported with the crate's words.
+/// * **Record length.** `framing::record_size(frame, width, height, mip_count)`
+///   *determines* the record's length — header, bare base level, bare level 1 for
+///   the block formats, then a `u32` count and that many bytes for every level
+///   from [`FrameFormat::first_prefixed_level`] on. So a record that differs is a
+///   record whose framing this build does not understand, and the refusal names
+///   both numbers.
+/// * **`field_18`.** The header word is the base level's own byte count in all
+///   three formats. Checked separately, because "the length closes" and "the
+///   header agrees with the length" are independent claims and a single verdict
+///   would let one mask the other.
 ///
-/// Neither is `0` layers: the record has layers, and this workspace cannot say
-/// how many.
+/// A `fourcc` with **no** frame is not a refusal: it is a format this build
+/// cannot frame, which is an absence, and it gets its own row rather than being
+/// folded into either check.
 fn read_raster(entry: &DbpfEntry, image: &[u8]) -> Result<RasterReading, String> {
     let bytes = extract(entry, image)?;
     let envelope = match spore_texture::parse_envelope(&bytes) {
@@ -395,21 +435,52 @@ fn read_raster(entry: &DbpfEntry, image: &[u8]) -> Result<RasterReading, String>
         }
         Err(error) => return Err(error.to_string()),
     };
-    let (layers, split) = match spore_texture::layer_count_for(bytes.len(), &envelope) {
-        Ok(layers) => (Some(layers), "derived".to_owned()),
-        Err(spore_texture::TextureError::UnsupportedFourcc { fourcc }) => (
-            None,
-            format!("no layer-count rule for fourcc {fourcc:#010x}"),
-        ),
-        Err(error) => (None, error.to_string()),
-    };
+
+    let mut framing = Vec::with_capacity(2);
+    // The record-length verdict is the crate's own, including its zero-dimension
+    // and zero-mip-count refusals: re-deriving them here would be a second,
+    // weaker copy of the geometry check this section exists to reproduce.
+    framing.push((
+        "record length",
+        match spore_texture::layer_count_for(bytes.len(), &envelope) {
+            // `layer_count_for` answers a chain count, which is not the question
+            // any more — there is one chain and it is not derived. What it still
+            // owns is the framing identity, so only that verdict is kept.
+            Ok(_) => "exact".to_owned(),
+            Err(spore_texture::TextureError::UnsupportedFourcc { .. }) => format!(
+                "no framing rule for fourcc {:#010x} (an absence, not a refusal)",
+                envelope.fourcc
+            ),
+            Err(error) => error.to_string(),
+        },
+    ));
+
+    if let Some(frame) = spore_texture::frame_for(envelope.fourcc) {
+        // `field_18` is only comparable when the base level is addressable as a
+        // `u32`, which is every record the corpus holds; a base level above
+        // `u32::MAX` bytes has already been refused as a size mismatch, and
+        // reporting it as a `field_18` failure would name the wrong problem.
+        let base = spore_texture::framing::level_size(frame, envelope.width, envelope.height, 0);
+        framing.push((
+            "field_18",
+            match u32::try_from(base) {
+                Ok(base) if base == envelope.field_18 => "the base level's byte count".to_owned(),
+                Ok(base) => format!(
+                    "declares {} where the base level needs {base}",
+                    envelope.field_18
+                ),
+                Err(_) => {
+                    format!("base level of {base} bytes does not fit a u32 header word")
+                }
+            },
+        ));
+    }
     Ok(RasterReading::Shape {
         fourcc: envelope.fourcc,
         width: envelope.width,
         height: envelope.height,
         mips: envelope.mip_count,
-        layers,
-        split,
+        framing,
     })
 }
 
@@ -485,34 +556,37 @@ fn write_report(
 
     write_section(
         out,
-        "raster geometry  (width x height x mip_count x derived layers)",
+        "raster geometry  (width x height x mip_count, all three read from the envelope;\n             there is no layer count in a raster record and none is derived)",
         ranked(
             census
                 .raster_geometry
                 .iter()
-                .map(|((width, height, mips, layers), count)| {
-                    (
-                        format!(
-                            "{width}x{height} mips={mips} layers={}",
-                            layers.map_or_else(|| "unavailable".to_owned(), |n| n.to_string())
-                        ),
-                        *count,
-                    )
+                .map(|((width, height, mips), count)| {
+                    (format!("{width}x{height} mips={mips}"), *count)
                 }),
         ),
         0,
     )?;
 
+    // The corpus measurement that refuted the two-layer reading, made
+    // reproducible here instead of asserted in a comment. Capped like `decodes`,
+    // because a refusal carries a record-specific length.
+    //
+    // The title names the *identity* rather than a frozen count: the rows below it
+    // carry whatever this package holds, and a caption that pinned "2954 of 2954"
+    // would be a second place to go stale the moment the corpus did. The count that
+    // established the rule is recorded in `docs/RASTER-FRAMING.md` and in this
+    // crate's module documentation.
     write_section(
         out,
-        "raster layer splits  (why `layers=unavailable` above)",
+        "raster framing  (record length vs framing::record_size, and field_18 vs the base\n             level's own byte count \u{2014} the cross-check that refuted the derived\n             layer count; both axes closed on every raster record of this scope is\n             the expected reading, and anything else is named here in full)",
         ranked(
             census
-                .raster_splits
+                .raster_framing
                 .iter()
-                .map(|(split, count)| (split.clone(), *count)),
+                .map(|((check, verdict), count)| (format!("{check}: {verdict}"), *count)),
         ),
-        0,
+        request.limit,
     )?;
 
     // Capped, unlike the small censuses above: a decoder message can carry a
@@ -630,15 +704,20 @@ fn group_label(group_id: u32) -> String {
     }
 }
 
-/// A fourcc in the words the corpus supports.
+/// A fourcc in the words the corpus supports, with the decode verdict attached.
+///
+/// The wording is [`super::describe_format`]'s, plus whether this build decodes
+/// it — which today is true of every format the corpus contains. The block size
+/// is in every label because it is the load-bearing number: the whole "two
+/// layers" reading was 8 bytes charged per 4x4 block where DXT5 holds 16.
 fn fourcc_label(fourcc: u32) -> String {
-    match fourcc {
-        spore_texture::DXT5_FOURCC => format!("{fourcc:#010x} DXT5 (decoded)"),
-        spore_texture::LUMINANCE_FOURCC => {
-            format!("{fourcc:#010x} 0x15 normal-map family (decoded)")
-        }
-        0x3154_5844 => format!("{fourcc:#010x} DXT1 (present in the corpus, refused by name)"),
-        other => format!("{other:#010x} (no decoder names this format)"),
+    if spore_texture::frame_for(fourcc).is_some() {
+        format!("{} (decoded)", super::describe_format(fourcc))
+    } else {
+        format!(
+            "{} \u{2014} not decoded by this build",
+            super::describe_format(fourcc)
+        )
     }
 }
 
@@ -722,27 +801,26 @@ fn census_json(census: &Census) -> Json {
                 census
                     .raster_geometry
                     .iter()
-                    .map(|((width, height, mips, layers), count)| {
+                    .map(|((width, height, mips), count)| {
                         Json::obj()
                             .push("width", Json::from(*width))
                             .push("height", Json::from(*height))
                             .push("mip_count", Json::from(*mips))
-                            // `null` for a fourcc with no layer-count rule, not 0.
-                            .push("layers", Json::from(*layers))
                             .push("count", Json::from(*count))
                     })
                     .collect(),
             ),
         )
         .push(
-            "raster_splits",
+            "raster_framing",
             Json::Arr(
                 census
-                    .raster_splits
+                    .raster_framing
                     .iter()
-                    .map(|(split, count)| {
+                    .map(|((check, verdict), count)| {
                         Json::obj()
-                            .push("split", split.clone())
+                            .push("check", check.clone())
+                            .push("verdict", verdict.clone())
                             .push("count", Json::from(*count))
                     })
                     .collect(),
@@ -891,14 +969,70 @@ mod tests {
     }
 
     #[test]
-    fn a_fourcc_label_only_names_formats_the_repository_has_a_word_for() {
-        assert!(fourcc_label(spore_texture::DXT5_FOURCC).contains("DXT5 (decoded)"));
-        assert!(fourcc_label(spore_texture::LUMINANCE_FOURCC).contains("normal-map"));
-        // DXT1 is present in the corpus and deliberately not decoded: the label
-        // must say so rather than reading like a format this build handles.
-        assert!(fourcc_label(0x3154_5844).contains("refused by name"));
-        // Anything else gets no name at all.
-        assert!(fourcc_label(0xdead_beef).contains("no decoder names this format"));
+    fn a_fourcc_label_names_every_format_the_corpus_has_and_refuses_none_of_them() {
+        // The corpus refuted the old premise. All three fourcc values present in
+        // `Spore_Content.package` decode, so a label calling any of them
+        // "refused" is a confident falsehood and this asserts against one.
+        for fourcc in [
+            spore_texture::DXT5_FOURCC,
+            spore_texture::DXT1_FOURCC,
+            spore_texture::LUMINANCE_FOURCC,
+        ] {
+            let label = fourcc_label(fourcc);
+            assert!(label.contains("decoded"), "{fourcc:#010x}: {label}");
+            assert!(
+                !label.contains("refus"),
+                "a decodable format must not be labelled refused: {label}"
+            );
+        }
+        // The block sizes are the load-bearing numbers, and they are the ones the
+        // refuted reading got wrong: DXT5 is 16 bytes per 4x4 block.
+        assert!(fourcc_label(spore_texture::DXT5_FOURCC).contains("16 bytes per 4x4 block"));
+        assert!(fourcc_label(spore_texture::DXT1_FOURCC).contains("8 bytes per 4x4 block"));
+        assert!(fourcc_label(spore_texture::LUMINANCE_FOURCC).contains("four bytes per texel"));
+        // Anything with no framing rule gets no decode claim at all, and the
+        // absence is worded as an absence rather than as a verdict on the record.
+        let unknown = fourcc_label(0xdead_beef);
+        assert!(unknown.contains("no measured framing rule"), "{unknown}");
+        assert!(!unknown.contains("(decoded)"), "{unknown}");
+    }
+
+    #[test]
+    fn the_geometry_histogram_has_no_layer_column_to_be_wrong_about() {
+        // There is no layer count in a raster record, so there is nothing to
+        // render as `layers=unavailable` — and nothing to render as `layers=1`
+        // either, which would be a measurement of a field that does not exist.
+        let mut census = Census::default();
+        census.raster_geometry.insert((512, 512, 10), 2);
+        census
+            .raster_framing
+            .insert(("record length".to_owned(), "exact".to_owned()), 2);
+        census.raster_framing.insert(
+            (
+                "field_18".to_owned(),
+                "the base level's byte count".to_owned(),
+            ),
+            2,
+        );
+        let Json::Arr(rows) = census_json(&census).pipe_key("raster_geometry") else {
+            panic!("expected an array")
+        };
+        let Json::Obj(row) = &rows[0] else {
+            panic!("expected an object")
+        };
+        let keys: Vec<&str> = row.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, vec!["width", "height", "mip_count", "count"]);
+        assert!(
+            !row.iter().any(|(k, _)| k.contains("layer")),
+            "a derived layer count is the refuted premise: {keys:?}"
+        );
+
+        // The framing section is a measurement, not a status line: both axes are
+        // present, each with its own count.
+        let Json::Arr(checks) = census_json(&census).pipe_key("raster_framing") else {
+            panic!("expected an array")
+        };
+        assert_eq!(checks.len(), 2, "{checks:?}");
     }
 
     #[test]
@@ -919,20 +1053,43 @@ mod tests {
     }
 
     #[test]
-    fn a_fourcc_with_no_layer_rule_reports_layers_as_null_not_zero() {
+    fn a_fourcc_with_no_framing_rule_is_censused_and_labelled_an_absence() {
+        // A record whose envelope is readable but whose format this build cannot
+        // frame. Its fourcc and geometry are still established by the envelope, so
+        // it is counted; the framing section records the absence.
         let mut census = Census::default();
-        census.raster_geometry.insert((512, 512, 10, None), 2);
-        let Json::Arr(rows) = census_json(&census).pipe_key("raster_geometry") else {
+        census.fourcc.insert(Some(0xdead_beef), 1);
+        census.raster_geometry.insert((4, 4, 1), 1);
+        census.raster_framing.insert(
+            (
+                "record length".to_owned(),
+                "no framing rule for fourcc 0xdeadbeef (an absence, not a refusal)".to_owned(),
+            ),
+            1,
+        );
+        let document = census_json(&census);
+        let Json::Arr(rows) = document.clone().pipe_key("raster_fourcc") else {
             panic!("expected an array")
         };
         let Json::Obj(row) = &rows[0] else {
             panic!("expected an object")
         };
-        assert_eq!(
-            row.iter().find(|(k, _)| k == "layers").map(|(_, v)| v),
-            Some(&Json::Null),
-            "`None` layers is a non-finding, and 0 layers is a false claim"
+        let label = row
+            .iter()
+            .find(|(k, _)| k == "label")
+            .map(|(_, v)| v.clone())
+            .expect("a label");
+        assert_eq!(label, Json::from(fourcc_label(0xdead_beef)));
+        assert!(
+            !label.to_string().contains("refused"),
+            "an absent framing rule is not a refusal of the record: {label}"
         );
+        // No `field_18` verdict for a format this build cannot size: there is no
+        // base level to compare against, and inventing one would be the old bug.
+        let Json::Arr(checks) = document.pipe_key("raster_framing") else {
+            panic!("expected an array")
+        };
+        assert_eq!(checks.len(), 1, "{checks:?}");
     }
 
     #[test]
@@ -947,6 +1104,8 @@ mod tests {
         // The geometry census covers only the records whose envelope was read,
         // which is why it is a separate map and not a derived one.
         assert!(census.raster_geometry.is_empty());
+        // And a record with no envelope has no framing to cross-check.
+        assert!(census.raster_framing.is_empty());
     }
 
     #[test]

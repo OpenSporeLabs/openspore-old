@@ -31,7 +31,7 @@ fn mixed_package() -> Vec<u8> {
             spore_texture::RASTER_TYPE,
             3,
             1,
-            synthetic_raster(16, 16, 2, 1),
+            synthetic_raster(16, 16, 2),
         ),
         Row::new(spore_texture::RASTER_TYPE, 3, 2, vec![0u8; 40]),
         // Container: never read, whatever its payload says.

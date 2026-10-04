@@ -119,7 +119,7 @@ fn flipping_and_truncating_the_rw4_never_panics() {
 
 #[test]
 fn a_synthetic_raster_survives_flipping_and_truncation() {
-    let raster = synthetic_raster(16, 16, 3, 1);
+    let raster = synthetic_raster(16, 16, 3);
     for at in (0..raster.len()).step_by(3) {
         let mut bytes = raster.clone();
         bytes[at] ^= 0x7F;
@@ -223,7 +223,7 @@ fn a_record_claiming_an_absurd_size_is_refused_rather_than_allocating() {
 fn an_extreme_raster_header_is_refused_rather_than_allocated() {
     // A header claiming 0xFFFFFFFF texels and a huge mip count must be an error,
     // not an enormous allocation.
-    let mut raster = synthetic_raster(4, 4, 1, 1);
+    let mut raster = synthetic_raster(4, 4, 1);
     raster[4..8].copy_from_slice(&u32::MAX.to_le_bytes()); // width
     raster[8..12].copy_from_slice(&u32::MAX.to_le_bytes()); // height
     raster[12..16].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // mip_count

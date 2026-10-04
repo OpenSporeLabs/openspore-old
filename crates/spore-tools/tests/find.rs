@@ -110,20 +110,27 @@ fn a_present_record_that_does_not_decode_still_exits_zero() {
 }
 
 #[test]
-fn a_raster_that_decodes_reports_its_dimensions() {
+fn a_raster_that_decodes_reports_its_dimensions_and_one_chain() {
+    // The corpus refuted the two-layer reading, so the summary states the chain
+    // count that is actually established — one — and says "one chain" rather than
+    // quoting a derived layer count of 2.
     let image = common::package_of(&[Row::new(
         spore_texture::RASTER_TYPE,
         0x4066_2900,
         0x067a_0901,
-        synthetic_raster(32, 16, 3, 1),
+        synthetic_raster(32, 16, 3),
     )]);
     let file = common::temp_package("find-raster", &image);
     let path = file.path().display().to_string();
     let (code, out, _err) = osptool(&["find", &path, "0x2f4e681c:0x40662900:0x067a0901"]);
     assert_eq!(code, EXIT_OK);
     assert!(out.contains("decode        decoded"), "{out}");
-    assert!(out.contains("raster 32x16"), "{out}");
-    assert!(out.contains("1 layer(s)"), "{out}");
+    assert!(out.contains("raster 32x16 base level"), "{out}");
+    assert!(out.contains("3 mip level(s) in one chain"), "{out}");
+    assert!(
+        !out.contains("2 layer(s)"),
+        "the derived two-layer count is the refuted premise: {out}"
+    );
 }
 
 #[test]

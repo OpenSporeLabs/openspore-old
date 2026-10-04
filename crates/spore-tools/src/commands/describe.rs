@@ -508,22 +508,36 @@ fn type_code_names(code: u32) -> String {
     }
 }
 
-/// The raster summary. Envelope, then the *derived* layer count, then the
-/// decoded per-layer mip dimensions.
+/// The raster summary. Envelope, then the mip chain, then the decoded per-level
+/// mip dimensions.
+///
+/// # The words here were wrong twice, and the corpus is why
+///
+/// * `field_18` used to be printed `UNRESOLVED (never read by any decoder)`. It
+///   **is** read: it is the base level's own byte count in all three formats
+///   (2954 of 2954 raster records in `Spore_Content.package`, 1432 of 1432 in
+///   `Spore_EP1_Content_01.package`), and `decode_raster` refuses a record whose
+///   header disagrees with its own geometry. Printing "never read" about a field
+///   that gates every decode was the false half of a bigger error.
+/// * `field_1c` used to be printed "format-specific per the oracle". In the
+///   **28-byte** `0x15` header it is not a field at all: those bytes are the first
+///   texel of the base level, which is why a real `0x15` record shows
+///   `0x008080ff` there — the corpus's own flat normal `(255, 128, 128, 0)`.
+///
+/// The layer line is gone for the same reason: there is one chain, and calling
+/// its count "derived" described a derivation the corpus refuted.
 fn write_raster(out: &mut dyn Write, image: &spore_texture::RasterImage) -> Result<(), ToolError> {
     let envelope = &image.envelope;
     writeln!(
         out,
-        "decoder: raster (decoded \u{2014} DXT5 texels of every mip of every layer)"
+        "decoder: raster (decoded \u{2014} the record's single mip chain, every level)"
     )?;
     writeln!(out, "  envelope")?;
     writeln!(out, "    version         {}", envelope.version)?;
     writeln!(out, "    width           {}", envelope.width)?;
     writeln!(out, "    height          {}", envelope.height)?;
     writeln!(out, "    mip count       {}", envelope.mip_count)?;
-    // These three are the fields `spore_texture` refuses to interpret. They are
-    // printed with that refusal attached, because a raw number with no verdict
-    // reads as "understood".
+    // `field_10` is still unresolved: observed `8` on every record, never read.
     writeln!(
         out,
         "    field_10        0x{:08x} UNRESOLVED (never read by any decoder; carried verbatim)",
@@ -531,41 +545,43 @@ fn write_raster(out: &mut dyn Write, image: &spore_texture::RasterImage) -> Resu
     )?;
     writeln!(
         out,
-        "    fourcc          0x{:08x} ({})",
-        envelope.fourcc,
-        fourcc_text(envelope.fourcc)
+        "    fourcc          {}",
+        super::describe_format(envelope.fourcc)
     )?;
+    // Read, checked, and the reason this decode was allowed to proceed at all:
+    // reaching this line means the header word and the geometry agreed.
     writeln!(
         out,
-        "    field_18        0x{:08x} UNRESOLVED (never read by any decoder; carried verbatim)",
+        "    field_18        0x{:08x} the base level's byte count \u{2014} re-read and checked against the\n                     geometry, and this record is only decoded because they agreed",
         envelope.field_18
     )?;
     writeln!(
         out,
-        "    field_1c        0x{:08x} format-specific per the oracle; carried verbatim, never used to select a decode",
-        envelope.field_1c
+        "    field_1c        0x{:08x} {}",
+        envelope.field_1c,
+        field_1c_text(envelope.fourcc)
     )?;
     writeln!(
         out,
-        "  derived layers    {} (derived from the record size \u{2014} the record stores no layer count)",
+        "  mip chains      {} (every raster record measured is one chain; a raster record has no\n                   layer count and none is derived \u{2014} the \"two layers\" reading was 8\n                   bytes charged per 4x4 block where DXT5 holds 16)",
         image.layers.len()
     )?;
     for (layer_index, layer) in image.layers.iter().enumerate() {
-        writeln!(out, "    layer {layer_index} ({})", dimensions(layer))?;
+        writeln!(out, "    chain {layer_index} ({})", dimensions(layer))?;
     }
     Ok(())
 }
 
-/// `DXT5` for the one format this build decodes, and the raw word otherwise.
+/// What the word at `0x1c` is, for one format.
 ///
-/// `spore_texture` refuses any other fourcc by name, so this line can only ever
-/// print `DXT5` -- but the helper stays total so a future call site that reads a
-/// raw envelope cannot accidentally print a bare number where a verdict belongs.
-fn fourcc_text(fourcc: u32) -> String {
-    if fourcc == spore_texture::DXT5_FOURCC {
-        "DXT5".to_owned()
+/// A total function over the three frames, because a word that means "the first
+/// texel of the payload" in one format and "an unestablished metadata word" in
+/// another must not be labelled the same way in both.
+fn field_1c_text(fourcc: u32) -> &'static str {
+    if fourcc == spore_texture::LUMINANCE_FOURCC {
+        "is NOT a header field: the 0x15 header is 28 bytes, so these four bytes are the first\n                   texel of the base level (a flat normal reads 0x008080ff here)"
     } else {
-        format!("0x{fourcc:08x}")
+        "carried verbatim; never used to select a decode and no meaning established"
     }
 }
 

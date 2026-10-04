@@ -128,9 +128,78 @@ pub fn compression_text(entry: &DbpfEntry) -> String {
     }
 }
 
+/// Renders a raster `fourcc` in the words the corpus supports.
+///
+/// One definition for `describe`, `stats` and `texture`, because three copies of
+/// a format vocabulary is three chances for one of them to keep calling a
+/// decodable format "refused" — which is exactly the stale label that a corpus
+/// byte count forced out of this crate: `0x31545844` used to be described as
+/// present-but-refused here while `spore_texture` decoded all 306 of its corpus
+/// records as BC1.
+///
+/// The trailing clause is the block size, because it is the number the old
+/// reading got wrong: `DXT5` is **16** bytes per 4x4 block (BC3), `DXT1` is
+/// **8** (BC1), and the `0x15` family has no blocks at all.
+///
+/// A fourcc with no measured framing is rendered as the bare word plus the
+/// statement that this build has no rule for it. That is an **absence**, and it
+/// is worded as one rather than as a refusal of the record.
+pub fn describe_format(fourcc: u32) -> String {
+    match spore_texture::frame_for(fourcc) {
+        Some(frame) if frame.block_bytes == spore_texture::framing::BYTES_PER_TEXEL => {
+            format!(
+                "{fourcc:#010x} {} \u{2014} uncompressed, four bytes per texel",
+                codec_name(fourcc)
+            )
+        }
+        Some(frame) => format!(
+            "{fourcc:#010x} {} \u{2014} {} bytes per 4x4 block",
+            codec_name(fourcc),
+            frame.block_bytes
+        ),
+        None => {
+            format!("{fourcc:#010x} (this build has no measured framing rule for it)")
+        }
+    }
+}
+
+/// The codec a raster format decodes as, in the vocabulary of the reference
+/// specifications rather than Spore's spelling of it.
+pub fn codec_name(fourcc: u32) -> &'static str {
+    match fourcc {
+        spore_texture::DXT5_FOURCC => "DXT5/BC3",
+        spore_texture::DXT1_FOURCC => "DXT1/BC1",
+        _ => "the 0x15 family",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_corpus_raster_format_is_named_and_no_one_of_them_is_refused() {
+        // The refutation: all three fourcc values in the corpus decode, so no
+        // label here may say "refused" or "not decoded".
+        for (fourcc, expected) in [
+            (spore_texture::DXT5_FOURCC, "DXT5/BC3"),
+            (spore_texture::DXT1_FOURCC, "DXT1/BC1"),
+            (spore_texture::LUMINANCE_FOURCC, "0x15"),
+        ] {
+            let text = describe_format(fourcc);
+            assert!(text.contains(expected), "{fourcc:#010x}: {text}");
+            assert!(
+                !text.contains("refus") && !text.contains("not decoded"),
+                "{fourcc:#010x} decodes; a label calling it refused is false: {text}"
+            );
+        }
+        // The two block sizes are the load-bearing numbers.
+        assert!(describe_format(spore_texture::DXT5_FOURCC).contains("16 bytes per 4x4 block"));
+        assert!(describe_format(spore_texture::DXT1_FOURCC).contains("8 bytes per 4x4 block"));
+        // A fourcc with no rule is an absence, worded as one.
+        let unknown = describe_format(0xdead_beef);
+        assert!(unknown.contains("no measured framing rule"), "{unknown}");
+    }
 
     #[test]
     fn a_type_renders_with_its_canonical_name_or_without_one() {

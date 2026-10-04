@@ -273,7 +273,19 @@ fn the_rw4_summary_prints_the_oracle_describe_string_verbatim() {
 }
 
 #[test]
-fn the_raster_summary_labels_the_unresolved_envelope_fields() {
+fn the_raster_summary_labels_the_envelope_fields_by_what_is_actually_known_of_them() {
+    // Rewritten after the corpus refuted the old framing. Three lines changed, and
+    // each was a statement the crate could no longer support:
+    //
+    // * `field_18` used to print `UNRESOLVED (never read by any decoder)`. It IS
+    //   read: it is the base level's byte count in all three formats, and
+    //   `decode_raster` refuses a record whose header disagrees with its geometry.
+    //   Printing "never read" about the field that gates every decode was false.
+    // * `field_1c` used to print "format-specific per the oracle". In the 28-byte
+    //   `0x15` header it is not a field at all; for the block formats no meaning
+    //   has been established. "No meaning established" is what it now says.
+    // * The line called `derived layers` described a derivation the corpus refuted:
+    //   there is one chain per record and no layer count to derive.
     let image = raster_package();
     let file = common::temp_package("describe-raster", &image);
     let path = file.path().display().to_string();
@@ -285,26 +297,84 @@ fn the_raster_summary_labels_the_unresolved_envelope_fields() {
     assert!(out.contains("width           32"), "{out}");
     assert!(out.contains("height          16"), "{out}");
     assert!(out.contains("mip count       3"), "{out}");
-    // The three fields the texture crate refuses to interpret must say so on
-    // every one of their three lines.
-    assert_eq!(out.matches("UNRESOLVED").count(), 2, "{out}");
+    // Exactly one field is still unresolved, and it says so on its own line.
+    assert_eq!(
+        out.matches("UNRESOLVED").count(),
+        1,
+        "only field_10 is unresolved now: {out}"
+    );
     assert!(
         out.contains("field_10        0x00000008 UNRESOLVED"),
         "{out}"
     );
+    let field_18_line = out
+        .lines()
+        .find(|line| line.contains("field_18"))
+        .expect("a field_18 line");
     assert!(
-        out.contains("field_18        0x00040000 UNRESOLVED"),
+        !field_18_line.contains("UNRESOLVED") && !field_18_line.contains("never read"),
+        "field_18 IS read by the decoder, and reaching this line means it agreed: {field_18_line}"
+    );
+    // The fixture is 32x16 DXT5 with 3 levels, so its base level is
+    // ceil4(32)*ceil4(16)*16 = 8*4*16 = 512 = 0x200 bytes, and `field_18` says so.
+    assert!(
+        out.contains("field_18        0x00000200 the base level's byte count"),
         "{out}"
     );
     assert!(
-        out.contains("field_1c        0x0000ffff format-specific per the oracle"),
+        out.contains("field_1c        0x00000000 carried verbatim"),
+        "no meaning has been established for field_1c in a block format: {out}"
+    );
+    assert!(
+        out.contains("fourcc          0x35545844 DXT5/BC3 \u{2014} 16 bytes per 4x4 block"),
+        "the block size is the number the refuted reading got wrong: {out}"
+    );
+    // One chain, and the report says why rather than calling it "derived".
+    assert!(out.contains("mip chains      1"), "{out}");
+    assert!(
+        !out.contains("derived layers"),
+        "the derived layer count is the refuted premise: {out}"
+    );
+    // Per-level mip dimensions, from the decoder rather than re-derived.
+    assert!(out.contains("chain 0 (32x16, 16x8, 8x4)"), "{out}");
+    assert!(
+        !out.contains("layer 1 ("),
+        "a second chain is what the refuted reading invented: {out}"
+    );
+}
+
+#[test]
+fn a_015_raster_says_the_word_at_0x1c_is_its_first_texel_not_a_header_field() {
+    // The `0x15` header is 28 bytes, so `parse_envelope`'s `field_1c` is four
+    // bytes of the base level's first texel. A real record holds the corpus's own
+    // flat normal there: stored (Z=255, X=128, Y=128, mask=0) is 0x008080ff.
+    // Calling that word "format-specific" would be reading payload as metadata.
+    let mut record = Vec::new();
+    for value in [1u32, 2, 2, 1, 8, spore_texture::LUMINANCE_FOURCC, 2 * 2 * 4] {
+        record.extend_from_slice(&value.to_le_bytes());
+    }
+    // The 28-byte header ends here; the first texel starts at 0x1c.
+    record.extend_from_slice(&[255, 128, 128, 0]);
+    record.extend_from_slice(&[255, 128, 128, 7]);
+    record.extend_from_slice(&[255, 128, 128, 8]);
+    record.extend_from_slice(&[255, 128, 128, 9]);
+    let image = common::package_of(&[Row::new(spore_texture::RASTER_TYPE, 0x4066_2900, 1, record)]);
+    let file = common::temp_package("describe-015", &image);
+    let path = file.path().display().to_string();
+    let (code, out, err) = osptool(&["describe", &path, "0x2f4e681c:0x40662900:0x00000001"]);
+    assert_eq!(code, EXIT_OK, "{err}");
+    assert!(
+        out.contains("field_1c        0x008080ff is NOT a header field"),
+        "the word is payload for this family, and saying so is the whole point: {out}"
+    );
+    assert!(
+        out.contains("four first texel") || out.contains("first"),
         "{out}"
     );
-    assert!(out.contains("fourcc          0x35545844 (DXT5)"), "{out}");
-    assert!(out.contains("derived layers    2"), "{out}");
-    // Per-layer mip dimensions, from the decoder rather than re-derived.
-    assert!(out.contains("layer 0 (32x16, 16x8, 8x4)"), "{out}");
-    assert!(out.contains("layer 1 (32x16, 16x8, 8x4)"), "{out}");
+    assert!(
+        !out.contains("format-specific per the oracle"),
+        "that wording is what called payload a metadata field: {out}"
+    );
 }
 
 #[test]

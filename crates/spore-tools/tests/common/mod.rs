@@ -141,59 +141,89 @@ pub fn rw4_package() -> Vec<u8> {
     )])
 }
 
-/// A synthetic DXT5 raster record with `layers` layers.
+/// A synthetic **DXT5** raster record: one mip chain, `mips` levels.
 ///
 /// There is no committed raster fixture — real raster records live only in the
-/// git-ignored game tree — so this builds one byte by byte:
+/// git-ignored game tree — so this builds one byte by byte.
+pub fn synthetic_raster(width: u32, height: u32, mips: u32) -> Vec<u8> {
+    synthetic_raster_of(spore_texture::DXT5_FOURCC, width, height, mips)
+}
+
+/// A synthetic raster record of any format `spore_texture` has a frame for.
+///
+/// # The framing this builds, and the one it used to build
+///
+/// This builder used to write a **32-byte envelope followed by `layers` × 16
+/// "layer headers" and then `layers` mip chains**, with each block charged 8
+/// bytes. A corpus byte count refuted that: over 2 954 of 2 954 raster records in
+/// `Spore_Content.package` and 1 432 of 1 432 in `Spore_EP1_Content_01.package`
+/// the length is exactly
 ///
 /// ```text
-/// 0x00 u32 version = 1
-/// 0x04 u32 width
-/// 0x08 u32 height
-/// 0x0c u32 mip_count
-/// 0x10 u32 field_10 = 8          UNRESOLVED in the crate that parses it
-/// 0x14 u32 fourcc  = DXT5
-/// 0x18 u32 field_18 = 0x00040000 UNRESOLVED
-/// 0x1c u32 field_1c = 0x0000ffff
-/// 0x20 16 skipped layer-header bytes, ALL layers first (the load-bearing
-///      layout assumption `spore_texture` documents)
-/// ...     then `layers` mip chains back to back
+/// header + level0 + (u32 count + level m) for every m >= first_prefixed_level
 /// ```
 ///
-/// The chain lengths come from [`spore_texture::dxt5_chain_size`] rather than
-/// from arithmetic here, because a hand-computed chain size that disagreed with
-/// the decoder's would only prove this builder wrong. Spore's DXT5 blocks are
-/// **8** bytes, not the published BC3 16 — that departure is the decoder's
-/// documented subject matter and the reason this builder uses its own size
-/// function rather than the published spec's.
-pub fn synthetic_raster(width: u32, height: u32, mips: u32, layers: usize) -> Vec<u8> {
+/// with **one** chain, no layer headers at all, 16 bytes per block for DXT5 and
+/// 8 for DXT1. The old builder's two errors cancelled: a 16-byte block read at 8
+/// bytes per block is two half-pictures, and two of them make one picture.
+///
+/// So the builder now asks [`spore_texture::framing`] for every length rather
+/// than computing its own — a hand-rolled chain length that disagreed with the
+/// decoder's would only prove this builder wrong — and it *asserts* the result
+/// is exactly the length the framing identity requires, so a future edit to the
+/// builder fails at build time instead of producing a record the decoder
+/// refuses.
+///
+/// # The two header words that are not measurements
+///
+/// * `field_10` is written as `8`, which is the value every corpus record
+///   carries and which no decoder reads.
+/// * `field_1c` is written as `0`. For the `0x15` family it is not a header word
+///   at all — that header is 28 bytes, so `parse_envelope` reads the first texel
+///   of the base level there, and this builder's payload supplies it. For the two
+///   block formats it is an unestablished word in the 32-byte header; `0` is
+///   written because no value has been established for it and a fixture does not
+///   need one. It is never used to select a decode.
+pub fn synthetic_raster_of(fourcc: u32, width: u32, height: u32, mips: u32) -> Vec<u8> {
+    let frame = spore_texture::framing::frame_for(fourcc)
+        .unwrap_or_else(|| panic!("no measured framing for fourcc {fourcc:#010x}"));
+    let base = spore_texture::framing::level_size(frame, width, height, 0);
+
     let mut record = Vec::new();
-    for value in [
-        1u32,
-        width,
-        height,
-        mips,
-        8,
-        spore_texture::DXT5_FOURCC,
-        0x0004_0000,
-        0x0000_FFFF,
-    ] {
+    for value in [1u32, width, height, mips, 8, fourcc, base as u32] {
         record.extend_from_slice(&value.to_le_bytes());
     }
-    // Every layer's header comes before every payload.
-    for _ in 0..layers {
-        record.extend_from_slice(&[0xAB; 16]);
+    // The eighth word only exists for the 32-byte headers. For the 28-byte `0x15`
+    // header the payload starts here, and the word `parse_envelope` calls
+    // `field_1c` is the base level's first texel — which is what the corpus
+    // records hold, and the crate refuses to pretend it is a field.
+    if frame.header_size >= spore_texture::ENVELOPE_SIZE {
+        record.extend_from_slice(&0u32.to_le_bytes());
     }
-    for layer in 0..layers {
-        for mip in 0..mips {
-            let size = spore_texture::dxt5_mip_size(width, height, mip);
-            // A deterministic ramp, so a decoded mip is reproducible. Block
-            // contents are irrelevant to `describe`, which reports dimensions.
-            for byte in 0..size {
-                record.push(((byte as u32 + layer as u32 * 7 + mip) & 0xFF) as u8);
-            }
+    assert_eq!(
+        record.len(),
+        frame.header_size,
+        "the eight header words must exactly fill this format's header, and no more"
+    );
+
+    for mip in 0..mips {
+        let size = spore_texture::framing::level_size(frame, width, height, mip);
+        if mip >= frame.first_prefixed_level {
+            record.extend_from_slice(&(size as u32).to_le_bytes());
+        }
+        // A deterministic ramp, so a decoded mip is reproducible. Block contents
+        // are irrelevant to `describe`, which reports dimensions.
+        let seed = mip.wrapping_mul(7);
+        for byte in 0..size {
+            record.push((byte as u32).wrapping_add(seed) as u8);
         }
     }
+
+    assert_eq!(
+        record.len(),
+        spore_texture::framing::record_size(frame, width, height, mips),
+        "the built record must be exactly the length the framing identity requires"
+    );
     record
 }
 
@@ -205,7 +235,7 @@ pub fn raster_package() -> Vec<u8> {
             spore_texture::RASTER_TYPE,
             0x4066_2900,
             0x067a_0901,
-            synthetic_raster(32, 16, 3, 2),
+            synthetic_raster(32, 16, 3),
         ),
         // `plt`, a named type this build has no decoder for.
         Row::new(

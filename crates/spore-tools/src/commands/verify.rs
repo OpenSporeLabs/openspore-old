@@ -333,13 +333,23 @@ fn decoded_summary(class: RecordClass, bytes: &[u8]) -> String {
             Err(error) => format!("<unreachable: {error}>"),
         },
         RecordClass::Raster => match spore_texture::decode_raster(bytes) {
-            Ok(image) => format!(
-                "{} layer(s), {} mip level(s) in layer 0, base {}x{}",
-                image.layers.len(),
-                image.layers.first().map_or(0, Vec::len),
-                image.envelope.width,
-                image.envelope.height
-            ),
+            Ok(image) => {
+                // `layers` is a one-element vector by construction
+                // (`decode_raster` builds `vec![mips]`), so the `None` arm is
+                // unreachable — and it is spelled as an unreachable marker rather
+                // than as a `0`, which would be a measurement of a chain that was
+                // never counted.
+                let Some(chain) = image.layers.first() else {
+                    return "<unreachable: a decoded raster carries no mip chain>".to_owned();
+                };
+                format!(
+                    "{} mip level(s) in one chain, base {}x{}, {}",
+                    chain.len(),
+                    image.envelope.width,
+                    image.envelope.height,
+                    super::describe_format(image.envelope.fourcc)
+                )
+            }
             Err(error) => format!("<unreachable: {error}>"),
         },
         RecordClass::Container | RecordClass::NoDecoder => "<not read>".to_owned(),
@@ -387,11 +397,11 @@ fn explain(
     match &verdict {
         OneRecord::Decoded { summary } => {
             writeln!(out, "  decoded    {summary}")?;
-            write_extra(out, class, entry, store)?;
+            write_extra(out, class, true, entry, store)?;
         }
         OneRecord::Failed { message } => {
             writeln!(out, "  refused    {message}")?;
-            write_extra(out, class, entry, store)?;
+            write_extra(out, class, false, entry, store)?;
         }
         // The honesty contract, in the one place a caller looks when a bulk count
         // has to be explained: a type with no decoder prints the index extent and
@@ -438,7 +448,7 @@ fn class_sentence(class: RecordClass) -> &'static str {
     match class {
         RecordClass::Gmdl => "decoded by the gmdl walker",
         RecordClass::Rw4 => "decoded as an RW4 section directory",
-        RecordClass::Raster => "decoded as a raster (DXT5 / 0x15) record",
+        RecordClass::Raster => "decoded as a raster (DXT5 / DXT1 / 0x15) record",
         RecordClass::Container => "recognised as a container; payload not read",
         RecordClass::NoDecoder => "no decoder in this build; nothing parsed",
     }
@@ -452,11 +462,12 @@ fn class_sentence(class: RecordClass) -> &'static str {
 fn write_extra(
     out: &mut dyn Write,
     class: RecordClass,
+    decoded: bool,
     entry: &DbpfEntry,
     store: &spore_assets::ContentStore,
 ) -> Result<(), ToolError> {
     match class {
-        RecordClass::Raster => write_raster_extra(out, entry, store),
+        RecordClass::Raster => write_raster_extra(out, decoded, entry, store),
         RecordClass::Gmdl => write_gmdl_extra(out, entry, store),
         // An RW4 failure message is already complete, and there is no second
         // decoding pass to report from.
@@ -466,12 +477,16 @@ fn write_extra(
 
 /// The raster envelope, printed even when the walk refused.
 ///
-/// For a raster refusal the fourcc is *the* answer, because the fourcc is what
-/// the walk dispatched on. Printing the envelope's four words afterwards is what
-/// turns "texture: unsupported fourcc 0x31545844" into "and here is the record
-/// that said so".
+/// For a raster refusal the envelope is *the* answer: the fourcc is what the walk
+/// dispatched on, and the geometry words are what the record actually said. This
+/// used to key its "these are header words, not a decoded image" note off the
+/// **fourcc**, which was right only while a refusal always meant "no decoder for
+/// that format". Now that every format in the corpus decodes, a refusal means the
+/// record disagreed with its own framing — so the note keys off the **verdict**,
+/// which is the thing that is actually in question.
 fn write_raster_extra(
     out: &mut dyn Write,
+    decoded: bool,
     entry: &DbpfEntry,
     store: &spore_assets::ContentStore,
 ) -> Result<(), ToolError> {
@@ -495,18 +510,25 @@ fn write_raster_extra(
             )?;
             writeln!(
                 out,
-                "  the fields this build does not interpret, carried verbatim: field_10=0x{:08x} \
-                 field_18=0x{:08x} field_1c=0x{:08x}",
+                "  field_10=0x{:08x} is UNRESOLVED and carried verbatim; field_18=0x{:08x} is the \
+                 base level's byte count and was checked against the geometry before this record \
+                 decoded; field_1c=0x{:08x} is carried verbatim and never used to select a decode",
                 envelope.field_10, envelope.field_18, envelope.field_1c
             )?;
-            if envelope.fourcc != spore_texture::DXT5_FOURCC
-                && envelope.fourcc != spore_texture::LUMINANCE_FOURCC
-            {
+            if !decoded {
                 writeln!(
                     out,
-                    "  that fourcc has no decoder in this build, so the walk stopped at the \
-                     dispatch and the dimensions above are the header's words \u{2014} not a decoded \
-                     image"
+                    "  the record did not decode, so the dimensions above are the header's words \
+                     \u{2014} not a decoded image"
+                )?;
+            } else if spore_texture::frame_for(envelope.fourcc).is_none() {
+                // Unreachable: a raster with no framing rule cannot reach the
+                // success path, because `decode_raster` dispatches on the frame.
+                // Kept as a bound on that argument rather than removed.
+                writeln!(
+                    out,
+                    "  this build has no measured framing rule for that fourcc, which the decode \
+                     above would have had to use"
                 )?;
             }
         }
@@ -583,15 +605,17 @@ fn write_gmdl_extra(
 }
 
 /// Why a fourcc was or was not decoded.
+///
+/// Total, and worded so that a format this build cannot frame reads as an
+/// **absence** while one it frames reads as a decode. `DXT1` used to land in the
+/// second arm and print "REFUSED BY NAME" while `spore_texture` decoded all 306 of
+/// its corpus records; `first_record_of_fourcc` in `tests/real_corpus.rs` greps
+/// for `fourcc=0x…`, so this wording is what a corpus scan reads to find a record
+/// of a given format.
 fn fourcc_verdict(fourcc: u32) -> &'static str {
-    match fourcc {
-        spore_texture::DXT5_FOURCC => " (DXT5, decoded)",
-        spore_texture::LUMINANCE_FOURCC => " (0x15 normal-map family, decoded)",
-        0x3154_5844 => {
-            " (DXT1: present in the corpus and REFUSED BY NAME \u{2014} its framing is measured \
-             not to fit either rule)"
-        }
-        _ => " (no decoder in this build names this format)",
+    match spore_texture::frame_for(fourcc) {
+        Some(_) => " (this build decodes it)",
+        None => " (no measured framing rule in this build \u{2014} an absence, not a verdict on the record)",
     }
 }
 
@@ -927,10 +951,26 @@ mod tests {
 
     #[test]
     fn an_unsupported_fourcc_is_named_by_the_explanation_helper() {
-        assert!(fourcc_verdict(spore_texture::DXT5_FOURCC).contains("decoded"));
-        assert!(fourcc_verdict(spore_texture::LUMINANCE_FOURCC).contains("decoded"));
-        assert!(fourcc_verdict(0x3154_5844).contains("REFUSED BY NAME"));
-        assert!(fourcc_verdict(0xdead_beef).contains("no decoder"));
+        // Every format in the corpus is framed by this build, so every one of them
+        // decodes. `DXT1` used to print "REFUSED BY NAME" here while
+        // `spore_texture` decoded all 306 of its records.
+        for fourcc in [
+            spore_texture::DXT5_FOURCC,
+            spore_texture::DXT1_FOURCC,
+            spore_texture::LUMINANCE_FOURCC,
+        ] {
+            let verdict = fourcc_verdict(fourcc);
+            assert!(
+                verdict.contains("this build decodes it"),
+                "{fourcc:#010x}: {verdict}"
+            );
+            assert!(!verdict.contains("REFUS"), "{fourcc:#010x}: {verdict}");
+        }
+        // A format with no measured framing is an absence, not a verdict on the
+        // record, and says so.
+        let unknown = fourcc_verdict(0xdead_beef);
+        assert!(unknown.contains("no measured framing rule"), "{unknown}");
+        assert!(unknown.contains("absence"), "{unknown}");
     }
 
     #[test]

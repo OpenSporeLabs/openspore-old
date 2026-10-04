@@ -171,7 +171,11 @@ pub struct TextureRequest {
     pub key: ResourceKey,
     /// Where to write the PNG. Required, and never inside this repository.
     pub out_file: PathBuf,
-    /// Which layer to write; `0` is the first.
+    /// Which mip chain to write. A raster record has **one** chain — the corpus
+    /// refuted the two-layer reading that used to make this a real choice — so
+    /// `0` is the only index that resolves, and any other is refused by name
+    /// rather than silently clamped. Kept because the field and flag predate the
+    /// refutation and callers still pass them.
     pub layer: usize,
     /// Which mip level to write; `0` is the base level.
     pub mip: usize,
@@ -462,7 +466,9 @@ pub fn usage() -> String {
          \x20        0x01C7AC81:0x01C7AC81 prop directory, which maps TYPE IDS TO NAMES.\n\
          \x20   texture {SYNOPSIS_TEXTURE}\n\
          \x20        Decode one raster record and write a real PNG: RGBA8, filter 0, deflate stored blocks.\n\
-         \x20        The 0x15 family is stored Z, X, Y, mask and is swizzled to R=X, G=Y, B=Z by default;\n\
+         \x20        DXT5 (BC3), DXT1 (BC1) and the uncompressed 0x15 family all decode; the 0x15\n\
+         \x20        family is stored Z, X, Y, mask and is swizzled to R=X, G=Y, B=Z by default,\n\
+         \x20        while the two block formats are written exactly as decoded.\n\
          \x20        `--channels stored` writes the file order unchanged and says so. The report always\n\
          \x20        states which was applied, because a swizzled-wrong PNG looks perfectly plausible.\n\
          \x20        `--out` is required and is refused when it resolves inside this repository.\n\

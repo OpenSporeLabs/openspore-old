@@ -25,7 +25,7 @@ fn model_package() -> Vec<u8> {
             spore_texture::RASTER_TYPE,
             0x4061_6201,
             0x067a_0801,
-            common::synthetic_raster(8, 8, 1, 1),
+            common::synthetic_raster(8, 8, 1),
         ),
     ])
 }

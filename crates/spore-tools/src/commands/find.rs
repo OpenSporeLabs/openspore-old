@@ -167,10 +167,8 @@ pub fn decode_verdict(entry: &DbpfEntry, bytes: &[u8]) -> DecodeVerdict {
             Ok(image) => {
                 let mips = image.layers.iter().map(Vec::len).sum::<usize>();
                 DecodeVerdict::Decoded(format!(
-                    "raster {}x{} with {} layer(s) and {mips} mip(s) total",
-                    image.envelope.width,
-                    image.envelope.height,
-                    image.layers.len()
+                    "raster {}x{} base level, {mips} mip level(s) in one chain",
+                    image.envelope.width, image.envelope.height
                 ))
             }
         },

@@ -33,11 +33,31 @@
 //!   as `X, Y, Z` is not established. So the report carries that question as an
 //!   [`Fact`] whose state is `unavailable`, never as a `false` and never as a
 //!   value. `--channels stored` shows the file order unchanged.
+//! * **The `0x15` lane claims are scoped to the `0x15` family.** Both block
+//!   formats write their bytes unchanged, and for them the report says the lane
+//!   layout is *not applicable* rather than printing the normal-map claim or
+//!   staying silent. Silence would read as "settled for this format"; it is the
+//!   opposite of the truth.
 //! * **DXT5 is never swizzled.** Its documented decode produces the black/red
 //!   alpha-mask signature (red in `{0, 8}`, green and blue `0`) on every texel,
 //!   because Spore's blocks depart from BC3 in four places. An image of that is
 //!   correct and looks broken; the report says so in the same words every time,
 //!   because a reader who has not been told will assume the tool is wrong.
+//! * **DXT1 is never swizzled either**, and it decodes: a BC1 record is a real
+//!   colour image (the corpus' own records expand to thousands of distinct RGBA
+//!   values), not a mask like DXT5. Before the framing was corrected this build
+//!   named DXT1 as "present in the corpus, refused by name" while decoding all
+//!   306 of its records; a census that labels a decodable format "refused" is the
+//!   kind of confident falsehood this repository forbids, so the label, this
+//!   report and the `stats` census now all say `DXT1/BC1` and name the 8-byte
+//!   block.
+//!
+//! # The corpus measurement that made this command worth running on DXT5 and DXT1
+//!
+//! `osptool stats SPORE/Data/Spore_Content.package` reports 2954 raster records:
+//! 1747 DXT5, 901 `0x15`, 306 DXT1, **2954 decoded, zero refusals**. So all three
+//! families reach this writer, and every one of the three has to say something
+//! different and true about its own bytes.
 //!
 //! # It writes only where it was told to
 //!
@@ -48,7 +68,7 @@
 
 use std::io::Write;
 
-use spore_core::{EvidenceLevel, Fact, Provenance};
+use spore_core::{Fact, Provenance};
 use spore_texture::{MipImage, RasterImage};
 
 use crate::json::{hex_id, Json};
@@ -61,6 +81,9 @@ const LUMINANCE_FOURCC: u32 = spore_texture::LUMINANCE_FOURCC;
 
 /// The DXT5 family's fourcc.
 const DXT5_FOURCC: u32 = spore_texture::DXT5_FOURCC;
+
+/// The DXT1 family's fourcc. Decoded as BC1 since the framing was corrected.
+const DXT1_FOURCC: u32 = spore_texture::DXT1_FOURCC;
 
 /// What the tool did to the decoded channel order, in words.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,18 +214,24 @@ fn refuse_non_raster(key: &spore_core::ResourceKey, type_id: u32, memory_size: u
     ToolError::Decode(message)
 }
 
-/// Picks the layer and mip the caller asked for, refusing an index that does not
+/// Picks the chain and mip the caller asked for, refusing an index that does not
 /// exist by naming the range that does.
+///
+/// The flag is still `--layer`, which predates the corpus refuting the two-layer
+/// reading; the refusal names what the flag now selects, so a caller who asks for
+/// layer 3 is told the record has one chain rather than told layer 3 is missing
+/// from a set of two it never had.
 fn select<'a>(image: &'a RasterImage, layer: usize, mip: usize) -> Result<Selection<'a>, String> {
     let chain = image.layers.get(layer).ok_or_else(|| {
         format!(
-            "layer {layer} was requested; this record has {} layer(s)",
+            "--layer {layer} was requested; this record has {} mip chain(s), and a raster record \
+             is one chain",
             image.layers.len()
         )
     })?;
     let level = chain.get(mip).ok_or_else(|| {
         format!(
-            "mip {mip} was requested; layer {layer} has {} mip level(s)",
+            "--mip {mip} was requested; chain {layer} has {} mip level(s)",
             chain.len()
         )
     })?;
@@ -252,45 +281,56 @@ fn to_rgba(mip: &MipImage, applied: AppliedOrder) -> Result<Vec<u8>, ToolError> 
 
 /// The evidence this tool attaches to its own channel-order choice.
 ///
-/// Two separate facts, kept separate because they have different grades:
+/// # Scoped to the `0x15` family, because that is all it is about
 ///
-/// * what the stored lanes *are* — `VERIFIED`, from `spore_texture`'s claims;
+/// The lane-order claim in `spore_texture` describes the **uncompressed normal
+/// family**. Printing it under a DXT5 or DXT1 record was a false statement: the
+/// lanes of a BC3 block are not `Z, X, Y, mask`, and nobody has established what
+/// they are. So for a block format this returns a non-finding whose *reason* says
+/// the claim does not apply, and the report prints that reason instead of the
+/// claim.
+///
+/// Two separate facts are kept separate because they have different grades:
+///
+/// * what the stored lanes *are*, for `0x15` only — `VERIFIED`, from
+///   `spore_texture`'s claims;
 /// * whether a consumer *should* read them as `X, Y, Z` — `Unavailable`, because
 ///   `spore_texture::claims::LUMINANCE_CHANNEL_SWIZZLE` says so explicitly.
 fn swizzle_facts(fourcc: u32) -> (Fact<&'static str>, Fact<&'static str>) {
-    let layout_grade: EvidenceLevel =
-        spore_texture::claims::grade_of(spore_texture::claims::LUMINANCE_TEXEL_LAYOUT);
-    let layout = Fact::new(
-        layout_grade,
-        spore_core::EvidenceState::Persisted,
-        vec![Provenance::committed(
-            "crates/spore-texture/src/claims.rs (luminance_0x15_texel_layout)",
-        )],
-        "the three first lanes are one tangent-space normal map, stored Z first, 128 as zero",
-    );
+    let applicable = fourcc == LUMINANCE_FOURCC;
+    let layout: Fact<&'static str> = if applicable {
+        Fact::new(
+            spore_texture::claims::grade_of(spore_texture::claims::LUMINANCE_TEXEL_LAYOUT),
+            spore_core::EvidenceState::Persisted,
+            vec![Provenance::committed(
+                "crates/spore-texture/src/claims.rs (luminance_0x15_texel_layout)",
+            )],
+            "the three first lanes are one tangent-space normal map, stored Z first, 128 as zero",
+        )
+    } else {
+        Fact::unavailable(NOT_A_LUMINANCE_FAMILY)
+    };
     // The question this tool must not answer is recorded as a question. An
     // `Unavailable` here is not a `false`: nobody has established that the game
     // reads these bytes as X, Y, Z, and saying "no" would invent the same error
     // with a sign on it.
-    let should = if fourcc == LUMINANCE_FOURCC {
+    let should = if applicable {
         Fact::unavailable(spore_texture::claims::LUMINANCE_CHANNEL_SWIZZLE)
     } else {
-        Fact::unavailable("not_applicable_to_this_fourcc")
+        Fact::unavailable(NOT_A_LUMINANCE_FAMILY)
     };
     (layout, should)
 }
 
+/// Why the `0x15` lane-order claims say nothing about a block format.
+///
+/// A closed reason code rather than a sentence, so the JSON document carries a
+/// stable token and a caller cannot mistake a non-finding for an answer.
+const NOT_A_LUMINANCE_FAMILY: &str = "not_applicable_to_this_fourcc";
+
 /// What a fourcc is, in words this repository has evidence for.
 fn fourcc_text(fourcc: u32) -> String {
-    match fourcc {
-        DXT5_FOURCC => "DXT5 \u{2014} block family, decoded in stored order".to_owned(),
-        LUMINANCE_FOURCC => {
-            "0x15 family \u{2014} uncompressed tangent-space normal map plus a fourth lane, \
-             stored Z, X, Y, mask"
-                .to_owned()
-        }
-        other => format!("0x{other:08x}"),
-    }
+    super::describe_format(fourcc)
 }
 
 /// The human report. Goes to `err` so that **stdout stays empty** unless
@@ -320,29 +360,58 @@ fn write_report(
         err,
         "decoder       raster (decoded \u{2014} every number below came out of spore_texture)"
     )?;
-    writeln!(err, "  fourcc      0x{:08x}", envelope.fourcc)?;
-    writeln!(err, "              {}", fourcc_text(envelope.fourcc))?;
+    writeln!(err, "  fourcc      {}", fourcc_text(envelope.fourcc))?;
     writeln!(
         err,
-        "  base level  {}x{}, {} mip level(s), {} layer(s) (layer count derived from the record \
-         size; the record stores none)",
+        "  base level  {}x{}, {} mip level(s) in one chain (a raster record has no layer count\n               and none is derived; `--layer 0` names the only chain there is)",
         envelope.width,
         envelope.height,
-        envelope.mip_count,
-        image.layers.len()
+        envelope.mip_count
     )?;
 
     let (layout, should) = swizzle_facts(envelope.fourcc);
     writeln!(err, "channel order {}", applied.describe())?;
-    if let Some(value) = layout.value() {
-        writeln!(err, "  lanes       {value} [{}]", layout.level())?;
-    }
-    if let Some(reason) = should.reason() {
+    if envelope.fourcc == LUMINANCE_FOURCC {
+        if let Some(value) = layout.value() {
+            writeln!(err, "  lanes       {value} [{}]", layout.level())?;
+        }
+        // Keyed on what was **applied**, not on the fourcc: `--channels stored` on
+        // a `0x15` record wrote the file order unchanged, and telling it "this
+        // tool re-indexes the lanes" would describe a step it did not take.
+        match applied {
+            AppliedOrder::SwizzledFromZXY => {
+                if let Some(reason) = should.reason() {
+                    writeln!(
+                        err,
+                        "  swizzle     this tool re-indexed the lanes so the image reads R=X, G=Y, \
+                         B=Z. That is a PRESENTATION choice: whether a consumer should read them \
+                         that way is unestablished ({reason}). Use `--channels stored` for the file \
+                         order unchanged."
+                    )?;
+                }
+            }
+            AppliedOrder::Stored => {
+                writeln!(
+                    err,
+                    "  swizzle     not applied, because `--channels stored` was given: the bytes were \
+                     written exactly as decoded. Whether a consumer should read them as X, Y, Z is \
+                     still unestablished ({}).",
+                    should.reason().unwrap_or("unrecorded")
+                )?;
+            }
+        }
+    } else {
+        // Said out loud rather than omitted: silence would read as "the lane order
+        // is settled for this format", which is the opposite of the truth.
         writeln!(
             err,
-            "  swizzle     this tool re-indexes the lanes so the image reads R=X, G=Y, B=Z. That \
-             is a PRESENTATION choice: whether a consumer should read them that way is \
-             unestablished ({reason}). Use `--channels stored` for the file order unchanged."
+            "  lanes       nothing established: the Z, X, Y, mask layout is a claim about the 0x15 \
+             family only, so it is not stated for this format ({NOT_A_LUMINANCE_FAMILY})."
+        )?;
+        writeln!(
+            err,
+            "  swizzle     not applied, and none proposed: this record's bytes are written exactly \
+             as decoded."
         )?;
     }
     if envelope.fourcc == DXT5_FOURCC {
@@ -351,6 +420,14 @@ fn write_report(
             "  note        Spore's DXT5 blocks depart from BC3 in four documented ways, so every \
              texel decodes to red in {{0, 8}} with green and blue 0. The image looks wrong and is \
              not: see crates/spore-texture/src/dxt5.rs."
+        )?;
+    }
+    if envelope.fourcc == DXT1_FOURCC {
+        writeln!(
+            err,
+            "  note        BC1 carries no alpha, so every texel is written with A=255. Unlike DXT5 \
+             this is a real colour image, not an alpha mask: the corpus' own 256x256 records expand \
+             to thousands of distinct RGBA values."
         )?;
     }
 
@@ -477,6 +554,7 @@ impl ChannelOrder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spore_core::EvidenceLevel;
     use spore_texture::claims::{LUMINANCE_CHANNEL_SWIZZLE, LUMINANCE_TEXEL_LAYOUT};
 
     #[test]
@@ -485,30 +563,34 @@ mod tests {
             applied_order(LUMINANCE_FOURCC, ChannelOrder::Auto),
             AppliedOrder::SwizzledFromZXY
         );
-        // DXT5 is never swizzled: its decode is already in stored order, and
-        // re-indexing it would invent a channel mapping nobody established.
-        assert_eq!(
-            applied_order(DXT5_FOURCC, ChannelOrder::Auto),
-            AppliedOrder::Stored
-        );
+        // Both block formats are never swizzled: their decode is already in
+        // stored order, and re-indexing one would invent a channel mapping nobody
+        // established. DXT1 was named "refused by name" here until a corpus byte
+        // count showed all 306 of its records decode as BC1.
+        for fourcc in [DXT5_FOURCC, DXT1_FOURCC] {
+            assert_eq!(
+                applied_order(fourcc, ChannelOrder::Auto),
+                AppliedOrder::Stored,
+                "{fourcc:#010x} must not be swizzled"
+            );
+        }
         // An unknown fourcc cannot reach the writer, but the dispatch must not
         // panic on one if it ever does.
         assert_eq!(
-            applied_order(0x3154_5844, ChannelOrder::Auto),
+            applied_order(0xdead_beef, ChannelOrder::Auto),
             AppliedOrder::Stored
         );
     }
 
     #[test]
     fn stored_means_stored_for_both_families() {
-        assert_eq!(
-            applied_order(LUMINANCE_FOURCC, ChannelOrder::Stored),
-            AppliedOrder::Stored
-        );
-        assert_eq!(
-            applied_order(DXT5_FOURCC, ChannelOrder::Stored),
-            AppliedOrder::Stored
-        );
+        for fourcc in [LUMINANCE_FOURCC, DXT5_FOURCC, DXT1_FOURCC] {
+            assert_eq!(
+                applied_order(fourcc, ChannelOrder::Stored),
+                AppliedOrder::Stored,
+                "{fourcc:#010x}"
+            );
+        }
     }
 
     #[test]
@@ -541,6 +623,45 @@ mod tests {
     }
 
     #[test]
+    fn a_block_format_gets_the_normal_map_lane_claim_as_a_non_finding() {
+        // The `Z, X, Y, mask` layout is a claim about the **uncompressed** family.
+        // Stating it under a BC3 or a BC1 record was a false sentence, so both
+        // facts become non-findings whose reason names why.
+        for fourcc in [DXT5_FOURCC, DXT1_FOURCC] {
+            let (layout, should) = swizzle_facts(fourcc);
+            assert!(layout.is_unavailable(), "{fourcc:#010x}");
+            assert_eq!(layout.reason(), Some(NOT_A_LUMINANCE_FAMILY));
+            assert_eq!(
+                layout.value(),
+                None,
+                "{fourcc:#010x}: an unavailable fact has no value to mistake for a claim"
+            );
+            assert!(should.is_unavailable(), "{fourcc:#010x}");
+            assert_eq!(should.reason(), Some(NOT_A_LUMINANCE_FAMILY));
+            assert_eq!(should.value(), None, "{fourcc:#010x}");
+            assert!(
+                should.provenance().is_empty() && layout.provenance().is_empty(),
+                "a non-finding carries no provenance to repeat"
+            );
+        }
+    }
+
+    #[test]
+    fn every_corpus_fourcc_is_named_and_no_one_of_them_is_called_refused() {
+        // A census that labels a decodable format "refused" is a confident
+        // falsehood, and this crate printed one until the corpus settled it.
+        for (fourcc, expected) in [
+            (DXT5_FOURCC, "DXT5/BC3"),
+            (DXT1_FOURCC, "DXT1/BC1"),
+            (LUMINANCE_FOURCC, "0x15"),
+        ] {
+            let text = fourcc_text(fourcc);
+            assert!(text.contains(expected), "{fourcc:#010x}: {text}");
+            assert!(!text.contains("refus"), "{fourcc:#010x}: {text}");
+        }
+    }
+
+    #[test]
     fn the_swizzle_question_is_carried_as_a_non_finding_not_as_a_false() {
         let (layout, should) = swizzle_facts(LUMINANCE_FOURCC);
         assert!(layout.is_available());
@@ -566,13 +687,6 @@ mod tests {
             should.provenance().is_empty(),
             "a non-finding carries no provenance to repeat"
         );
-    }
-
-    #[test]
-    fn a_fourcc_with_no_lane_layout_is_also_a_non_finding_not_a_default() {
-        let (_, should) = swizzle_facts(DXT5_FOURCC);
-        assert!(should.is_unavailable());
-        assert_eq!(should.reason(), Some("not_applicable_to_this_fourcc"));
     }
 
     #[test]
@@ -614,6 +728,31 @@ mod tests {
     }
 
     #[test]
+    fn a_block_formats_json_carries_no_lane_claim_value() {
+        // Same envelope, same absence: the JSON for a DXT1 record must not carry
+        // a `value` under either fact, or a caller would read the normal-map
+        // layout out of a BC1 record.
+        for fourcc in [DXT5_FOURCC, DXT1_FOURCC] {
+            let (layout, should) = swizzle_facts(fourcc);
+            for (name, fact) in [("stored_lane_layout", layout), ("swizzle", should)] {
+                let rendered = fact_json(fact);
+                let Json::Obj(pairs) = &rendered else {
+                    panic!("expected an object")
+                };
+                assert!(
+                    !pairs.iter().any(|(k, _)| k == "value"),
+                    "{fourcc:#010x} {name}: {rendered:?}"
+                );
+                assert_eq!(
+                    pairs.iter().find(|(k, _)| k == "reason").map(|(_, v)| v),
+                    Some(&Json::from(NOT_A_LUMINANCE_FAMILY)),
+                    "{fourcc:#010x} {name}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn an_out_of_range_layer_or_mip_names_the_range_that_exists() {
         let image = RasterImage {
             envelope: spore_texture::RasterEnvelope {
@@ -644,13 +783,14 @@ mod tests {
         assert!(
             select(&image, 3, 0)
                 .unwrap_err()
-                .contains("this record has 1 layer(s)"),
-            "an out-of-range layer names the count that does exist"
+                .contains("this record has 1 mip chain(s)"),
+            "an out-of-range --layer names the count that does exist, and says a raster record is \
+             one chain"
         );
         assert!(
             select(&image, 0, 9)
                 .unwrap_err()
-                .contains("layer 0 has 2 mip level(s)"),
+                .contains("chain 0 has 2 mip level(s)"),
             "an out-of-range mip names the count that does exist"
         );
     }
