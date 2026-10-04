@@ -11,6 +11,26 @@
 //! request for one JSON response per query. `dbpf.read` is the only entry point
 //! used; no oracle is reimplemented here.
 //!
+//! # Why one command is NOT an oracle at all
+//! #
+//! # The `0x15` raster family has no reference implementation. `raster.py::decode`
+//! # refuses any fourcc other than DXT5, so after `spore-texture` learned to decode
+//! # `0x15` there was nothing on this side of the boundary to compare it against --
+//! # 901 real records with no second implementation. `cmd_raster15` below closes
+//! # that gap, and it is deliberately NOT filed as an oracle:
+//! #
+//! # * it re-derives the framing identity from the format description in a second
+//! #   language, with no call into `raster.py` or `dxt5.py`, so a shared mistake in
+//! #   one language cannot hide in both;
+//! # * it is checked against the crate's own answer and a disagreement is REPORTED,
+//! #   never reconciled -- the same discipline `mirror_index` follows;
+//! # * the crate under test and this function were written from the same document
+//! #   (`docs/LUMINANCE-RASTER.md`), so their agreement raises confidence in the
+//! #   *arithmetic* and says nothing about whether the document describes Spore.
+//! #   That last question is settled only by the corpus, over 901 of 901 records
+//! #   consuming exactly. Anything stronger would be a claim this harness cannot
+//! #   make.
+//! #
 //! # Why the driver is allowed to look at bytes `dbpf.read` does not return
 //!
 //! Two measurements need words `dbpf.read` discards:
@@ -251,6 +271,18 @@ def cmd_gmdl(req):
         'material_ids': list(g.materialIDs),
         'unk': g.unk,
         'material_info_groups': len(g.materialInfos),
+        # One entry per material-info block: how many texture-set REFERENCES
+        # that block contributed. Counts references, not texture-set entries: a
+        # block may hold more than one 0x20D entry, and an entry may hold more
+        # than one reference, so counting entries instead makes a block look
+        # like it contributed one reference when it contributed several.
+        'block_tex_counts': [sum(len(e[3]) for e in mi if e[0] == 'texset')
+                             for mi in g.materialInfos],
+        # And whether two blocks of the same record name the same texture set,
+        # which is what decides whether the block ORDER carries any information
+        # at all for this record.
+        'block_tex_sets': [[[t[2], t[3]] for e in mi if e[0] == 'texset' for t in e[3]]
+                           for mi in g.materialInfos],
         # Flattened exactly the way spore-gmdl flattens it: every 0x20D texture
         # set in every material group, in order of appearance, as (inst, grp).
         # The tree itself is NOT projected -- see the Rust-side note about the
@@ -288,6 +320,115 @@ def cmd_raster(req):
         return out
     out['mip0_sha16'] = hashlib.sha256(mip0).hexdigest()[:16]
     out['mip0_len'] = len(mip0)
+    return out
+
+
+LUMINANCE_FOURCC = 0x00000015
+LUM_HEADER = 28
+LUM_PREFIX = 4
+LUM_TEXEL = 4
+
+
+def _lum_dim(base, mip):
+    """max(1, base >> mip), with every mip at or beyond 32 clamped to 1."""
+    if mip >= 32:
+        return 1
+    return max(1, base >> mip)
+
+
+def _lum_payload(width, height, mip):
+    return _lum_dim(width, mip) * _lum_dim(height, mip) * LUM_TEXEL
+
+
+def luminance_identity(width, height, mip_count):
+    """The one record size this family's framing allows.
+
+    28-byte header, then the base level's payload, then for every mip past the
+    base level a little-endian u32 byte count and that level's payload.
+    """
+    total = LUM_HEADER
+    bounded = min(mip_count, 32)
+    for mip in range(bounded):
+        if mip > 0:
+            total += LUM_PREFIX
+        total += _lum_payload(width, height, mip)
+    total += max(0, mip_count - bounded) * (LUM_PREFIX + LUM_TEXEL)
+    return total
+
+
+def cmd_raster15(req):
+    """An independent framing walk over a `0x15` record. See the module docs.
+
+    Returns the derived identity, the byte window and digest of every mip, and
+    whether the walk consumed the record exactly. Refusals are reported as
+    refusals with a reason, never as an empty success.
+    """
+    _item, blob = extract(req['i'])
+    out = {'ok': True, 'len': len(blob)}
+    if len(blob) < LUM_HEADER:
+        out['ok'] = False
+        out['err'] = 'shorter than the 28-byte header'
+        return out
+    # 0x04 width, 0x08 height, 0x0c mipCount, 0x14 fourcc. The four words at
+    # 0x04..0x14 are NOT consecutive with the format word: 0x10 is field_10, the
+    # unresolved word that reads 8 in every record. Unpacking four consecutive
+    # words from 0x04 reads field_10 as the format, which is exactly the kind of
+    # off-by-one-word this function exists to catch.
+    width, height, mip_count = struct.unpack_from('<3I', blob, 4)
+    fourcc = struct.unpack_from('<I', blob, 0x14)[0]
+    field_10 = struct.unpack_from('<I', blob, 0x10)[0]
+    out.update({'width': width, 'height': height, 'mipCount': mip_count,
+                'fourcc': fourcc, 'field_10': field_10})
+    if fourcc != LUMINANCE_FOURCC:
+        out['ok'] = False
+        out['err'] = 'fourcc 0x%08X is not the 0x15 family' % fourcc
+        return out
+    if mip_count == 0:
+        out['ok'] = False
+        out['err'] = 'mipCount 0'
+        return out
+    identity = luminance_identity(width, height, mip_count)
+    out['identity'] = identity
+    out['identity_holds'] = (identity == len(blob))
+    if not out['identity_holds']:
+        out['ok'] = False
+        out['err'] = 'identity says %d bytes, record is %d' % (identity, len(blob))
+        return out
+    mips = []
+    at = LUM_HEADER
+    bad = None
+    for mip in range(mip_count):
+        declared = None
+        if mip > 0:
+            declared = struct.unpack_from('<I', blob, at)[0]
+            at += LUM_PREFIX
+        geom = _lum_payload(width, height, mip)
+        window = blob[at:at + geom]
+        if len(window) != geom:
+            bad = 'mip %d window runs past the record' % mip
+            break
+        if declared is not None and declared != geom:
+            bad = 'mip %d declares %d bytes, geometry says %d' % (mip, declared, geom)
+            break
+        mips.append({
+            'mip': mip,
+            'offset': at,
+            'declared': declared,
+            'geom': geom,
+            'width': _lum_dim(width, mip),
+            'height': _lum_dim(height, mip),
+            'sha16': hashlib.sha256(window).hexdigest()[:16],
+        })
+        at += geom
+    out['mips'] = mips
+    out['consumed'] = at
+    out['prefix_mismatch'] = bad
+    if bad is not None:
+        out['ok'] = False
+        out['err'] = bad
+        return out
+    out['first_texel'] = list(blob[LUM_HEADER:LUM_HEADER + 4])
+    out['base_sha16'] = mips[0]['sha16']
     return out
 
 
@@ -414,6 +555,7 @@ HANDLERS = {
     'rw4': cmd_rw4,
     'gmdl': cmd_gmdl,
     'raster': cmd_raster,
+    'raster15': cmd_raster15,
     'manifest': cmd_manifest,
     'worldobj': cmd_worldobj,
     'rw4_file': cmd_rw4_file,
@@ -747,6 +889,16 @@ impl OracleSession {
             ("path", Json::Str(path.to_string_lossy().into_owned())),
         ]);
         self.exchange(&request.to_string())
+    }
+
+    /// Asks the driver for its independent `0x15` framing walk over index
+    /// `index`.
+    ///
+    /// Not an oracle -- see the module documentation, "Why one command is NOT
+    /// an oracle at all". It is a second implementation of the framing identity
+    /// in another language, and a disagreement with the crate is a finding.
+    pub fn request_luminance(&mut self, index: usize) -> Result<Json, OracleError> {
+        self.request_record("raster15", index)
     }
 
     /// Asks for the whole-file manifest rows.

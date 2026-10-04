@@ -197,10 +197,35 @@ fn the_synthetic_corpus_reaches_equality_on_the_index_and_the_rw4_walk() {
 }
 
 #[test]
-fn a_fixture_run_produces_no_divergence_in_any_comparison() {
-    // The strongest claim the hermetic suite can make: over the committed
-    // fixtures, the Rust parsers and the Python oracles agree completely. If a
-    // future change breaks a port, this is the test that says so.
+fn a_fixture_run_produces_no_divergence_except_the_one_the_oracle_gets_wrong() {
+    // Over the committed fixtures the Rust parsers and the Python oracles agree
+    // completely -- with one exception, and it is a real defect in the oracle.
+    //
+    // # FINDING: `gmdl.py` reads the reference-table keys little-endian
+    //
+    // The oracle's own docstring states the rule it then breaks:
+    //
+    // ```text
+    // refCount         u32  (BIG-endian; every other word is little-endian)
+    //   refCount *     { instanceID, groupID, typeID } u32 x3
+    // ```
+    //
+    // `u32be` is applied to the count and plain little-endian `u` to the three
+    // words of every key behind it. The corpus settles which side is right:
+    // over the 4 209 gmdl records of `Spore_Content.package`, the big-endian
+    // reading of those keys resolves 7 989 of 7 989 against the package's own
+    // index and the little-endian reading resolves 0 of 7 989 -- see
+    // `tests/gmdl_reference_table.rs`. `spore-gmdl` reads them big-endian, which
+    // is correct; the oracle does not.
+    //
+    // The committed fixture cannot show this on its own, because it was
+    // *generated* from the oracle's assumption, so its key bytes are
+    // little-endian too. What the fixture does show, and what this test pins, is
+    // that the two sides now disagree about one word and one word only.
+    //
+    // This is asserted rather than tolerated: a test that quietly dropped the
+    // comparison would report "clean" the moment either side was "fixed" in the
+    // wrong direction, and the harness's whole value is that it cannot.
     let corpus = Corpus::synthetic().expect("the committed fixtures must exist");
     let config = config();
     let package = corpus.packages().first().expect("the mini package");
@@ -213,16 +238,14 @@ fn a_fixture_run_produces_no_divergence_in_any_comparison() {
 
     // The two file-level entry points fold the oracle error into a `Skipped`
     // report, so they are already reports; the two package-level ones return it.
-    let mut reports = vec![
+    let agreeing = vec![
         compare::dbpf_index::compare_package(package, &config)
             .expect("the oracle must answer for a committed fixture"),
         compare::record_bytes::compare_package(package, &config, 16)
             .expect("the oracle must answer for a committed fixture"),
         compare::rw4::compare_record_file(rw4_record, &config),
-        compare::gmdl::compare_record_file(gmdl_record, &config),
     ];
-    reports.sort_by(|a, b| a.comparison.cmp(&b.comparison));
-    for report in &reports {
+    for report in &agreeing {
         assert_eq!(
             report.status,
             Status::Complete,
@@ -237,6 +260,42 @@ fn a_fixture_run_produces_no_divergence_in_any_comparison() {
             report.summary()
         );
     }
+
+    let gmdl = compare::gmdl::compare_record_file(gmdl_record, &config);
+    assert_eq!(gmdl.status, Status::Complete, "{}", gmdl.summary());
+    assert_eq!(
+        gmdl.divergences.len(),
+        1,
+        "exactly one field disagrees, and it is the reference table's type word:\n{}",
+        gmdl.summary()
+    );
+    let divergence = &gmdl.divergences[0];
+    assert_eq!(
+        divergence.field,
+        "refs",
+        "the divergence is the reference table, nothing else:\n{}",
+        gmdl.summary()
+    );
+    // Both sides print the triple instance-first, so the values are directly
+    // comparable and the difference is exactly one byte-reversal.
+    assert!(
+        divergence.oracle.contains("type=0x00e6bce5"),
+        "the oracle read the type word little-endian: {divergence}"
+    );
+    assert!(
+        divergence.rust.contains("type=0xe5bce600"),
+        "spore_gmdl read it big-endian, and the fixture's bytes are little-endian: {divergence}"
+    );
+    // The instance and group words are byte-symmetric in this fixture, so they
+    // cannot contribute to the disagreement -- which is why the fixture can show
+    // the shape of the bug but not settle it.
+    assert!(
+        divergence.oracle.contains("inst=0x11111111"),
+        "{divergence}"
+    );
+    assert!(divergence.rust.contains("inst=0x11111111"), "{divergence}");
+    assert!(divergence.oracle.contains("grp=0x22222222"), "{divergence}");
+    assert!(divergence.rust.contains("grp=0x22222222"), "{divergence}");
 }
 
 // ------------------------------------------------------- 3. quoting both sides
