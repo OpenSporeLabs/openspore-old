@@ -38,6 +38,16 @@
 //!   configuration, not geometry, and they do not unblock the render path.
 //! * **Instance naming.** DBPF has no string table. An instance id is opaque
 //!   and nothing here invents a name for one.
+//!
+//! # The graph layer
+//!
+//! [`graph`] builds the dependency edges *between* records — model to its
+//! textures, model to the `rw4` records it names, model to the raster sharing
+//! its identity — with each edge kind graded by how it was established and every
+//! unresolved reference reported rather than dropped. See `docs/RESOURCE-GRAPH.md`
+//! for the measured numbers and, in particular, for the one place where the
+//! corpus says this crate's own dependency reads a gmdl table with the wrong byte
+//! order.
 
 // `unsafe` is DENIED crate-wide, not merely forbidden, so that the single
 // exception below has to be an explicit, greppable `#[allow]` on one function
@@ -46,12 +56,17 @@
 #![warn(missing_debug_implementations)]
 
 pub mod error;
+pub mod graph;
 pub mod manifest;
 pub mod model;
 pub mod package;
 pub mod store;
 
 pub use error::AssetError;
+pub use graph::{
+    read_reference_table, DanglingReference, Edge, EdgeKind, EdgeSummary, GraphOptions,
+    ReferenceTableError, ResourceGraph, SkipReason, TraversalEntry, UnresolvedRecord,
+};
 pub use manifest::{probe_gmdl, DecodeStatus, ManifestBuilder, ManifestEvidence, ManifestRow};
 pub use model::{LoadedModel, LoadedTexture, ModelFormat, ModelStore, TextureStore};
 pub use package::{Package, PackageBytes};
