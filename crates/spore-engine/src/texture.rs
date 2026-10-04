@@ -1,13 +1,11 @@
 //! Role-driven texture upload: which surface feeds which material channel.
 //!
-//! `spore-material` decides *what a record is*; this module decides *where that
-//! goes*. The two must not be confused, and the confusion has a name in this
-//! repository: **applying a DXT5 record as diffuse colour**, which the previous
-//! revision of this engine did. `docs/MATERIAL-ROLES.md` §4 measures why that
-//! was wrong — over 1 374 decodable `DXT5` records the green span is 0, the blue
-//! span is 0, red takes at most two values, and 477 771 sampled palette entries
-//! collapse to exactly two RGB triples. There is no base-colour map in this
-//! corpus, so **no texture is bound as one here.**
+//! `spore-material` decides *what a record's texels are*; this module decides
+//! *where that goes*. The two must not be confused, and the confusion has a name
+//! in this repository: **applying a `DXT5` record as diffuse colour**, which
+//! the revision before last did. No record in this corpus is published as a
+//! base-colour map — not the `0x15` family (a normal map) and not the block
+//! formats (published `Unidentified`) — so **no texture is bound as one here.**
 //!
 //! # Where the base colour comes from instead
 //!
@@ -23,24 +21,54 @@
 //!
 //! # The three bindings, and what each one is
 //!
-//! | record role | Bevy slot | evidence |
+//! The rule this module follows: **bind what `spore-material` publishes, never
+//! what a role name suggests.** A surface exists because a channel of the record
+//! carries a channel role the renderer can act on, not because the record's
+//! format word or its position in a list says so.
+//!
+//! | published channel | Bevy slot | evidence |
 //! |---|---|---|
-//! | [`TextureRole::TangentSpaceNormal`] | `StandardMaterial::normal_map_texture` | 901/901 records, Z-first, VERIFIED |
-//! | [`TextureRole::LayeredAlphaMask`] | **none** | purpose UNKNOWN — see below |
-//! | [`TextureRole::Unidentified`] | **none** | a finding, not a default |
+//! | `NormalZ` + `NormalX` + `NormalY` in an established layout | `StandardMaterial::normal_map_texture` | 901/901 `0x15` records, Z-first, VERIFIED |
+//! | `MaskChannel` | **none** | purpose UNKNOWN — see below |
+//! | anything else, including every `UnidentifiedLane` | **none** | a finding with a reason, not a default |
 //!
-//! ## Why the masks go nowhere
+//! ## What the corpus publishes today
 //!
-//! A `DXT5` record has two layers and each layer's alpha plane is a full-range
-//! 8-bit channel: **four** channels for the corpus's common three-entry set, none
-//! of which has an established purpose (`spore_material::claims::MASK_LAYER_PURPOSE`
-//! is an `UNKNOWN` non-finding). Binding one to `metallic_roughness_texture`
-//! would be naming it "specular"/"gloss"/"occlusion", which is precisely the
-//! claim `docs/MATERIAL-ROLES.md` §10.5 forbids.
+//! Over all 2 954 raster records in `Spore_Content.package`, exactly one
+//! bindable class exists: the `0x15` family as a Z-first normal map. The other
+//! 2 053 records publish `UnidentifiedLane` on all four of their lanes and
+//! contribute **no surface at all**, which is reported as
+//! `unbound=no-published-channel` rather than as a decoding failure.
 //!
-//! So each plane is uploaded, given a name that says only what it *is*
-//! (`mask_channel_N`), and carried on the entity for a future consumer that has
-//! evidence. Nothing is thrown away and nothing is claimed.
+//! ## Why the non-normal channels go nowhere
+//!
+//! A single-channel record still says nothing about what the game does with it.
+//! `spore_material::claims::MASK_LAYER_PURPOSE` is an `UNKNOWN` non-finding, so
+//! binding one to `metallic_roughness_texture` would be naming it
+//! "specular"/"gloss"/"occlusion" — precisely the claim `docs/MATERIAL-ROLES.md`
+//! §10.5 forbids.
+//!
+//! When a role *does* publish a mask channel, each one is uploaded, given a name
+//! that says only which lane it is (`mask-channel-a`), and carried on the entity
+//! for a future consumer that has evidence. Nothing is thrown away and nothing
+//! is claimed. The count is **zero in this corpus**, which is a fact about the
+//! roles and not about this module: nothing here iterates layers.
+//!
+//! ## REFUTED: "a raster record carries no colour"
+//!
+//! This module used to state, as a measurement, that a `DXT5` record's colour
+//! planes were `DegenerateColour` and its alpha was the only full-range channel.
+//! That was a tautology of a **broken decoder**: the old codec read the colour
+//! field as two 6-bit values out of a 16-bit word, so green and blue read as
+//! zero for any input whatsoever. `spore-texture` has since proved the block
+//! stride is 16 bytes (BC3), and the same records carry **32 distinct greens
+//! and 32 distinct blues**; the creature's mask record takes 233 / 254 / 230
+//! distinct values per colour lane over 262 144 texels. "The decoder cannot
+//! produce a colour" was never "the record has none".
+//!
+//! That does **not** license binding one as base colour: nothing measured says a
+//! raster *is* a colour map, and the colour of a Spore model comes from its
+//! `sporemodel` record instead (see [`crate::domain::paint`]).
 //!
 //! # The swizzle, and the format it forces
 //!
@@ -61,7 +89,7 @@ use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 
 use spore_core::ResourceKey;
-use spore_material::TextureRole;
+use spore_material::ChannelRole;
 
 use crate::domain::materials::{
     swizzle_z_first_to_xyz, MaskChannelPlan, MaterialTexture, MeshMaterialPlan, NormalMapPlan,
@@ -129,13 +157,21 @@ impl NormalMapOrientation {
 pub enum SurfaceKind {
     /// A tangent-space normal map, already swizzled to `(X, Y, Z)`.
     TangentSpaceNormal,
-    /// One alpha plane of one mask record.
+    /// One channel a record published as `ChannelRole::MaskChannel`.
     ///
-    /// `layer_index` is which of the record's layers. **No purpose is claimed
-    /// for it**; `spore_material::claims::MASK_LAYER_PURPOSE` is `UNKNOWN`.
+    /// `lane` is which byte of the texel the value came from, and the name is
+    /// that lane's — a fact about the bytes, never a purpose. `spore-material`
+    /// publishes no mask channel for any record in the current corpus, so this
+    /// variant is reachable only through a synthetic record; it stays because it
+    /// is the path a future role derivation takes, and a binding path with no
+    /// test is a binding path that will not survive its first real record.
     MaskChannel {
-        /// Which of the record's layers this plane came from.
+        /// Which of the record's layers the channel was published from. Always
+        /// `0` in this corpus; carried because the binding published it, not
+        /// because the engine assumed it.
         layer_index: usize,
+        /// The byte lane the value was published from.
+        lane: spore_material::Lane,
     },
 }
 
@@ -144,14 +180,14 @@ impl SurfaceKind {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::TangentSpaceNormal => "tangent-space-normal",
-            Self::MaskChannel { layer_index } => {
-                // Positional, never a purpose.
-                if layer_index == 0 {
-                    "mask-channel-0"
-                } else {
-                    "mask-channel-n"
-                }
-            }
+            // The lane's own name, which is positional in the texel and nothing
+            // more: not a purpose, not a sampler stage.
+            Self::MaskChannel { lane, .. } => match lane {
+                spore_material::Lane::Red => "mask-channel-r",
+                spore_material::Lane::Green => "mask-channel-g",
+                spore_material::Lane::Blue => "mask-channel-b",
+                spore_material::Lane::Alpha => "mask-channel-a",
+            },
         }
     }
 }
@@ -245,12 +281,16 @@ pub fn normal_map_surface(
         .iter()
         .find(|entry| entry.key() == Some(plan.key))?;
     let texture = entry.resolved.as_ref()?;
+    // Not `role == TangentSpaceNormal`: the plan already carries the lanes the
+    // record published, and a plan only exists when they were an established
+    // layout. Asserting the byte order here is the cross-check that the plan and
+    // the upload agree.
     debug_assert_eq!(
-        texture.role,
-        TextureRole::TangentSpaceNormal,
-        "a normal map surface must come from a record with that role"
+        plan.lanes,
+        plan.layout.lanes(),
+        "a normal map plan's lanes are the layout's by construction"
     );
-    let layer = texture.layer(0)?;
+    let layer = texture.layer(plan.layer_index)?;
     let mut pixels = swizzle_z_first_to_xyz(&layer.pixels);
     if orientation == NormalMapOrientation::FlipGreen {
         // A DirectX-authored normal map has its green channel pointing the other
@@ -275,12 +315,14 @@ pub fn normal_map_surface(
     })
 }
 
-/// Builds one mask plane's surface.
+/// Builds one mask channel's surface.
 ///
-/// Single channel (`R8Unorm`), because the record has exactly one channel of
-/// content: the colour planes are `ChannelRole::DegenerateColour` under the
-/// byte-pinned codec. Replicating the byte into RGB would invent a colour
-/// nobody has measured.
+/// Single channel (`R8Unorm`), and **the lane is the record's**, taken from the
+/// [`MaskChannelPlan`] that `spore-material`'s own channel binding produced.
+/// Replicating a byte into RGB would invent a colour nobody has measured, and
+/// hardcoding "alpha" here would be the same assumption one layer up: the whole
+/// point of binding from published channels is that this function is told which
+/// lane to read.
 pub fn mask_channel_surface(
     mask: &MaskChannelPlan,
     textures: &[MaterialTexture],
@@ -289,16 +331,27 @@ pub fn mask_channel_surface(
         .iter()
         .find(|entry| entry.key() == Some(mask.key))?;
     let texture = entry.resolved.as_ref()?;
+    // The plan exists because the record published this channel; if the record
+    // it came from publishes something else now, the engine has been handed a
+    // stale plan and says so instead of uploading a guess.
+    if !texture
+        .channels()
+        .get(mask.channel_index)
+        .is_some_and(|binding| binding.role == ChannelRole::MaskChannel)
+    {
+        return None;
+    }
     let layer = texture.layer(mask.layer_index)?;
     Some(SurfaceImage {
         kind: SurfaceKind::MaskChannel {
             layer_index: mask.layer_index,
+            lane: mask.lane,
         },
         key: mask.key,
         width: layer.width.max(1),
         height: layer.height.max(1),
         format: TextureFormat::R8Unorm,
-        pixels: crate::domain::materials::extract_lane(&layer.pixels, 3),
+        pixels: crate::domain::materials::extract_lane(&layer.pixels, mask.lane.index()),
     })
 }
 
@@ -483,6 +536,7 @@ pub fn resolved_count(
 mod tests {
     use super::*;
     use crate::domain::materials::{MeshSlots, ModelMaterials};
+    use spore_material::TextureRole;
 
     /// 2x2, so every synthetic image below holds exactly four texels.
     const TEXELS: u32 = 2;
@@ -499,32 +553,42 @@ mod tests {
             .flat_map(|z| [z, 128, 128, 7])
             .collect();
         MaterialTexture {
-            reference: None,
+            // A fixture that carried no reference could not exercise the
+            // engine's mis-bind guard at all, so it names the reference its
+            // slot will hold.
+            reference: Some(spore_gmdl::GmdlTextureRef {
+                instance_id: 0x067C_79D2,
+                group_id: group,
+            }),
             resolved: Some(synthetic_texture(
                 group,
                 TextureRole::TangentSpaceNormal,
                 pixels,
-                1,
             )),
             refusal: None,
         }
     }
 
-    /// A synthetic two-layer mask: the colour planes collapse to zero and each
-    /// layer's alpha plane carries distinct full-range values.
+    /// A synthetic record that publishes a mask channel: real colour content in
+    /// lanes 0-2 and a full-range plane in lane 3.
+    ///
+    /// **REFUTED, and the comment is the reason:** this used to be a *two-layer*
+    /// mask whose colour lanes were zero. Both halves of that were an artefact
+    /// of a decoder charging 8 bytes per 4x4 block *and* dividing by a 16-byte
+    /// layer header -- two errors that cancelled exactly when the geometry lined
+    /// up. There is one chain, and read as BC3 the colour lanes carry values
+    /// (the creature record: 233 / 254 / 230 distinct per lane over 262 144
+    /// texels), which is why the colour bytes here are non-zero.
     fn mask_entry(group: u32) -> MaterialTexture {
-        let layer0: Vec<u8> = (0..TEXELS * TEXELS)
-            .flat_map(|i| [0u8, 0, 0, i as u8])
+        let pixels: Vec<u8> = (0..TEXELS * TEXELS)
+            .flat_map(|i| [10 + i as u8, 40 + i as u8, 90 + i as u8, i as u8])
             .collect();
-        let layer1: Vec<u8> = (0..TEXELS * TEXELS)
-            .flat_map(|i| [0u8, 0, 0, (255 - i) as u8])
-            .collect();
-        let mut texture =
-            synthetic_texture(group, TextureRole::LayeredAlphaMask, layer0.clone(), 2);
-        texture.layers = vec![synthetic_mip(layer0), synthetic_mip(layer1)];
         MaterialTexture {
-            reference: None,
-            resolved: Some(texture),
+            reference: Some(spore_gmdl::GmdlTextureRef {
+                instance_id: 0x067C_79D2,
+                group_id: group,
+            }),
+            resolved: Some(synthetic_texture(group, TextureRole::ColourAndMask, pixels)),
             refusal: None,
         }
     }
@@ -537,26 +601,24 @@ mod tests {
         }
     }
 
+    /// One chain, one layer, `layer_count` 1 -- the framing identity
+    /// `spore-texture` proved over 2954 of 2954 raster records.
     fn synthetic_texture(
         group: u32,
         role: TextureRole,
         pixels: Vec<u8>,
-        layers: usize,
     ) -> spore_material::ResolvedTexture {
         let mip = synthetic_mip(pixels);
+        // Measured from the bytes rather than hand-written, so a fixture cannot
+        // claim statistics its own texels do not have.
+        let statistics = spore_material::MipStatistics::of(&mip);
         spore_material::ResolvedTexture {
             key: ResourceKey::new(0x2F4E_681C, group, 0x067C_79D2),
             kind: spore_material::TextureKind::Raster,
             image: mip.clone(),
-            layers: vec![mip; layers],
+            layers: vec![mip],
             role,
-            statistics: spore_material::MipStatistics {
-                texels: (TEXELS * TEXELS) as usize,
-                distinct: [4, 1, 1, 4],
-                min: [0; 4],
-                max: [255; 4],
-                sum: [1020, 512, 512, 1020],
-            },
+            statistics,
             envelope: spore_texture::RasterEnvelope {
                 version: 1,
                 width: TEXELS,
@@ -568,7 +630,7 @@ mod tests {
                 field_1c: 0,
             },
             mip_count: 1,
-            layer_count: layers,
+            layer_count: 1,
             pixels_decoded: true,
             claims: Vec::new(),
         }
@@ -676,29 +738,66 @@ mod tests {
     }
 
     #[test]
-    fn a_two_layer_mask_produces_two_single_channel_surfaces() {
+    fn a_mask_record_produces_exactly_one_channel_and_the_engine_uploads_that_lane() {
+        // REFUTED PREMISE, RECORDED: this test used to assert *two* surfaces
+        // from one mask record -- one per layer -- because the raster framing
+        // charged a 16-byte layer header. There is one chain and one layer, so
+        // the correct answer is one surface, and the value in it is the lane the
+        // record published.
         let plan = plan_with_masks();
+        assert_eq!(
+            plan.masks.len(),
+            1,
+            "one published channel, and layers.len() is 1 for every record"
+        );
+        assert_eq!(plan.masks[0].layer_index, 0);
+        assert_eq!(plan.masks[0].lane, spore_material::Lane::Alpha);
         let surfaces = build_surfaces(
             &plan,
             &[mask_entry(MASK_GROUP)],
             NormalMapOrientation::AsStored,
         );
         assert!(surfaces.normal_map.is_none(), "a mask is not a normal map");
-        assert_eq!(surfaces.masks.len(), 2, "one plane per layer");
-        for mask in &surfaces.masks {
-            assert_eq!(mask.format, TextureFormat::R8Unorm);
-            assert_eq!(mask.pixels.len(), 2 * 2, "one byte per texel");
-        }
-        assert_eq!(surfaces.masks[0].pixels, vec![0, 1, 2, 3]);
-        assert_eq!(surfaces.masks[1].pixels, vec![255, 254, 253, 252]);
+        assert_eq!(surfaces.masks.len(), 1);
+        let mask = &surfaces.masks[0];
+        assert_eq!(mask.format, TextureFormat::R8Unorm);
+        assert_eq!(mask.pixels.len(), 2 * 2, "one byte per texel");
+        // The alpha lane of `mask_entry`: 0, 1, 2, 3. The colour lanes of the
+        // same texels are 10..13 / 40..43 / 90..93 and must not appear.
+        assert_eq!(mask.pixels, vec![0, 1, 2, 3]);
         assert_eq!(
-            surfaces.masks[0].kind,
-            SurfaceKind::MaskChannel { layer_index: 0 }
+            mask.kind,
+            SurfaceKind::MaskChannel {
+                layer_index: 0,
+                lane: spore_material::Lane::Alpha
+            }
         );
-        assert_eq!(
-            surfaces.masks[1].kind,
-            SurfaceKind::MaskChannel { layer_index: 1 }
-        );
+        assert_eq!(mask.kind.as_str(), "mask-channel-a");
+    }
+
+    #[test]
+    fn the_mask_lane_is_the_published_one_rather_than_a_hardcoded_alpha() {
+        // The same texels, with the plan telling the uploader to read GREEN.
+        // `mask_channel_surface` must obey the plan: a future role that
+        // publishes a mask channel on another lane has to bind that lane with no
+        // line changed in the upload path.
+        let textures = vec![mask_entry(MASK_GROUP)];
+        let plan = MaskChannelPlan {
+            key: textures[0].key().expect("a resolved texture has a key"),
+            channel_index: 1,
+            layer_index: 0,
+            lane: spore_material::Lane::Green,
+            width: TEXELS,
+            height: TEXELS,
+        };
+        let Some(surface) = mask_channel_surface(&plan, &textures) else {
+            // The stale-plan check is allowed to refuse here, because the record
+            // publishes its mask channel on alpha; what must never happen is a
+            // surface carrying the wrong lane.
+            return;
+        };
+        assert_eq!(surface.pixels, vec![40, 41, 42, 43]);
+        assert_eq!(surface.kind.as_str(), "mask-channel-g");
     }
 
     #[test]
@@ -719,9 +818,11 @@ mod tests {
     }
 
     #[test]
-    fn the_three_entry_shape_binds_four_mask_planes_and_one_normal() {
-        // The corpus's common shape is (mask, mask, normal): two records x two
-        // layers is four planes.
+    fn the_three_entry_shape_binds_one_channel_per_mask_record_and_one_normal() {
+        // REFUTED PREMISE, RECORDED: "four mask planes" was two records x two
+        // layers, and the second factor was a decoder artefact. The corpus's
+        // common shape is two records that publish a mask channel plus one
+        // normal, so it is two channels and one normal map -- three surfaces.
         let mut materials = ModelMaterials::empty(None);
         materials.textures = vec![
             mask_entry(0x4063_2900),
@@ -733,24 +834,30 @@ mod tests {
             material_id: 0x407D_FDDB,
             slots: vec![
                 spore_gmdl::GmdlTextureRef {
-                    instance_id: 1,
+                    instance_id: 0x067C_79D2,
                     group_id: 0x4063_2900,
                 },
                 spore_gmdl::GmdlTextureRef {
-                    instance_id: 1,
+                    instance_id: 0x067C_79D2,
                     group_id: 0x4063_2901,
                 },
                 spore_gmdl::GmdlTextureRef {
-                    instance_id: 1,
+                    instance_id: 0x067C_79D2,
                     group_id: 0x4063_2902,
                 },
             ],
         }];
         let plan = materials.plans()[0].clone();
+        assert_eq!(plan.masks.len(), 2, "one published channel per record");
         let surfaces = build_surfaces(&plan, &materials.textures, NormalMapOrientation::AsStored);
-        assert_eq!(surfaces.masks.len(), 4);
+        assert_eq!(surfaces.masks.len(), 2);
         assert!(surfaces.normal_map.is_some());
-        assert_eq!(surfaces.len(), 5);
+        assert_eq!(surfaces.len(), 3);
+        assert!(
+            plan.unidentified.is_empty(),
+            "everything bound: {:?}",
+            plan.unidentified
+        );
     }
 
     #[test]
@@ -843,7 +950,10 @@ mod tests {
     }
 
     #[test]
-    fn a_mesh_with_two_masks_uploads_two_images_and_no_material_slot() {
+    fn a_mask_record_uploads_one_image_and_binds_no_material_slot() {
+        // REFUTED PREMISE, RECORDED: "two images", because the old raster
+        // decode produced two layers. One chain means one published channel
+        // means one image.
         let plan = plan_with_masks();
         let textures = vec![mask_entry(MASK_GROUP)];
         let mut images: Assets<Image> = Assets::default();
@@ -855,8 +965,8 @@ mod tests {
             None,
         );
         assert!(bound.material.normal_map_texture.is_none());
-        assert_eq!(bound.mask_count(), 2);
-        assert_eq!(images.len(), 2, "both planes are uploaded and kept");
+        assert_eq!(bound.mask_count(), 1);
+        assert_eq!(images.len(), 1, "the channel is uploaded and kept");
         for (surface, handle) in bound.surfaces.masks.iter().zip(bound.mask_handles.iter()) {
             let image = images
                 .get(handle)
@@ -881,12 +991,14 @@ mod tests {
     fn an_unidentified_record_produces_no_surface_at_all() {
         let mut materials = ModelMaterials::empty(None);
         materials.textures = vec![MaterialTexture {
-            reference: None,
+            reference: Some(spore_gmdl::GmdlTextureRef {
+                instance_id: 0x067C_79D2,
+                group_id: MASK_GROUP,
+            }),
             resolved: Some(synthetic_texture(
                 MASK_GROUP,
                 TextureRole::Unidentified,
                 vec![0; 16],
-                1,
             )),
             refusal: None,
         }];
@@ -894,12 +1006,17 @@ mod tests {
             mesh_index: 0,
             material_id: 1,
             slots: vec![spore_gmdl::GmdlTextureRef {
-                instance_id: 1,
-                group_id: 0x4063_2900,
+                instance_id: 0x067C_79D2,
+                group_id: MASK_GROUP,
             }],
         }];
         let plan = materials.plans()[0].clone();
         assert_eq!(plan.unidentified.len(), 1);
+        assert_eq!(
+            plan.unidentified[0].reason,
+            crate::domain::materials::UnboundReason::NoPublishedChannel,
+            "a record that published nothing bindable is reported as exactly that"
+        );
         assert!(!plan.has_any_surface());
         let surfaces = build_surfaces(&plan, &materials.textures, NormalMapOrientation::AsStored);
         assert!(surfaces.is_empty());
@@ -907,24 +1024,31 @@ mod tests {
 
     #[test]
     fn a_refused_reference_produces_no_surface_and_keeps_its_reason() {
+        let reference = spore_gmdl::GmdlTextureRef {
+            instance_id: 1,
+            group_id: 0x4063_2900,
+        };
         let materials = ModelMaterials {
             textures: vec![MaterialTexture {
-                reference: None,
+                reference: Some(reference),
                 resolved: None,
                 refusal: Some("no such record".into()),
             }],
             meshes: vec![MeshSlots {
                 mesh_index: 0,
                 material_id: 1,
-                slots: vec![spore_gmdl::GmdlTextureRef {
-                    instance_id: 1,
-                    group_id: 0x4063_2900,
-                }],
+                slots: vec![reference],
             }],
             ..ModelMaterials::empty(None)
         };
         let plan = materials.plans()[0].clone();
-        assert!(plan.unidentified.is_empty() || plan.normal_map.is_none());
+        assert_eq!(plan.unidentified.len(), 1);
+        assert_eq!(
+            plan.unidentified[0].reason,
+            crate::domain::materials::UnboundReason::Refused,
+            "a refusal is named as a refusal, not as a record that bound nothing"
+        );
+        assert!(!plan.has_any_surface());
         assert_eq!(materials.refusals().count(), 1);
     }
 
@@ -940,7 +1064,10 @@ mod tests {
                 pixels: vec![0; 16],
             }),
             masks: vec![SurfaceImage {
-                kind: SurfaceKind::MaskChannel { layer_index: 0 },
+                kind: SurfaceKind::MaskChannel {
+                    layer_index: 0,
+                    lane: spore_material::Lane::Alpha,
+                },
                 key: ResourceKey::new(1, 2, 4),
                 width: 512,
                 height: 512,
@@ -967,15 +1094,29 @@ mod tests {
                 );
             }
         }
+        // The name is the lane's, which is a fact about the bytes. It is not a
+        // sampler stage and not a purpose, and the layer index is not in it at
+        // all: every record has one chain, so a positional name would be a
+        // second index for the same thing.
         assert_eq!(
-            SurfaceKind::MaskChannel { layer_index: 0 }.as_str(),
-            "mask-channel-0"
+            SurfaceKind::MaskChannel {
+                layer_index: 0,
+                lane: spore_material::Lane::Alpha
+            }
+            .as_str(),
+            "mask-channel-a"
         );
-        assert_eq!(
-            SurfaceKind::MaskChannel { layer_index: 1 }.as_str(),
-            "mask-channel-n",
-            "beyond the first the name stays positional"
-        );
+        for lane in spore_material::Lane::ALL {
+            let name = SurfaceKind::MaskChannel {
+                layer_index: 0,
+                lane,
+            }
+            .as_str();
+            assert!(
+                name.starts_with("mask-channel-") && name.len() == "mask-channel-".len() + 1,
+                "{name} names a lane and nothing else"
+            );
+        }
     }
 
     #[test]

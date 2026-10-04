@@ -175,7 +175,7 @@ What this build does with each term:
 | `editorColors.mColor1.rgb` / `mColor2.rgb` | **INFERRED** — and applied | `spore_assets::color::claims::SKIN_COLOR_TO_SHADER`. The shader names, the effect cheatsheet's `SPSkinPaintClear -diffuse color1` (`0x497767B9`) and the XML's `<color1>` are the same words; no record states the assignment. |
 | the numeric values | **VERIFIED by bytes** | `color::extract` reads them; `tests/real_corpus.rs` asserts `skincolor1` of `0x05e3df13` is exactly `0.498039,0.803922,0.474510`. |
 | `editorColors.mColor1.a` / `mColor2.a` | **UNKNOWN — refused** | `claims::COLOR_ALPHA_SOURCE`: the record stores **three** components and nothing in the corpus says where the fourth comes from. Inventing a weight (0.5, "fully opaque", …) would be inventing a field. |
-| `diffuseTexture` as the `lerp` weight | **UNKNOWN — refused** | `spore_material::claims::MASK_LAYER_PURPOSE`: the `DXT5` families' four alpha planes have no established per-plane purpose, so no plane is treated as a mask weight. The planes stay uploaded and unaddressed-by-guess (`MaskChannels`), exactly as before. |
+| `diffuseTexture` as the `lerp` weight | **UNKNOWN — refused** | `spore_material::claims::MASK_LAYER_PURPOSE`: the one mask channel a `DXT5` record publishes has no established purpose, so no channel is treated as a mask weight. It stays uploaded and unaddressed-by-guess (`MaskChannels`), and the engine still substitutes **no** weight for it. |
 | `In.color.rgb` (vertex colour) | **not available** | `spore_gmdl` yields positions, normals and uvs; no vertex-colour channel is decoded. |
 | `Current.color.a` | **not reproduced** | alpha blending would be a claim about mask planes that is not established; the material stays `AlphaMode::Opaque`. |
 
@@ -326,12 +326,34 @@ or a closed `reason`.
 | U2 | the fourth colour component (`mColor1.a` / `mColor2.a`) | `spore_assets::color::claims::COLOR_ALPHA_SOURCE`; named on every report line as `alpha_source=UNKNOWN` |
 | U3 | what one `paintregion` bit selects | `claims::PAINT_REGION_BITS`; `RegionMapping::is_decoded()` is `const`-`false` |
 | U4 | how `paintid` resolves | `claims::PAINT_ID_RESOLUTION`; the id is carried and never looked up |
-| U5 | the purpose of any of the four mask planes | `spore_material::claims::MASK_LAYER_PURPOSE`; `mask_purpose=UNKNOWN` on every report line |
+| U5 | the purpose of the mask channel a raster record publishes | `spore_material::claims::MASK_LAYER_PURPOSE`; `mask_purpose=UNKNOWN` on every report line |
 | U6 | where a *player's own* creature colour lives | `claims::USER_CREATURE_COLOR_LOCATION`; every `sporemodel` in the install is a shipped preset |
 | U7 | whether `skincolor2`/`skincolor3` are regions or pattern tints | not stated anywhere; `unapplied_colours=1` on the line is the honest accounting |
 | U8 | the two creatures that share a family and disagree | `--sporemodel` exists for that, and `candidates=47` is printed |
 
 ### Also recorded, not caused by this work
+
+### Re-verified after the raster refutation, 2026-10-05
+
+The raster layer model was refuted (`DXT5` is BC3, one chain, no layer headers)
+and with it "a raster record carries no colour" — which was a tautology of the
+old decoder. `spore-material` re-derived its roles from real BC3 texels and
+`spore-engine` was reworked to bind **channel roles** rather than role names.
+Neither touches this document's pipeline, and the colour survives: the same
+command, measured on a real screenshot of the same window.
+
+```text
+green-dominant pixels inside the creature's bbox   97 784
+neutral (grey) pixels in the same bbox              17 265
+G − R over the creature                    +9 … +30, mean +22.7
+OPENSPORE-PAINT v1 … base=#7fcd79 … link=INFERRED   OPENSPORE-MATERIAL v1 … unbound=0
+```
+
+against the previous session's `98 203` / `21 454` / `+23…+30`. A record that now
+carries colour feeds **no** colour slot: `base_color_texture` is still `None`,
+because "it has colour" and "it is a colour map" are different claims and only
+the first is measured. The normal map still facets the skin — §3.4 of
+`docs/ENGINE-SCENE.md` has the A/B against a `--texture`-less render.
 
 `crates/spore-material` gained `BindingScope::Undetermined { collected,
 contradicted }` concurrently. The creature record's material-info walk stops at
@@ -340,6 +362,6 @@ evenly over two meshes and are therefore wrong; `spore-material` refuses the
 cut. `crates/spore-engine/src/domain/materials.rs` handles it as
 `applies_whole_set()` does — the same flat-index arithmetic as `WholeModel`,
 with `stated_ordinal` returning `None` so the refusal cannot manufacture an
-ordinal conflict — and `tests/real_corpus.rs` was rewritten to assert the new,
-measured truth: `Undetermined { collected: 2, contradicted: 1 }`, both meshes
+ordinal conflict — and `tests/real_corpus.rs` asserts the measured truth:
+`Undetermined { collected: 2, contradicted: 1 }`, both meshes
 carrying both references, `ordinal_conflicts == 0` on each.

@@ -5,6 +5,20 @@
 //! than quoted, so a change to `spore-material` that moves a role cannot reach
 //! the renderer without one of these failing.
 //!
+//! # Two corpus measurements, both recorded in these tests
+//!
+//! 1. **The raster layer model is refuted.** One mip chain, no layers, no
+//!    16-byte layer headers; `DXT5` is BC3. The engine's old "two layers per
+//!    mask record" expectation came from a decoder that charged 8 bytes per
+//!    4x4 block *and* divided by `16 + chain` -- two errors that cancelled
+//!    exactly when the geometry lined up.
+//! 2. **"A raster carries no colour" was a tautology of that decoder.** Read as
+//!    BC3 the same records carry 32 distinct greens and blues. The engine binds
+//!    only what `spore-material` publishes, so the colour in a record does not
+//!    become a base-colour map: a `DXT5` record still feeds no material channel
+//!    but its mask plane, and the model's colour still comes from its
+//!    `sporemodel` record.
+//!
 //! Reproduce with:
 //!
 //! ```bash
@@ -123,17 +137,17 @@ fn the_creature_record_carries_a_normal_map_and_its_short_list_cannot_be_cut_per
     // Because the whole short list goes to every mesh, BOTH meshes carry both
     // references -- the conservative answer, and the visible consequence of
     // refusing the cut.
+    //
+    // The roles themselves are asserted, because they are what the renderer
+    // binds from. The first slot's record is a `DXT5`: it is not a normal map,
+    // and it is not published as the old layered-alpha-mask either, because with
+    // BC3 texels its colour lanes are no longer degenerate. What it publishes is
+    // asserted from its channels, below.
     assert_eq!(
         materials.roles(),
         vec![
-            vec![
-                TextureRole::LayeredAlphaMask,
-                TextureRole::TangentSpaceNormal
-            ],
-            vec![
-                TextureRole::LayeredAlphaMask,
-                TextureRole::TangentSpaceNormal
-            ],
+            vec![TextureRole::ColourAndMask, TextureRole::TangentSpaceNormal],
+            vec![TextureRole::ColourAndMask, TextureRole::TangentSpaceNormal],
         ]
     );
 
@@ -156,10 +170,20 @@ fn the_creature_record_carries_a_normal_map_and_its_short_list_cannot_be_cut_per
 
     // The content of each.
     let mask = materials.entry(0).unwrap().resolved.as_ref().unwrap();
-    assert_eq!(mask.role, TextureRole::LayeredAlphaMask);
-    assert_eq!(mask.layers.len(), 2, "two alpha planes");
+    assert_eq!(mask.role, TextureRole::ColourAndMask);
+    assert_eq!(mask.layer_count, 1, "one mip chain, always");
+    assert_eq!(mask.layers.len(), 1, "and no layer header, at any size");
     assert_eq!((mask.image.width, mask.image.height), (512, 512));
     assert_eq!(mask.mip_count, 10);
+    // The refutation, on this record: read as BC3 the colour lanes are full
+    // ranges, not the two-value field the old codec could produce. These are the
+    // distinct-value counts over all 262 144 texels.
+    assert_eq!(
+        mask.statistics.distinct,
+        [233, 254, 230, 256],
+        "green and blue are no longer degenerate, so 'a raster carries no \
+         colour' was a property of the decoder and not of the record"
+    );
     let normal = materials.entry(1).unwrap().resolved.as_ref().unwrap();
     assert_eq!(normal.role, TextureRole::TangentSpaceNormal);
     assert_eq!(normal.layers.len(), 1);
@@ -192,15 +216,32 @@ fn the_creature_record_carries_a_normal_map_and_its_short_list_cannot_be_cut_per
             .as_ref()
             .unwrap_or_else(|| panic!("mesh {index} carries the normal map"));
         assert_eq!(normal_plan.lanes, [1, 2, 0], "file byte 0 holds Z");
+        assert_eq!(normal_plan.layer_index, 0);
         assert!(normal_plan.lane_zero_is_z());
+        // REFUTED: this used to be 2, "two alpha planes from the one mask
+        // record". The record has one chain and publishes one mask channel.
         assert_eq!(
             plan.masks.len(),
-            2,
-            "two alpha planes from the one mask record"
+            1,
+            "one published mask channel from a one-layer record"
+        );
+        assert_eq!(plan.masks[0].lane, spore_material::Lane::Alpha);
+        assert_eq!(plan.masks[0].layer_index, 0);
+        assert_eq!(plan.masks[0].width, 512);
+        assert!(
+            plan.unidentified.is_empty(),
+            "both slots bound something: {:?}",
+            plan.unidentified
         );
         assert_eq!(
             plan.ordinal_conflicts, 0,
             "a refused cut states no ordinal, so it cannot manufacture a conflict"
+        );
+        // And the whole-set binding means both meshes hold the *same* two
+        // records: mesh 1 is not bound to a texture out of mesh 0's block.
+        assert_eq!(
+            plan.masks[0].key, planes[0].masks[0].key,
+            "the same collected list goes to every mesh"
         );
     }
     let swizzled = spore_engine::domain::materials::swizzle_z_first_to_xyz(&normal.image.pixels);
@@ -265,7 +306,7 @@ fn the_two_resolution_routes_agree_field_for_field_on_a_record_the_strict_one_ac
 
 #[test]
 #[ignore = "needs SPORE/Data/Spore_Content.package; run with --ignored --nocapture"]
-fn the_documented_asset_is_mask_mask_normal_with_all_ordinals_agreeing() {
+fn the_documented_asset_keeps_its_cut_its_shape_and_its_ordinals() {
     let Some(store) = store() else { return };
     let resolved = spore_material::resolve_model_record(&store, &DOCUMENTED, raster()).unwrap();
     assert_eq!(resolved.meshes.len(), 1);
@@ -274,18 +315,32 @@ fn the_documented_asset_is_mask_mask_normal_with_all_ordinals_agreeing() {
         BindingScope::PerMeshBlock { refs_per_mesh: 3 }
     );
     assert!(resolved.scope.is_inferred());
+    // REFUTED, RECORDED: this used to assert `TexSetShape::MaskMaskNormal`, over
+    // a role called `LayeredAlphaMask` and two layers per record. The set's
+    // SHAPE survived the raster refutation -- three references, normal last --
+    // under `spore-material`'s re-derived role name. What did not survive is the
+    // content the old name asserted (a colourless, two-layer alpha plane), and
+    // that is asserted from the record's own statistics below rather than from a
+    // role's spelling.
     assert_eq!(
         resolved.observed_shape,
-        spore_material::TexSetShape::MaskMaskNormal
+        spore_material::TexSetShape::ColourAndMaskTwiceThenNormal
+    );
+    assert!(
+        resolved.observed_shape.matches_corpus(),
+        "the corpus regularity still holds, under the role name the content earns"
     );
     assert_eq!(resolved.ordinal_agreement.agreed, 3);
     assert_eq!(resolved.ordinal_agreement.compared, 3);
+    assert!(resolved.ordinal_agreement.checked());
+    assert!(resolved.ordinal_agreement.all_agree());
     assert_eq!(resolved.resolved_count(), 3);
+    assert_eq!(resolved.model.texture_refs.len(), 3);
     assert_eq!(
         resolved.roles(),
         vec![vec![
-            TextureRole::LayeredAlphaMask,
-            TextureRole::LayeredAlphaMask,
+            TextureRole::ColourAndMask,
+            TextureRole::ColourAndMask,
             TextureRole::TangentSpaceNormal,
         ]]
     );
@@ -304,35 +359,143 @@ fn the_documented_asset_is_mask_mask_normal_with_all_ordinals_agreeing() {
             spore_material::ChannelRole::UnidentifiedLane,
         ]
     );
-    // The masks carry two alpha planes each and no colour: their colour planes
-    // are `DegenerateColour` under the byte-pinned codec.
+
+    // The other two records: ONE chain each, publishing one mask channel over
+    // three colour lanes.
+    //
+    // REFUTED, RECORDED: this used to assert `layer_count == 2`, eight channel
+    // bindings, `DegenerateColour` on the colour lanes, and a distinct-value
+    // count of 1 for green and blue. Every one of those was a measurement *of the
+    // old 8-byte decoder*. Read as BC3 the same records carry colour, and the
+    // counts below are what they actually are.
     for index in [0usize, 1] {
         let mask = resolved.textures[index].as_ref().unwrap();
-        assert_eq!(mask.layer_count, 2);
+        assert_eq!(mask.layer_count, 1, "one mip chain, always");
+        assert_eq!(mask.layers.len(), 1);
+        assert!(mask.pixels_decoded);
         assert_eq!(
-            mask.channels()
+            mask.channels().len(),
+            4,
+            "4 * layer_count, and layer_count is 1"
+        );
+        let bindings = mask.channels();
+        assert_eq!(bindings[0].lane, spore_material::Lane::Red);
+        assert_eq!(bindings[3].lane, spore_material::Lane::Alpha);
+        assert_eq!(
+            bindings
                 .iter()
-                .map(|c| c.role)
-                .collect::<Vec<_>>()
-                .len(),
-            8
-        );
-        assert!(mask
-            .channels()
-            .iter()
-            .all(|c| c.role == spore_material::ChannelRole::DegenerateColour
-                || c.role == spore_material::ChannelRole::MaskChannel));
-        assert_eq!(
-            mask.statistics.distinct[spore_material::Lane::Green.index()],
+                .filter(|c| c.role == spore_material::ChannelRole::MaskChannel)
+                .count(),
             1,
-            "the green span is 0 across the corpus"
+            "one channel the engine may upload, and no more"
         );
-        assert_eq!(
-            mask.statistics.distinct[spore_material::Lane::Blue.index()],
-            1,
-            "the blue span is 0 across the corpus"
-        );
+        for lane in [spore_material::Lane::Red, spore_material::Lane::Green] {
+            assert!(
+                mask.statistics.distinct[lane.index()] > 1,
+                "lane {} takes {} distinct values: the old decoder could not \
+                 produce a second one, which is why this number used to be 1",
+                lane.as_str(),
+                mask.statistics.distinct[lane.index()],
+            );
+        }
     }
+
+    // What the engine does with that, from the same record: two mask channels --
+    // one per record -- and one normal map. Never the other way round.
+    let engine = spore_engine::domain::materials::ModelMaterials::from_model_textures(&resolved);
+    let plans = engine.plans();
+    assert_eq!(plans.len(), 1);
+    assert_eq!(plans[0].masks.len(), 2, "one published channel per record");
+    assert!(plans[0].normal_map.is_some(), "the 0x15 record binds");
+    assert!(
+        plans[0].unidentified.is_empty(),
+        "nothing was left unbound: {:?}",
+        plans[0].unidentified
+    );
+    for mask in &plans[0].masks {
+        assert_eq!(mask.lane, spore_material::Lane::Alpha);
+        assert_eq!(mask.layer_index, 0);
+        assert_eq!((mask.width, mask.height), (512, 512));
+    }
+    // And the normal map is not one of the mask records: the keys differ.
+    let normal_key = plans[0].normal_map.as_ref().unwrap().key;
+    assert!(plans[0].masks.iter().all(|m| m.key != normal_key));
+}
+
+#[test]
+#[ignore = "needs SPORE/Data/Spore_Content.package; run with --ignored --nocapture"]
+fn every_raster_record_decodes_and_only_the_luminance_family_publishes_a_normal() {
+    // The corpus-scale version of the same claim, and the number the engine's
+    // binding policy rests on: **2954 of 2954** raster records decode with one
+    // mip chain and no layer header, and exactly one family publishes anything
+    // bindable. If a decoder regression ever takes a record back, this fails
+    // rather than quietly changing what the renderer shows.
+    use spore_material::Lane;
+
+    let Some(store) = store() else { return };
+    let mut total = 0usize;
+    let mut chains = std::collections::BTreeMap::<usize, usize>::new();
+    let mut roles = std::collections::BTreeMap::<String, usize>::new();
+    let mut normals = 0usize;
+    for key in store.identities_of_type(raster()) {
+        let bytes = store.read(&key).expect("every raster record extracts");
+        let image =
+            spore_texture::decode_raster(&bytes).unwrap_or_else(|e| panic!("{key} decodes: {e}"));
+        total += 1;
+        *chains.entry(image.layers.len()).or_default() += 1;
+        assert_eq!(
+            image.layers.len(),
+            1,
+            "{key}: one mip chain per record, no layer header"
+        );
+        let stats = spore_material::MipStatistics::of(&image.layers[0][0]);
+        let role = spore_material::classify(image.envelope.fourcc, &stats);
+        *roles.entry(role.as_str().to_owned()).or_default() += 1;
+        if spore_material::normal_map_signature(&stats) {
+            normals += 1;
+        }
+        // The engine binds a normal map only when the record publishes the three
+        // normal components, so a record that carries no colour must not be able
+        // to masquerade as one.
+        if !spore_material::normal_map_signature(&stats) {
+            assert!(
+                stats.mean(Lane::Red).is_some(),
+                "{key}: statistics were gathered"
+            );
+        }
+    }
+    eprintln!("rasters={total} normal_maps={normals} roles={roles:?} chains={chains:?}");
+    assert_eq!(total, 2954, "every raster record in Spore_Content.package");
+    assert_eq!(
+        *chains.get(&1).unwrap_or(&0),
+        2954,
+        "layers.len() is 1 for every single record"
+    );
+    assert_eq!(normals, 901, "the 0x15 family, and nothing else");
+    assert_eq!(
+        roles.get("tangent-space-normal").copied().unwrap_or(0),
+        901,
+        "901 records publish a normal: {roles:?}"
+    );
+    // 1 747 `DXT5` records publish a colour plane and a mask channel -- and
+    // crucially NOT a normal -- while the 306 `DXT1` records publish nothing at
+    // all. That is the whole corpus role census, and it is what the renderer
+    // binds from.
+    assert_eq!(
+        roles.get("colour-and-mask").copied().unwrap_or(0),
+        1747,
+        "the DXT5 family: {roles:?}"
+    );
+    assert_eq!(
+        roles.get("unidentified").copied().unwrap_or(0),
+        306,
+        "the DXT1 family, which no signature claims: {roles:?}"
+    );
+    assert_eq!(
+        roles.values().sum::<usize>(),
+        total,
+        "every record is counted in exactly one role: {roles:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------

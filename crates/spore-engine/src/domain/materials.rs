@@ -7,37 +7,103 @@
 //!
 //! # What the corpus says, and what this module therefore does
 //!
-//! Measured over `SPORE/Data/Spore_Content.package` and published in
-//! `docs/MATERIAL-ROLES.md`:
+//! Measured over `SPORE/Data/Spore_Content.package`:
 //!
-//! * **2 954 raster records, and not one of them decodes as a base-colour
-//!   map.** 1 374 decodable `DXT5` records have a green span of **0**, a blue
-//!   span of **0**, a red distinct-value count of at most **2**, and 477 771
-//!   sampled palette entries collapse to exactly **two** RGB triples:
-//!   `(0,0,0)` and `(8,0,0)`. They are alpha/mask surfaces.
-//! * The `0x15` family is a **tangent-space normal map stored Z FIRST**: over
-//!   901/901 records the first byte's mean is 232.51 … 255.00, and it exceeds
-//!   the brighter lateral lane by at least 94.21.
+//! * **All 2 954 raster records decode, and none of them is published as a
+//!   base-colour map.** `spore-material` derives a role from the record's
+//!   `fourcc` **and** a per-lane statistic over its own base mip, and it
+//!   publishes exactly one bindable content class in this corpus: the `0x15`
+//!   family as a **tangent-space normal map stored Z FIRST** (901 of 901,
+//!   first byte's mean 232.51 … 255.00, leading the brighter lateral lane by
+//!   at least 94.21). Every other record lands in `TextureRole::Unidentified`.
+//! * **The colour of a Spore model is in its `sporemodel` record**, not in a
+//!   raster — see [`crate::domain::paint`]. So `base_color_texture` is `None`
+//!   always, and there is no `Diffuse` here: adding one would be a claim about
+//!   a record that does not exist.
 //!
-//! So there is no `Diffuse` here, and adding one would be a claim about a
-//! record that does not exist.
+//! # REFUTED: "a raster record carries no colour, only alpha"
 //!
+//! This module used to carry that claim in the paragraph above, and every test
+//! in it was written to defend it: *"the corpus's common three-entry set offers
+//! **four** planes per mesh"*, `layer_index` on every mask, `DegenerateColour`
+//! for the colour lanes. All of it was a **tautology of a broken decoder**.
+//! `spore-texture` decoded `DXT5` as an 8-byte-per-block format, whose colour
+//! field cannot set bits 10..19 of a 16-bit word, so green and blue read as
+//! zero *by construction* for any input at all. The corpus has since proved
+//! the block stride is **16** (BC3), and the same records now carry **32
+//! distinct greens and 32 distinct blues**. Measured on this record set: the
+//! creature's `DXT5` texture takes **233 / 254 / 230 distinct values** in red,
+//! green and blue over its 262 144 texels.
+//!
+//! Three things follow, and they are the reason this module no longer names a
+//! role at all:
+//!
+//! 1. `layers` is **one chain, always** — there are no layer headers and no
+//!    second surface, so `layer_index` is `0` everywhere and a per-layer loop
+//!    was iterating an artefact;
+//! 2. `TextureRole::LayeredAlphaMask`'s content signature is a statement about
+//!    the *old* decoder, and with the decoder fixed no corpus record satisfies
+//!    it. `spore-material` publishes `Unidentified` for all of them, which is
+//!    an observation ("we checked and it is not that") rather than a default;
+//! 3. the engine therefore binds **from the channel bindings
+//!    `spore-material` publishes**, never from a role variant it expects. See
+//!    [`MeshMaterialPlan`] and [`NormalMapPlan::from_channels`].
+//!
+//! # What is still NOT established, and is still refused
+//!
+//! Refuting "a raster carries no colour" is **not** the same as establishing
+//! that a raster *is* a colour map. Nothing measured here says what a `DXT5` or
+//! `DXT1` record is *for*; the purposes of every non-normal channel remain
+//! `UNKNOWN` (`spore_material::claims::MASK_LAYER_PURPOSE`), and binding one
+//! into `base_color_texture` or `metallic_roughness_texture` is the exact
+//! confusion this module was written to prevent. So: the normal map binds, and
+//! everything else is uploaded nowhere and *reported* — see
+//! [`UnboundReason`], which is what the report line prints.
 //! # The index math, and why it is not a zip
 //!
 //! `spore-gmdl` flattens every material-info block's texture references into
 //! one list and loses the block boundaries. `spore-material` recovers a cut by
-//! dividing by the mesh count, and grades it **INFERRED**
-//! (`BindingScope::is_inferred()` is `true` for both variants). The mapping is:
+//! dividing by the mesh count, cross-checks it against the record's own
+//! statement of each entry's position, and grades the whole thing **INFERRED**
+//! (`BindingScope::is_inferred()` is `true` for every variant, including the
+//! third). The mapping is:
 //!
 //! ```text
 //! flat = mesh_index * refs_per_mesh + within      // PerMeshBlock { refs_per_mesh }
-//! flat = within                                  // WholeModel
+//! flat = within                                  // WholeModel | Undetermined { .. }
 //! ```
 //!
 //! `ModelTextures::roles()` computes this. [`ModelMaterials::roles`] computes
 //! the same thing from the same inputs, and
 //! `tests/real_corpus.rs` asserts the two agree on the real documented asset —
 //! so the engine has one algorithm and `spore-material` remains the reference.
+//!
+//! # Three scopes, and the third one is the one the creature takes
+//!
+//! `BindingScope` has **three** arms and this engine matches all three wherever
+//! it touches a cut:
+//!
+//! | arm | when | what a mesh holds |
+//! |---|---|---|
+//! | `PerMeshBlock { refs_per_mesh }` | the division is even **and** the record's group-id ordinals agree with it | its own slice |
+//! | `WholeModel` | the division is not even, or no slot states an ordinal to check with | the whole list |
+//! | `Undetermined { collected, contradicted }` | the division is even but **the record contradicts it** | the whole (short) list |
+//!
+//! `Undetermined` is a **short** list seen from the outside: the gmdl
+//! material-info walk stops on the undocumented shader-data id `0x218` in 619
+//! of 4 209 gmdl records, and because what is missing is *whole blocks* the
+//! truncated list still divides evenly — so the division used to succeed on
+//! incomplete input and hand mesh 1 a texture out of mesh 0's block. The
+//! documented creature is one of those records.
+//!
+//! [`ModelMaterials::flat_index`] gives every mesh the whole collected list
+//! under `Undetermined`, which is the conservative answer, and
+//! [`stated_ordinal`] states **no** ordinal under it, so the engine cannot
+//! manufacture a conflict out of the refusal itself. On top of that,
+//! [`ModelMaterials::plan_for`] refuses to bind a slot whose flat entry carries
+//! a **different reference**: the cut can then never silently move a texture
+//! between blocks, even if a future `spore-material` offers a cut this engine
+//! would disagree with.
 //!
 //! # The swizzle, stated three times because it is the likeliest mistake here
 //!
@@ -58,8 +124,8 @@ use spore_assets::LoadedModel;
 use spore_core::ResourceKey;
 use spore_gmdl::GmdlModel;
 use spore_material::{
-    BindingScope, ChannelRole, MaterialError, ModelTextures, OrdinalAgreement, ResolvedTexture,
-    TexSetShape, TextureRole,
+    BindingScope, ChannelRole, Lane, MaterialError, ModelTextures, OrdinalAgreement,
+    ResolvedTexture, TexSetShape, TextureRole,
 };
 
 /// How a mesh's normal map's lanes are stored on disk.
@@ -82,6 +148,20 @@ impl NormalLayout {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::ZFirst => "z-first",
+        }
+    }
+
+    /// `[byte of X, byte of Y, byte of Z]` — the **inverse** of
+    /// [`lane_components`], and the form the channel bindings arrive in.
+    ///
+    /// Both directions exist because both are easy to write backwards, and a
+    /// layout that is only stated one way is a layout that can only be checked
+    /// one way. `tests` asserts they are inverses of each other.
+    pub const fn lanes(self) -> [usize; 3] {
+        match self {
+            // `lane_components` says byte 0 holds Z (index 2), byte 1 holds X
+            // (0), byte 2 holds Y (1).
+            Self::ZFirst => [1, 2, 0],
         }
     }
 }
@@ -124,9 +204,10 @@ pub fn swizzle_z_first_to_xyz(pixels: &[u8]) -> Vec<u8> {
 
 /// Extracts one byte lane of an RGBA8 image into a single-channel buffer.
 ///
-/// Used for a `DXT5` layer's **alpha plane**, which is the only plane of that
-/// record with any content: the RGB planes are `ChannelRole::DegenerateColour`
-/// under the byte-pinned codec.
+/// Used for a channel `spore-material` published as
+/// [`ChannelRole::MaskChannel`]. The lane is **not** chosen here: it arrives in
+/// the plan, from the record's own binding, because the engine's job is to bind
+/// what is published rather than to guess which lane was meant.
 pub fn extract_lane(pixels: &[u8], lane: usize) -> Vec<u8> {
     pixels.iter().skip(lane).step_by(4).copied().collect()
 }
@@ -279,6 +360,14 @@ impl ModelMaterials {
         let scope = meshes
             .first()
             .map_or(BindingScope::WholeModel, |mesh| mesh.scope);
+        // The scope is a property of the model, not of one mesh, so every mesh
+        // states the same one. If that ever stopped being true the engine would
+        // be about to divide a list by a scope it read off mesh 0 while binding
+        // mesh 1's slots, so the assumption is asserted rather than trusted.
+        debug_assert!(
+            meshes.iter().all(|mesh| mesh.scope == scope),
+            "every mesh of one model must report the same BindingScope"
+        );
         let textures = results
             .into_iter()
             .zip(model.texture_refs.iter())
@@ -431,71 +520,143 @@ impl ModelMaterials {
         };
         for (within, reference) in mesh.slots.iter().enumerate() {
             let flat = self.flat_index(mesh.mesh_index, within);
-            let Some(entry) = self.entry(flat) else {
-                // No such flat index. Recorded as an unidentified surface with
-                // no key, which is the honest shape of "the record referenced
-                // something we cannot line up".
-                plan.unidentified.push(UnidentifiedSurface {
-                    reference: Some(*reference),
-                    key: None,
-                    flat,
-                });
-                continue;
-            };
-            // A conflict is a *finding*: the derived ordinal disagrees with the
-            // group id's low byte, which is the only independent cross-check
-            // available. Reported, never silently preferred.
-            if entry.reference == Some(*reference) {
-                if let Some(ordinal) = stated_ordinal(self.scope, within) {
-                    if ordinal != reference.group_id & 0xFF {
-                        plan.ordinal_conflicts += 1;
-                    }
-                }
-            }
-            match entry.resolved.as_ref() {
-                None => plan.unidentified.push(UnidentifiedSurface {
-                    reference: Some(*reference),
-                    key: entry.key(),
-                    flat,
-                }),
-                Some(texture) => match texture.role {
-                    TextureRole::TangentSpaceNormal => {
-                        let plane = NormalMapPlan::new(texture);
-                        // First one wins, and the fact is stated: two normal maps
-                        // on one mesh is not a corpus shape, so silently keeping
-                        // the second would be a guess.
-                        if plan.normal_map.is_none() {
-                            plan.normal_map = Some(plane);
-                        } else {
-                            plan.unidentified.push(UnidentifiedSurface {
-                                reference: Some(*reference),
-                                key: Some(texture.key),
-                                flat,
-                            });
-                        }
-                    }
-                    TextureRole::LayeredAlphaMask => {
-                        for layer_index in 0..texture.layers.len() {
-                            plan.masks.push(MaskChannelPlan {
-                                key: texture.key,
-                                layer_index,
-                                width: texture.layer(layer_index).map_or(0, |layer| layer.width),
-                                height: texture.layer(layer_index).map_or(0, |layer| layer.height),
-                            });
-                        }
-                    }
-                    // Neither an error nor a default: the record decoded and
-                    // matched no signature. Its statistics are on the entry if a
-                    // caller wants to see why.
-                    TextureRole::Unidentified => plan.unidentified.push(UnidentifiedSurface {
-                        reference: Some(*reference),
-                        key: Some(texture.key),
-                        flat,
-                    }),
-                },
-            }
+            self.bind_slot(&mut plan, flat, within, *reference);
         }
         plan
+    }
+
+    /// Decides what one slot binds, and records what it did not.
+    ///
+    /// The order of the checks is the order of the trust:
+    ///
+    /// 1. **does a flat entry exist at all** — if not, that is an absence and it
+    ///    is recorded;
+    /// 2. **is that entry this slot's own reference** — if not, the cut is wrong
+    ///    for this mesh and nothing binds. This is the invariant
+    ///    [`Self::flat_index`] exists to protect, enforced at the point of
+    ///    binding rather than assumed from the arithmetic: a slot is only ever
+    ///    bound to the texture the record named *for that slot*;
+    /// 3. **does the derived ordinal agree with the group id's low byte** — a
+    ///    disagreement is counted, never resolved in favour of either statement;
+    /// 4. **what does the record publish** — and this is the only thing that
+    ///    decides a binding. A record that publishes a normal triple binds a
+    ///    normal map; one that publishes mask channels binds those; one that
+    ///    publishes neither binds nothing and says so.
+    fn bind_slot(
+        &self,
+        plan: &mut MeshMaterialPlan,
+        flat: usize,
+        within: usize,
+        reference: spore_gmdl::GmdlTextureRef,
+    ) {
+        let Some(entry) = self.entry(flat) else {
+            // No such flat index. Recorded as an unbound surface with no key,
+            // which is the honest shape of "the record referenced something we
+            // cannot line up".
+            plan.unidentified.push(UnidentifiedSurface {
+                reference: Some(reference),
+                key: None,
+                flat,
+                role: TextureRole::Unidentified,
+                reason: UnboundReason::NoFlatEntry,
+            });
+            return;
+        };
+        if entry.reference != Some(reference) {
+            // The engine's own last line of defence. Every arm of
+            // `BindingScope` that keeps whole sets passes this trivially; a
+            // `PerMeshBlock` cut reaches it only when the division names a
+            // reference the mesh did not carry, which is precisely "a texture
+            // from another mesh's block". Nothing binds.
+            plan.unidentified.push(UnidentifiedSurface {
+                reference: Some(reference),
+                key: entry.key(),
+                flat,
+                role: entry.role(),
+                reason: UnboundReason::EntryReferenceMismatch,
+            });
+            return;
+        }
+        if let Some(ordinal) = stated_ordinal(self.scope, within) {
+            if ordinal != reference.group_id & 0xFF {
+                plan.ordinal_conflicts += 1;
+            }
+        }
+        let Some(texture) = entry.resolved.as_ref() else {
+            plan.unidentified.push(UnidentifiedSurface {
+                reference: Some(reference),
+                key: None,
+                flat,
+                role: TextureRole::Unidentified,
+                reason: UnboundReason::Refused,
+            });
+            return;
+        };
+
+        // Bound-or-reported: once either happens, this slot is accounted for and
+        // a second "nothing bound" report must not follow it.
+        let mut accounted = false;
+        match NormalMapPlan::from_channels(texture) {
+            Ok(Some(plane)) if plan.normal_map.is_none() => {
+                plan.normal_map = Some(plane);
+                accounted = true;
+            }
+            Ok(Some(_)) => {
+                // Two normal maps on one mesh is not a corpus shape, so the
+                // first wins and the fact is stated rather than the second being
+                // silently preferred.
+                plan.unidentified.push(UnidentifiedSurface {
+                    reference: Some(reference),
+                    key: Some(texture.key),
+                    flat,
+                    role: texture.role,
+                    reason: UnboundReason::DuplicateNormalMap,
+                });
+                accounted = true;
+            }
+            // Not a normal map at all. Not a finding on its own: most records
+            // are not.
+            Ok(None) => {}
+            Err(reason) => {
+                plan.unidentified.push(UnidentifiedSurface {
+                    reference: Some(reference),
+                    key: Some(texture.key),
+                    flat,
+                    role: texture.role,
+                    reason,
+                });
+                accounted = true;
+            }
+        }
+        for (channel_index, binding) in texture.channels().iter().enumerate() {
+            if binding.role != ChannelRole::MaskChannel {
+                continue;
+            }
+            let (width, height) = texture
+                .layer(binding.layer_index)
+                .map_or((0, 0), |layer| (layer.width, layer.height));
+            plan.masks.push(MaskChannelPlan {
+                key: texture.key,
+                channel_index,
+                layer_index: binding.layer_index,
+                lane: binding.lane,
+                width,
+                height,
+            });
+            accounted = true;
+        }
+        if !accounted {
+            // The record decoded and published nothing this build can bind.
+            // Its role and statistics are on the entry and in the report's role
+            // census; nothing is guessed at here.
+            plan.unidentified.push(UnidentifiedSurface {
+                reference: Some(reference),
+                key: Some(texture.key),
+                flat,
+                role: texture.role,
+                reason: UnboundReason::NoPublishedChannel,
+            });
+        }
     }
 
     /// Every distinct role in the model, with counts, in slot order of first
@@ -538,6 +699,13 @@ fn mesh_slots(mesh: &spore_material::MeshMaterial) -> MeshSlots {
 pub struct NormalMapPlan {
     /// The record's identity, with the **assumed** type word substituted in.
     pub key: ResourceKey,
+    /// Which of the record's layers the normal's three channels came from.
+    ///
+    /// **`0` for every record measured**: `spore-texture` proved there is exactly
+    /// one mip chain per raster record. It is a field rather than a constant
+    /// because `channels()` carries a layer index and this module reads what it
+    /// is given rather than assuming.
+    pub layer_index: usize,
     /// Width of the base mip.
     pub width: u32,
     /// Height of the base mip.
@@ -558,26 +726,94 @@ pub struct NormalMapPlan {
 }
 
 impl NormalMapPlan {
-    fn new(texture: &ResolvedTexture) -> Self {
-        let bindings = texture.channels();
-        let mut lanes = [usize::MAX; 3];
-        let mut means = [f64::NAN; 3];
-        for binding in &bindings {
-            let component = match binding.role {
-                ChannelRole::NormalX => 0,
-                ChannelRole::NormalY => 1,
-                ChannelRole::NormalZ => 2,
-                _ => continue,
+    /// Builds a normal-map binding from a record's own published channels.
+    ///
+    /// A thin wrapper over [`Self::from_bindings`], which is the part with the
+    /// decisions in it.
+    pub fn from_channels(texture: &ResolvedTexture) -> Result<Option<Self>, UnboundReason> {
+        Self::from_bindings(&texture.channels(), texture)
+    }
+
+    /// Builds a normal-map binding from `bindings`, read out of `texture`.
+    ///
+    /// Three outcomes, and the difference between them is the whole point:
+    ///
+    /// * `Ok(Some(plan))` — `bindings` publish a complete normal triple whose
+    ///   lanes are an established layout ([`NormalLayout::ZFirst`]). This is the
+    ///   only path that binds a normal map, and it never consults the role
+    ///   variant: a role this build has not seen that publishes
+    ///   `NormalZ`/`NormalX`/`NormalY` in the right lanes binds correctly with
+    ///   no line changed here, and a role *called* normal that publishes
+    ///   something else does not.
+    /// * `Ok(None)` — nothing here is a normal. **Not** a finding: most records
+    ///   in this corpus are not.
+    /// * `Err(reason)` — the bindings publish normal components this build
+    ///   cannot place, so binding would mean guessing at a permutation. It binds
+    ///   nothing and is reported.
+    ///
+    /// Taking the bindings as an argument rather than reading them off the
+    /// texture is what makes the two `Err` arms reachable from a test at all:
+    /// `spore-material` publishes exactly one normal layout, so through
+    /// `channels()` alone they are unreachable defensive code.
+    pub fn from_bindings(
+        bindings: &[spore_material::ChannelBinding],
+        texture: &ResolvedTexture,
+    ) -> Result<Option<Self>, UnboundReason> {
+        // Per layer, not per record: a record that published a normal triple in
+        // two layers would be two planes, and taking whichever binding came last
+        // would be an arbitrary choice between them.
+        let mut chosen: Option<(usize, [usize; 3], [f64; 3])> = None;
+        let mut incomplete: Option<usize> = None;
+        for layer_index in 0..texture.layers.len().max(1) {
+            let mut lanes = [usize::MAX; 3];
+            let mut means = [f64::NAN; 3];
+            let mut published = 0usize;
+            for binding in bindings {
+                if binding.layer_index != layer_index {
+                    continue;
+                }
+                let component = match binding.role {
+                    ChannelRole::NormalX => 0,
+                    ChannelRole::NormalY => 1,
+                    ChannelRole::NormalZ => 2,
+                    _ => continue,
+                };
+                lanes[component] = binding.lane.index();
+                means[component] = texture.statistics.mean(binding.lane).unwrap_or(f64::NAN);
+                published += 1;
+            }
+            if published == 0 {
+                continue;
+            }
+            if published < 3 {
+                // A partial triple cannot be swizzled: two of three components
+                // leave the third undefined.
+                incomplete = incomplete.or(Some(layer_index));
+                continue;
+            }
+            chosen = Some((layer_index, lanes, means));
+            break;
+        }
+        let Some((layer_index, lanes, means)) = chosen else {
+            return match incomplete {
+                Some(_) => Err(UnboundReason::IncompleteNormalTriple),
+                None => Ok(None),
             };
-            lanes[component] = binding.lane.index();
-            means[component] = texture.statistics.mean(binding.lane).unwrap_or(f64::NAN);
+        };
+        if lanes != NormalLayout::ZFirst.lanes() {
+            // The record publishes a normal in some order this build has not
+            // established. Adding the layout to [`NormalLayout`] would be a claim
+            // that a record with that order exists; guessing the permutation
+            // would be a wrong normal map that looks almost right.
+            return Err(UnboundReason::UnestablishedNormalLayout);
         }
         let mut first_texel = [0u8; 4];
         if texture.image.pixels.len() >= 4 {
             first_texel.copy_from_slice(&texture.image.pixels[..4]);
         }
-        Self {
+        Ok(Some(Self {
             key: texture.key,
+            layer_index,
             width: texture.image.width,
             height: texture.image.height,
             mip_count: texture.mip_count,
@@ -585,7 +821,7 @@ impl NormalMapPlan {
             lanes,
             component_means: means,
             first_texel,
-        }
+        }))
     }
 
     /// Whether the record's own statistics name lane 0 as Z.
@@ -619,25 +855,86 @@ impl NormalMapPlan {
     }
 }
 
-/// One alpha plane of one mask record.
+/// One channel `spore-material` published as [`ChannelRole::MaskChannel`].
+///
+/// **Its purpose is unknown** and this engine does not name one. What the
+/// corpus establishes is the *lane* the value sits in, so that is what is
+/// recorded — enough to read the record's bytes back out of the surface, and
+/// nothing more.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MaskChannelPlan {
     /// The record's identity, with the assumed type word substituted in.
     pub key: ResourceKey,
-    /// Which of the record's layers this plane is.
+    /// The binding's position in [`ResolvedTexture::channels`], in
+    /// `(layer, lane)` order.
+    pub channel_index: usize,
+    /// Which of the record's layers the channel belongs to. **`0` for every
+    /// record measured**: `spore-texture` proved there is exactly one mip chain
+    /// per raster record, so the earlier per-layer loop was iterating an
+    /// artefact of a decoder that charged 8 bytes per 4×4 block *and* divided
+    /// by a 16-byte layer header — two errors that cancelled exactly when the
+    /// geometry lined up.
     pub layer_index: usize,
+    /// The byte of the texel the value lives in, as published.
+    pub lane: Lane,
     /// Width of the base mip.
     pub width: u32,
     /// Height of the base mip.
     pub height: u32,
 }
 
-/// A slot that feeds no material channel.
+/// Why a slot fed no material channel.
 ///
-/// **Its purpose is unknown.** `spore_material::claims::MASK_LAYER_PURPOSE` is
-/// an `UNKNOWN` non-finding, so this engine names the slot by position and
-/// nothing else. Naming it "specular", "gloss" or "occlusion" would be a claim
-/// about a record nobody has read a shader for.
+/// Seven reasons, kept apart because each is a different statement about the
+/// record. Collapsing them into a count is what made `unidentified=1` look like
+/// a decoding failure when it was usually a decoder that had just been fixed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UnboundReason {
+    /// The flat index the cut produced is past the end of the reference list.
+    NoFlatEntry,
+    /// The record was looked up and refused, or could not be found.
+    Refused,
+    /// The entry at that flat index carries a **different reference** than the
+    /// slot, so the cut is not this mesh's block. Nothing binds.
+    EntryReferenceMismatch,
+    /// A second normal map on one mesh, which is not a corpus shape.
+    DuplicateNormalMap,
+    /// The record publishes some but not all of a normal's three components.
+    IncompleteNormalTriple,
+    /// The record publishes a normal in an order this build has not
+    /// established.
+    UnestablishedNormalLayout,
+    /// The record decoded and published nothing this build can bind.
+    NoPublishedChannel,
+}
+
+impl UnboundReason {
+    /// The canonical spelling, for logs and reports.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NoFlatEntry => "no-flat-entry",
+            Self::Refused => "refused",
+            Self::EntryReferenceMismatch => "entry-reference-mismatch",
+            Self::DuplicateNormalMap => "duplicate-normal-map",
+            Self::IncompleteNormalTriple => "incomplete-normal-triple",
+            Self::UnestablishedNormalLayout => "unestablished-normal-layout",
+            Self::NoPublishedChannel => "no-published-channel",
+        }
+    }
+}
+
+impl std::fmt::Display for UnboundReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A slot that fed no material channel.
+///
+/// Named by position and by the reason, never by a purpose:
+/// `spore_material::claims::MASK_LAYER_PURPOSE` is an `UNKNOWN` non-finding, so
+/// calling a slot "specular", "gloss" or "occlusion" would be a claim about a
+/// record nobody has read a shader for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnidentifiedSurface {
     /// The reference the record carried.
@@ -646,6 +943,12 @@ pub struct UnidentifiedSurface {
     pub key: Option<ResourceKey>,
     /// The flat position it was cut from.
     pub flat: usize,
+    /// The role `spore-material` published for it, so a report can say *what the
+    /// record was* as well as *why nothing bound it*. `Unidentified` for a
+    /// refusal and for an absent entry alike: neither is a role the record has.
+    pub role: TextureRole,
+    /// Why nothing bound.
+    pub reason: UnboundReason,
 }
 
 /// One mesh's material, as the corpus describes it.
@@ -657,18 +960,26 @@ pub struct MeshMaterialPlan {
     pub material_id: u32,
     /// Always `None`. No registry maps a material id to a name.
     pub material_name: Option<&'static str>,
-    /// How the per-mesh cut was made. `is_inferred()` is `true` for both
-    /// variants — there is no proven binding in this build.
+    /// How the per-mesh cut was made. `is_inferred()` is `true` for **every**
+    /// variant, `Undetermined` included — there is no proven binding in this
+    /// build.
     pub scope: BindingScope,
-    /// The tangent-space normal map, when one of this mesh's slots resolved to
-    /// that role.
+    /// The tangent-space normal map, when one of this mesh's slots published a
+    /// normal triple in an established layout.
     pub normal_map: Option<NormalMapPlan>,
-    /// Every alpha plane of every mask record on this mesh.
+    /// Every channel this mesh's slots published as
+    /// [`ChannelRole::MaskChannel`], in slot then channel order.
     ///
-    /// A `DXT5` record contributes **one plane per layer**; the corpus's
-    /// three-entry set therefore offers four planes per mesh.
+    /// **Zero for every record in the current corpus**: with `DXT5` read as BC3
+    /// rather than as an 8-byte format, no raster record satisfies the old
+    /// layered-mask signature, so `spore-material` publishes
+    /// [`ChannelRole::UnidentifiedLane`] for all four of its lanes. The
+    /// machinery stays, because it binds whatever the next role derivation does
+    /// publish — with no line changed here — and because a plan that could only
+    /// ever be empty would be untestable.
     pub masks: Vec<MaskChannelPlan>,
-    /// Slots that decoded but fed nothing, and slots that failed to decode.
+    /// Slots that fed nothing, each with the reason. A slot that bound a mask
+    /// channel is **not** in here.
     pub unidentified: Vec<UnidentifiedSurface>,
     /// Slots where the derived ordinal disagreed with the group id's low byte.
     pub ordinal_conflicts: usize,
@@ -680,17 +991,36 @@ impl MeshMaterialPlan {
         self.normal_map.is_some() || !self.masks.is_empty()
     }
 
+    /// The unbound slots' reasons, with counts, in encounter order.
+    pub fn unbound_reasons(&self) -> Vec<(UnboundReason, usize)> {
+        let mut counts: Vec<(UnboundReason, usize)> = Vec::new();
+        for surface in &self.unidentified {
+            match counts.iter_mut().find(|(seen, _)| *seen == surface.reason) {
+                Some((_, count)) => *count += 1,
+                None => counts.push((surface.reason, 1)),
+            }
+        }
+        counts
+    }
+
     /// One line for a log.
     pub fn describe(&self) -> String {
+        let reasons = self
+            .unbound_reasons()
+            .iter()
+            .map(|(reason, count)| format!("{reason}:{count}"))
+            .collect::<Vec<_>>()
+            .join(",");
         format!(
-            "mesh {} material=0x{:08x} scope={} normal_maps={} mask_channels={} unidentified={} \
-             ordinal_conflicts={} inferred={}",
+            "mesh {} material=0x{:08x} scope={} normal_maps={} mask_channels={} \
+             unbound={} unbound_reasons={} ordinal_conflicts={} inferred={}",
             self.mesh_index,
             self.material_id,
             self.scope.as_str(),
             usize::from(self.normal_map.is_some()),
             self.masks.len(),
             self.unidentified.len(),
+            if reasons.is_empty() { "none" } else { &reasons },
             self.ordinal_conflicts,
             self.scope.is_inferred(),
         )
@@ -998,6 +1328,7 @@ mod tests {
     fn lane_zero_is_z_reads_the_published_statistics() {
         let good = NormalMapPlan {
             key: ResourceKey::new(1, 2, 3),
+            layer_index: 0,
             width: 256,
             height: 256,
             mip_count: 9,
@@ -1033,6 +1364,7 @@ mod tests {
     fn the_plan_describes_itself_with_the_swizzle_named() {
         let plan = NormalMapPlan {
             key: ResourceKey::new(0x2F4E_681C, 0x4062_2901, 0x067C_79D2),
+            layer_index: 0,
             width: 256,
             height: 256,
             mip_count: 9,
@@ -1066,7 +1398,9 @@ mod tests {
             normal_map: None,
             masks: vec![MaskChannelPlan {
                 key: ResourceKey::new(1, 2, 3),
+                channel_index: 3,
                 layer_index: 0,
+                lane: Lane::Alpha,
                 width: 512,
                 height: 512,
             }],
@@ -1081,5 +1415,218 @@ mod tests {
             );
         }
         assert!(text.contains("mask_channels=1"), "{text}");
+        assert!(text.contains("unbound=0"), "{text}");
+        assert!(
+            text.contains("unbound_reasons=none"),
+            "no unbound slot means no reason is invented: {text}"
+        );
+    }
+
+    /// A 2x2 record whose lanes the engine has not been told about, standing in
+    /// for a real decode: this module's tests never need the package.
+    fn synthetic(
+        role: TextureRole,
+        lanes: [(Lane, [u8; 4]); 4],
+    ) -> spore_material::ResolvedTexture {
+        let mut pixels = Vec::with_capacity(lanes.len() * 4);
+        for (_, values) in lanes {
+            pixels.extend_from_slice(&values);
+        }
+        let mip = spore_texture::MipImage {
+            width: 2,
+            height: 2,
+            pixels,
+        };
+        spore_material::ResolvedTexture {
+            key: ResourceKey::new(0x2F4E_681C, 0x4062_2901, 0x067C_79D2),
+            kind: spore_material::TextureKind::Raster,
+            statistics: spore_material::MipStatistics::of(&mip),
+            image: mip.clone(),
+            // One chain, always: `spore-texture` proved the two-layer reading
+            // was two cancelling errors.
+            layers: vec![mip],
+            role,
+            envelope: spore_texture::RasterEnvelope {
+                version: 1,
+                width: 2,
+                height: 2,
+                mip_count: 1,
+                field_10: 8,
+                fourcc: 0,
+                field_18: 16,
+                field_1c: 0,
+            },
+            mip_count: 1,
+            layer_count: 1,
+            pixels_decoded: true,
+            claims: Vec::new(),
+        }
+    }
+
+    fn flat_normal_texels() -> [(Lane, [u8; 4]); 4] {
+        // (Z, X, Y, ?) exactly as the `0x15` family stores it.
+        [
+            (Lane::Red, [255, 128, 128, 0]),
+            (Lane::Green, [255, 128, 128, 0]),
+            (Lane::Blue, [255, 128, 128, 0]),
+            (Lane::Alpha, [255, 128, 128, 0]),
+        ]
+    }
+
+    #[test]
+    fn the_layout_lane_table_is_the_inverse_of_the_component_table() {
+        // Both directions of one permutation, stated in one place and checked
+        // against each other. `lane_components` says which component each file
+        // byte holds; `lanes` says which byte each component is read from. A
+        // normal map that is swizzled with one and looked up with the other is a
+        // normal map whose Z is in red, which looks almost right.
+        for layout in [NormalLayout::ZFirst] {
+            let components = lane_components(layout);
+            let lanes = layout.lanes();
+            for (component, lane) in lanes.iter().enumerate() {
+                assert_eq!(
+                    components[*lane], component as u8,
+                    "{layout:?}: component {component} must be read from byte {lane}"
+                );
+            }
+        }
+        assert_eq!(NormalLayout::ZFirst.lanes(), [1, 2, 0]);
+    }
+
+    #[test]
+    fn a_normal_binding_comes_from_the_published_channels_and_nothing_else() {
+        let texture = synthetic(TextureRole::TangentSpaceNormal, flat_normal_texels());
+        let plan = NormalMapPlan::from_channels(&texture)
+            .expect("the published lanes are an established layout")
+            .expect("a normal publishes a normal");
+        assert_eq!(plan.lanes, [1, 2, 0], "file byte 0 holds Z");
+        assert_eq!(plan.layer_index, 0);
+        assert_eq!(plan.first_texel, [255, 128, 128, 0]);
+        assert!(plan.lane_zero_is_z(), "read from the published statistics");
+    }
+
+    #[test]
+    fn a_record_that_publishes_no_normal_is_not_a_finding() {
+        // The common case, and it must be `Ok(None)` rather than an error: the
+        // great majority of records in this corpus publish no normal.
+        let texture = synthetic(
+            TextureRole::Unidentified,
+            [
+                (Lane::Red, [0; 4]),
+                (Lane::Green, [0; 4]),
+                (Lane::Blue, [0; 4]),
+                (Lane::Alpha, [0; 4]),
+            ],
+        );
+        assert_eq!(
+            NormalMapPlan::from_channels(&texture),
+            Ok(None),
+            "nothing published a normal, so nothing is reported"
+        );
+    }
+
+    #[test]
+    fn a_normal_in_an_unestablished_order_is_refused_rather_than_swizzled() {
+        // The same texels, published as X, Y, Z in file order — a normal map
+        // written the other way round. Binding it with ZFirst's permutation
+        // would produce a wrong normal that looks almost right, so it is
+        // refused and reported instead.
+        let texture = synthetic(TextureRole::TangentSpaceNormal, flat_normal_texels());
+        let rotated = vec![
+            spore_material::ChannelBinding {
+                layer_index: 0,
+                lane: Lane::Red,
+                role: ChannelRole::NormalX,
+            },
+            spore_material::ChannelBinding {
+                layer_index: 0,
+                lane: Lane::Green,
+                role: ChannelRole::NormalY,
+            },
+            spore_material::ChannelBinding {
+                layer_index: 0,
+                lane: Lane::Blue,
+                role: ChannelRole::NormalZ,
+            },
+        ];
+        assert_eq!(
+            NormalMapPlan::from_bindings(&rotated, &texture),
+            Err(UnboundReason::UnestablishedNormalLayout)
+        );
+        // Two of three components is the same class of defect: the third is
+        // undefined, and a swizzle would invent it.
+        assert_eq!(
+            NormalMapPlan::from_bindings(&rotated[..2], &texture),
+            Err(UnboundReason::IncompleteNormalTriple)
+        );
+        assert_eq!(
+            UnboundReason::UnestablishedNormalLayout.as_str(),
+            "unestablished-normal-layout"
+        );
+    }
+
+    #[test]
+    fn a_mesh_is_never_bound_to_a_texture_from_another_meshes_block() {
+        // The cut is wrong for this mesh: mesh 1's slice claims a reference the
+        // mesh does not carry, so the flat entry it points at belongs to another
+        // block. Before this check the engine bound it, which is exactly the
+        // failure the documented creature used to exhibit.
+        let mine = spore_gmdl::GmdlTextureRef {
+            instance_id: 1,
+            group_id: 0x4063_2901,
+        };
+        let someone_elses = spore_gmdl::GmdlTextureRef {
+            instance_id: 1,
+            group_id: 0x4063_2900,
+        };
+        let materials = ModelMaterials {
+            scope: BindingScope::PerMeshBlock { refs_per_mesh: 1 },
+            meshes: vec![
+                MeshSlots {
+                    mesh_index: 0,
+                    material_id: 1,
+                    slots: vec![mine],
+                },
+                // The truncated-list shape: mesh 1's slot names the texture that
+                // belongs to mesh 0's block, and the flat index it was cut from
+                // holds mesh 1's own reference instead.
+                MeshSlots {
+                    mesh_index: 1,
+                    material_id: 1,
+                    slots: vec![mine],
+                },
+            ],
+            textures: vec![
+                MaterialTexture {
+                    reference: Some(mine),
+                    resolved: None,
+                    refusal: Some("synthetic".into()),
+                },
+                MaterialTexture {
+                    reference: Some(someone_elses),
+                    resolved: None,
+                    refusal: Some("synthetic".into()),
+                },
+            ],
+            ..ModelMaterials::empty(None)
+        };
+        // Mesh 0 is fine: its slot names the reference the cut handed it, so it
+        // is only unbound because the synthetic record refused to decode.
+        assert_eq!(
+            materials.plans()[0].unidentified[0].reason,
+            UnboundReason::Refused
+        );
+        let plan = &materials.plans()[1];
+        assert_eq!(materials.flat_index(1, 0), 1);
+        assert_eq!(plan.unidentified.len(), 1);
+        assert_eq!(
+            plan.unidentified[0].reason,
+            UnboundReason::EntryReferenceMismatch,
+            "a slot whose entry names another reference binds nothing"
+        );
+        assert!(
+            !plan.has_any_surface(),
+            "and there is no surface to attach to the wrong mesh"
+        );
     }
 }

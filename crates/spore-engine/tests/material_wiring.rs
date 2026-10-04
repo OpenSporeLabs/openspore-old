@@ -14,8 +14,10 @@
 //! 2. the uploaded image is `Rgba8Unorm`, never the sRGB variant;
 //! 3. its **blue** lane carries the record's file byte 0, because that byte is
 //!    Z — asserted from the numbers, not from the code path that produced them;
-//! 4. a `LayeredAlphaMask` record produces one single-channel surface **per
-//!    layer**, attached to the entity, and bound to no material slot at all;
+//! 4. a record that publishes a `MaskChannel` produces **one**
+//!    single-channel surface, attached to the entity, and bound to no material
+//!    slot at all -- and it is the published *lane* that is uploaded, not a
+//!    hardcoded one;
 //! 5. **no** texture reaches `base_color_texture`, because no raster record in
 //!    this corpus decodes as base colour;
 //! 6. the mesh carries a tangent frame, because Bevy 0.19 ignores a normal map
@@ -36,7 +38,7 @@ use bevy::render::render_resource::TextureFormat;
 
 use spore_assets::ModelFormat;
 use spore_core::ResourceKey;
-use spore_material::{ResolvedTexture, TexSetShape, TextureRole};
+use spore_material::{ResolvedTexture, TextureRole};
 
 use spore_engine::convert::{tangents_of, to_bevy_mesh};
 use spore_engine::domain::creature::Creature;
@@ -84,33 +86,29 @@ fn normal_texture() -> ResolvedTexture {
         .into_iter()
         .flat_map(|z| [z, 128, 128, 7])
         .collect();
-    resolved(
-        NORMAL,
-        TextureRole::TangentSpaceNormal,
-        pixels.clone(),
-        vec![pixels],
-    )
+    resolved(NORMAL, TextureRole::TangentSpaceNormal, pixels)
 }
 
-/// A synthetic two-layer mask: the colour planes collapse to zero, each layer's
-/// alpha plane carries distinct full-range values.
+/// A synthetic mask record: real colour content in lanes 0-2 and a full-range
+/// plane in lane 3.
+///
+/// The colour bytes are **not** zero, and that is the point: the previous
+/// fixture zeroed them because a broken 8-byte decoder could not produce
+/// anything else. `spore-texture` has since proved the stride is 16 bytes
+/// (BC3), and the real records carry 32 distinct greens and blues. A fixture
+/// whose colour lanes were all zero would still pass while the refutation is
+/// being undone.
 fn mask_texture(group: u32, first: u8) -> ResolvedTexture {
-    let layer0: Vec<u8> = (0..4u8).flat_map(|i| [0u8, 0, 0, first + i]).collect();
-    let layer1: Vec<u8> = (0..4u8).flat_map(|i| [0u8, 0, 0, 200 - i]).collect();
-    resolved(
-        group,
-        TextureRole::LayeredAlphaMask,
-        layer0.clone(),
-        vec![layer0, layer1],
-    )
+    // Four lanes, four clearly different values per lane, so an assertion on the
+    // uploaded bytes can tell *which* lane was read. A fixture whose lanes all
+    // held the same bytes would pass whichever one the engine uploaded.
+    let pixels: Vec<u8> = (0..4u8)
+        .flat_map(|i| [200 + i, 60 + i, 120 + i, first + i])
+        .collect();
+    resolved(group, TextureRole::ColourAndMask, pixels)
 }
 
-fn resolved(
-    group: u32,
-    role: TextureRole,
-    image_pixels: Vec<u8>,
-    layers: Vec<Vec<u8>>,
-) -> ResolvedTexture {
+fn resolved(group: u32, role: TextureRole, image_pixels: Vec<u8>) -> ResolvedTexture {
     let image = spore_texture::MipImage {
         width: 2,
         height: 2,
@@ -121,14 +119,9 @@ fn resolved(
         kind: spore_material::TextureKind::Raster,
         statistics: spore_material::MipStatistics::of(&image),
         image: image.clone(),
-        layers: layers
-            .into_iter()
-            .map(|pixels| spore_texture::MipImage {
-                width: 2,
-                height: 2,
-                pixels,
-            })
-            .collect(),
+        // One chain, always: `spore-texture` measured 2954 of 2954 raster
+        // records with no layer header and a single mip chain.
+        layers: vec![image.clone()],
         role,
         envelope: spore_texture::RasterEnvelope {
             version: 1,
@@ -141,13 +134,14 @@ fn resolved(
             field_1c: 0,
         },
         mip_count: 1,
-        layer_count: 0,
+        layer_count: 1,
         pixels_decoded: true,
         claims: Vec::new(),
     }
 }
 
-/// A one-mesh model with the corpus's `(mask, mask, normal)` set.
+/// A one-mesh model with a `(mask, mask, normal)` set -- the corpus's most
+/// common three-entry shape by slot order.
 fn texture_bearing_model(key: ResourceKey) -> Arc<ModelDefinition> {
     let textures = vec![
         MaterialTexture {
@@ -197,7 +191,11 @@ fn texture_bearing_model(key: ResourceKey) -> Arc<ModelDefinition> {
         }],
         route: MaterialRoute::Strict,
         strict_refusal: None,
-        observed_shape: Some(TexSetShape::MaskMaskNormal),
+        // `None` = the shape observation was not made for this fixture. It is
+        // not `Some(Divergent(..))` and it is not a corpus shape: whether the
+        // corpus's own sets still match `(mask, mask, normal)` is
+        // `tests/real_corpus.rs`'s claim to measure, not this fixture's.
+        observed_shape: None,
         ordinal_agreement: Some(spore_material::OrdinalAgreement {
             compared: 3,
             agreed: 3,
@@ -357,7 +355,7 @@ fn the_normal_map_lands_in_the_normal_slot_with_z_in_blue_and_no_srgb() {
 }
 
 #[test]
-fn a_mask_record_produces_one_single_channel_surface_per_layer_and_binds_nothing() {
+fn a_mask_record_produces_one_single_channel_surface_per_published_channel_and_binds_nothing() {
     let key = ResourceKey::new(0x00E6_BCE5, 0x4063_7E03, 0x067A_07F0);
     let scene = scene_of(
         vec![SceneObject::Model(ModelInstance::new(
@@ -390,25 +388,34 @@ fn a_mask_record_produces_one_single_channel_surface_per_layer_and_binds_nothing
     let images = world.resource::<Assets<Image>>();
     let (entity, _) = parts.iter(world).next().expect("one mesh entity");
 
-    // 4. Four planes: two records x two layers. `MaskChannels` is the only place
-    //    they are named, and it names them positionally. A per-plane component
-    //    would have left one of the four, because `insert` replaces.
-    let mut planes: Vec<(ResourceKey, usize, Handle<Image>)> = bindings
+    // 4. TWO channels, one per mask record. REFUTED PREMISE, RECORDED: this
+    //    used to assert four, "two records x two layers" -- the second factor
+    //    was an artefact of a decoder that charged a 16-byte layer header.
+    //    `MaskChannels` is the only place they are named, and it names them by
+    //    the record and the published lane. A per-channel component would have
+    //    left one of the two, because `insert` replaces.
+    let mut planes: Vec<(ResourceKey, spore_material::Lane, Handle<Image>)> = bindings
         .iter(world)
         .flat_map(|channels| channels.planes.iter())
-        .map(|binding| (binding.key, binding.layer_index, binding.handle.clone()))
+        .map(|binding| (binding.key, binding.lane, binding.handle.clone()))
         .collect();
-    assert_eq!(planes.len(), 4, "two records x two layers");
-    planes.sort_by_key(|(key, layer, _)| (key.group_id, *layer));
+    assert_eq!(planes.len(), 2, "one published channel per record");
+    planes.sort_by_key(|(key, _, _)| key.group_id);
     assert_eq!(
         planes
             .iter()
-            .map(|(key, layer, _)| (key.group_id, *layer))
+            .map(|(key, _, _)| (key.group_id, *key))
             .collect::<Vec<_>>(),
-        vec![(MASK_A, 0), (MASK_A, 1), (MASK_B, 0), (MASK_B, 1)]
+        vec![(MASK_A, planes[0].0), (MASK_B, planes[1].0)],
+        "both records contributed, in slot order"
     );
-    for (_, _, handle) in &planes {
-        let image = images.get(handle).expect("every plane is uploaded");
+    for (_, lane, handle) in &planes {
+        assert_eq!(
+            *lane,
+            spore_material::Lane::Alpha,
+            "the lane the record published, not one the engine chose"
+        );
+        let image = images.get(handle).expect("every channel is uploaded");
         assert_eq!(
             image.texture_descriptor.format,
             TextureFormat::R8Unorm,
@@ -416,15 +423,13 @@ fn a_mask_record_produces_one_single_channel_surface_per_layer_and_binds_nothing
         );
     }
 
-    // The planes carry the ALPHA lane of each layer, nothing else. MASK_A's
-    // layer 0 starts at 10 and layer 1 at 200.
+    // The channels carry the published lane of each record and nothing else.
+    // MASK_A's alpha lane starts at 10 and MASK_B's at 20; every colour lane of
+    // every texel holds 60, 120 or 200+, so the bytes below can only be alpha.
     let first = images.get(&planes[0].2).unwrap();
     let second = images.get(&planes[1].2).unwrap();
     assert_eq!(first.data.as_ref().unwrap().as_slice(), &[10, 11, 12, 13]);
-    assert_eq!(
-        second.data.as_ref().unwrap().as_slice(),
-        &[200, 199, 198, 197]
-    );
+    assert_eq!(second.data.as_ref().unwrap().as_slice(), &[20, 21, 22, 23]);
 
     // And the binding is on the mesh entity that owns it.
     let owners: Vec<Entity> = owned.iter(world).collect();

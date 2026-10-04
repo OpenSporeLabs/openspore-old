@@ -218,27 +218,34 @@ pub struct ModelPartMarker {
     pub material_id: u32,
 }
 
-/// Every uploaded alpha plane of one mesh, carried on the mesh that owns them.
+/// Every uploaded mask channel of one mesh, carried on the mesh that owns them.
 ///
 /// **The purpose of none of them is established.**
 /// `spore_material::claims::MASK_LAYER_PURPOSE` is an `UNKNOWN` non-finding, so
-/// this names each plane by record and layer index and nothing else. It exists so
-/// the planes are addressable and demonstrably uploaded rather than guessed at
-/// or discarded.
+/// this names each channel by the record it came from and the byte lane it was
+/// published from, and nothing else. It exists so the channels are addressable
+/// and demonstrably uploaded rather than guessed at or discarded.
 ///
-/// A `Vec` rather than one component per plane, and that is a real constraint
+/// **Empty for every record in the current corpus**: with `DXT5` read as BC3,
+/// `spore-material` publishes `UnidentifiedLane` on every lane of every
+/// non-normal raster record, so there is no mask channel to upload. The
+/// component stays because "no channel was published" and "the engine has
+/// nowhere to put one" must not look the same, and because the next role
+/// derivation that publishes one takes this path unchanged.
+///
+/// A `Vec` rather than one component per channel, and that is a real constraint
 /// rather than a style choice: `Commands::insert` **replaces** a component of the
-/// same type, so a per-plane component would leave exactly one of the four
-/// planes on a three-entry record — the last one inserted — and the other three
-/// would vanish with no error.
+/// same type, so a per-channel component would leave exactly one of a mesh's
+/// channels on the entity — the last one inserted — and the others would vanish
+/// with no error.
 #[derive(Component, Debug, Clone, PartialEq, Eq)]
 pub struct MaskChannels {
-    /// The planes, in slot then layer order.
+    /// The channels, in slot then channel order.
     pub planes: Vec<MaskChannelBinding>,
 }
 
 impl MaskChannels {
-    /// How many planes this mesh carries.
+    /// How many channels this mesh carries.
     pub fn len(&self) -> usize {
         self.planes.len()
     }
@@ -249,13 +256,15 @@ impl MaskChannels {
     }
 }
 
-/// One uploaded alpha plane.
+/// One uploaded mask channel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MaskChannelBinding {
-    /// The record the plane came from.
+    /// The record the channel came from.
     pub key: ResourceKey,
-    /// Which of that record's layers.
+    /// Which of that record's layers. `0` for every record measured.
     pub layer_index: usize,
+    /// The byte lane, as `spore-material` published it.
+    pub lane: spore_material::Lane,
     /// The uploaded single-channel image.
     pub handle: Handle<Image>,
 }
@@ -697,10 +706,10 @@ pub fn spawn_scene(
                         mesh_paint.base_color,
                     )),
                 };
-                // The mask planes ride in the spawn bundle rather than being
+                // The mask channels ride in the spawn bundle rather than being
                 // inserted afterwards, so the entity is complete the moment it
                 // exists. Inserting afterwards would also be *one component per
-                // plane*, which silently keeps only the last of the four.
+                // channel*, which silently keeps only the last one.
                 let planes: Vec<MaskChannelBinding> = bound
                     .as_ref()
                     .map(|bound| {
@@ -712,9 +721,16 @@ pub fn spawn_scene(
                             .map(|(mask, handle)| MaskChannelBinding {
                                 key: mask.key,
                                 layer_index: match mask.kind {
-                                    crate::texture::SurfaceKind::MaskChannel { layer_index } => {
-                                        layer_index
+                                    crate::texture::SurfaceKind::MaskChannel {
+                                        layer_index,
+                                        ..
+                                    } => layer_index,
+                                    crate::texture::SurfaceKind::TangentSpaceNormal => {
+                                        unreachable!("a normal map is never a mask channel")
                                     }
+                                },
+                                lane: match mask.kind {
+                                    crate::texture::SurfaceKind::MaskChannel { lane, .. } => lane,
                                     crate::texture::SurfaceKind::TangentSpaceNormal => {
                                         unreachable!("a normal map is never a mask channel")
                                     }
