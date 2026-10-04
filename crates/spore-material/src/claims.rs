@@ -47,7 +47,7 @@
 //! [`DXT5_LAYERS_ARE_DISTINCT`]. **None of them was deleted.** Each is recorded
 //! as [`ClaimKind::Refuted`] under its original spelling, carrying the
 //! measurement that refuted it and naming, through
-//! [`ClaimSpec::kind`][k], the *other* crate's subject that measured it.
+//! `ClaimSpec::kind`, the *other* crate's subject that measured it.
 //!
 //! Two reasons that is the right shape and not bookkeeping:
 //!

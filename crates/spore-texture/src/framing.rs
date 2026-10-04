@@ -85,7 +85,7 @@ pub struct FrameFormat {
     pub fourcc: u32,
     /// Bytes of header before the base level's payload.
     pub header_size: usize,
-    /// Bytes per 4x4 block. [`FrameFormat::BYTES_PER_TEXEL`] marks the one
+    /// Bytes per 4x4 block. the frame format's bytes-per-texel marks the one
     /// format that is uncompressed and has no blocks at all.
     pub block_bytes: usize,
     /// The first mip level preceded by a `u32` byte count. Levels below it are

@@ -83,8 +83,8 @@ pub struct RasterEnvelope {
     /// Offset `0x10`. **Unresolved**: observed `8` in every sample. Parsed and
     /// carried; never read. Graded `UNKNOWN` in [`crate::claims`].
     pub field_10: u32,
-    /// Offset `0x14`. Must be [`DXT5_FOURCC`], [`crate::DXT1_FOURCC`] or
-    /// [`LUMINANCE_FOURCC`] for this crate to decode.
+    /// Offset `0x14`. Must be `DXT5_FOURCC`, [`crate::DXT1_FOURCC`] or
+    /// `LUMINANCE_FOURCC` for this crate to decode.
     pub fourcc: u32,
     /// Offset `0x18`. **The base level's byte count**, verified over every
     /// raster record measured in `Spore_Content.package` and
@@ -152,7 +152,7 @@ pub fn parse_envelope(data: &[u8]) -> Result<RasterEnvelope, TextureError> {
 
 /// Dimension of one axis at one mip level.
 ///
-/// `max(1, base >> mip)`, with every mip at or beyond [`MIP_FLOOR`] clamped to
+/// `max(1, base >> mip)`, with every mip at or beyond the mip floor clamped to
 /// 1 — the rule the framing identity closes under.
 pub fn mip_dimension(base: u32, mip: u32) -> u32 {
     level_dimension(base, mip)

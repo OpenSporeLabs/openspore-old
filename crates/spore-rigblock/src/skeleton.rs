@@ -282,7 +282,7 @@ impl Skeleton {
     /// The bones whose identity recovered a name, with that name.
     ///
     /// Only names at [`crate::Confidence::Family`] or
-    /// [`crate::Confidence::Literal`]; a weak hit is deliberately omitted so a
+    /// `Confidence::Literal`; a weak hit is deliberately omitted so a
     /// caller iterating this cannot print an unproven word as anatomy.
     pub fn named_bones(&self) -> Vec<(usize, &'static str)> {
         self.bones

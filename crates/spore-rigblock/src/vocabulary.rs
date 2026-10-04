@@ -39,7 +39,7 @@
 //! candidate strings against 2002 targets, which is **29.0 expected accidental
 //! collisions**; 244 names were recovered. So a *single* unrepeated name with no
 //! corroboration is graded [`Confidence::Unconfirmed`] and a caller who needs to
-//! be right should require [`Confidence::Family`] or [`Confidence::Literal`].
+//! be right should require [`Confidence::Family`] or `Confidence::Literal`.
 //!
 //! # What this is not
 //!

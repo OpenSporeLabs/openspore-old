@@ -280,7 +280,7 @@ impl OneRecord {
 /// Runs the same per-record decision as the walk, for exactly one record.
 ///
 /// The path is deliberately the *same* code the walk uses
-/// ([`classify`] then [`decode`]), so an explanation and the tally it explains
+/// ([`classify`] then the decoder), so an explanation and the tally it explains
 /// cannot come from two different decisions. The extra information here is
 /// additional, never a second verdict.
 pub fn diagnose(entry: &DbpfEntry, image: &[u8]) -> OneRecord {

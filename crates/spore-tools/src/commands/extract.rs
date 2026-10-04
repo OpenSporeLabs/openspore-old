@@ -131,7 +131,7 @@ pub fn validate_out_dir(raw: &str) -> Result<PathBuf, crate::CliError> {
 ///   `--out foo.png` run from the repository root would otherwise drop a
 ///   megabyte next to the sources, where it is neither ignored nor reviewable.
 ///
-/// The repository root is [`env!("CARGO_MANIFEST_DIR")`]'s parent, baked in at
+/// The repository root is `CARGO_MANIFEST_DIR`'s parent, baked in at
 /// build time. When that directory does not exist — an installed binary built
 /// elsewhere — the comparison is textual and simply matches nothing, so the guard
 /// is inert rather than wrong.

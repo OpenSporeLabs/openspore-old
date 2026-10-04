@@ -52,7 +52,7 @@
 //!
 //! **This section replaced a refuted one, and the refutation is kept.** The
 //! previous model was a [`TextureRole::LayeredAlphaMask`] carrying
-//! [`ChannelRole::DegenerateColour`] planes, derived from a decoder that charged
+//! [`ChannelRole::ColourPlane`] planes, derived from a decoder that charged
 //! **8 bytes per 4x4 block**. The corpus refuted that decoder's stride — 16 bytes
 //! per block, 2 954 of 2 954 records — and with it the model built on top. Read
 //! as BC3, the same records carry:
@@ -207,7 +207,7 @@ pub enum ChannelRole {
     /// — and because assigning `Red`/`Green`/`Blue` *purposes* would be a claim
     /// the corpus does not support. [`Lane`] carries the position.
     ///
-    /// Replaces [`ChannelRole::DegenerateColour`], which measured the refuted
+    /// Replaces [`ChannelRole::ColourPlane`], which measured the refuted
     /// 8-byte codec rather than any record.
     ColourPlane,
     /// Lane 3 of a `DXT5` record: one 8-bit channel, statistically independent

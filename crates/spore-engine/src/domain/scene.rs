@@ -5,7 +5,7 @@
 //! This is the point of the module. The engine used to hold exactly one decoded
 //! record, so "show two things" was not expressible. A [`Scene`] is a list of
 //! objects, each of which is a single model or a [`Creature`], each with its own
-//! [`Placement`], and each placed by a deterministic [`Layout`] computed from
+//! placement, and each placed by a deterministic [`Layout`] computed from
 //! the objects' **own measured bounds**.
 //!
 //! # Layout is computed, not configured

@@ -98,7 +98,7 @@
 //!
 //! [`ModelMaterials::flat_index`] gives every mesh the whole collected list
 //! under `Undetermined`, which is the conservative answer, and
-//! [`stated_ordinal`] states **no** ordinal under it, so the engine cannot
+//! the slot's stated ordinal states **no** ordinal under it, so the engine cannot
 //! manufacture a conflict out of the refusal itself. On top of that,
 //! [`ModelMaterials::plan_for`] refuses to bind a slot whose flat entry carries
 //! a **different reference**: the cut can then never silently move a texture
@@ -487,7 +487,7 @@ impl ModelMaterials {
     /// Every mesh's roles, in slot order.
     ///
     /// The same arithmetic as [`spore_material::ModelTextures::roles`], so the
-    /// two must agree; see [`tests::the_roles_table_reproduces_the_reference_cut`].
+    /// two must agree; see the roles-table test.
     pub fn roles(&self) -> Vec<Vec<TextureRole>> {
         self.meshes
             .iter()

@@ -71,7 +71,7 @@ pub struct Header {
     /// `0x00` — constant `0x01000000`. Meaning unknown.
     pub magic: u32,
     /// `0x04` — `0x01000000` in 1823 of 1824. The single exception is recorded in
-    /// [`crate::claims::HEADER_WORD_04_EXCEPTION`].
+    /// the `HEADER_WORD_04_EXCEPTION` claim.
     pub second: u32,
     /// `0x08` — constant `0x00000400`. Tested for correlation against size,
     /// vertex count and block count; nothing survives, because it is constant.

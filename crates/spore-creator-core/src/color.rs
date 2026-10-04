@@ -37,7 +37,7 @@
 //! The creature skin shader consumes `float4` (`mColor1`, `mColor2`, `mParams`)
 //! and reads `.a` from two of them, but the document writes three components and
 //! never a fourth. That gap is recorded, not filled: see
-//! [`crate::claims::COLOR_ALPHA_SOURCE`]. Alpha is **not** defaulted to 1.0
+//! the `COLOR_ALPHA_SOURCE` claim. Alpha is **not** defaulted to 1.0
 //! here, because a default alpha would be a fourth component this corpus does
 //! not contain.
 

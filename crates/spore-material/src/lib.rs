@@ -86,8 +86,8 @@
 //!   ([`TextureRole::ColourAndMask`]) — over all 1 747 records in
 //!   `Spore_Content.package`, each of lanes 0–2 takes at least **32 distinct
 //!   values** and **0** records have a colour lane of two or fewer. The old model,
-//!   [`TextureRole::LayeredAlphaMask`] over
-//!   [`ChannelRole::DegenerateColour`], was a **tautology of a broken codec**:
+//!   [`TextureRole::ColourAndMask`] over
+//!   [`ChannelRole::ColourPlane`], was a **tautology of a broken codec**:
 //!   green and blue read as zero under R5G5B5 on a 6-bit word *by construction*.
 //!   Its claims are kept as refutations, not deleted — see
 //!   [`claims::DXT5_CARRIES_NO_COLOUR`].
@@ -96,7 +96,7 @@
 //! matters. It is no longer "no raster record in the corpus carries colour" —
 //! 1 747 of them do. It is now **"what colour a record is for is not
 //! established"**: no shader has been read, no referenced group id has a
-//! canonical name, and [`ChannelRole::ColourPlane::purpose_established`] is
+//! canonical name, and `ChannelRole::purpose_established` is
 //! `false` for every lane of a `DXT5` record. A `Diffuse` variant would convert
 //! an unestablished *purpose* into a confident role.
 //!

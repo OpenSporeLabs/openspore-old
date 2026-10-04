@@ -53,7 +53,7 @@ use crate::role::{self, ChannelBinding, Lane, MipStatistics, TextureRole};
 /// caller written against the old two-layer reading keeps compiling — but
 /// `layers.len() == layer_count == 1` is the *finding*, not an accident. See
 /// [`claims::LAYER_COUNT_IS_DERIVED`], whose recorded value is the refutation of
-/// the "two layers" model, and [`channels`] for the consequence: **four** channel
+/// the "two layers" model, and `channels()` for the consequence: **four** channel
 /// bindings per texture, not eight.
 ///
 /// [`Self::image`] is that single base mip, and it is what existing callers read.

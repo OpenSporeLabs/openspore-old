@@ -61,7 +61,7 @@
 //!
 //! # It writes only where it was told to
 //!
-//! `--out` is required, and [`validate_out_file`] refuses any path that resolves
+//! `--out` is required, and `validate_out_file` refuses any path that resolves
 //! inside this repository. There is no default destination, so there is nothing
 //! for a command to create by accident, and the guard means even a plausible
 //! invocation cannot drop megabytes of expanded texture next to the sources.

@@ -683,7 +683,7 @@ fn write_section(
 /// The canonical name of a record class, as a stable sort key.
 ///
 /// `RecordClass` deliberately derives no `Ord`: the order of "which classes to
-/// list" belongs to this report, and [`RecordClass::ALL`]-style declaration order
+/// list" belongs to this report, and the `ALL`-style declaration order-style declaration order
 /// is not something the enum exposes. Spelling the names here gives the census a
 /// key it can sort on and a label it can print from the same value.
 pub fn class_name(class: RecordClass) -> &'static str {
