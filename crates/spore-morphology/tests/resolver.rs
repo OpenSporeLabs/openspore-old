@@ -74,6 +74,68 @@ fn container_with_skeleton(bones: &[(u32, i32)]) -> Vec<u8> {
     out
 }
 
+/// A minimal real `gmsh` record: 3 vertices, 1 triangle, 1 bone.
+///
+/// The resolver requires the geometry half to decode, so a fixture of arbitrary
+/// bytes would test "returns unresolved" rather than "resolves".
+fn gmsh_record() -> Vec<u8> {
+    let mut out = vec![0u8; 0x18];
+    out[0x00..0x04].copy_from_slice(&0x0100_0000u32.to_le_bytes());
+    out[0x04..0x08].copy_from_slice(&0x0100_0000u32.to_le_bytes());
+    out[0x08..0x0C].copy_from_slice(&0x0000_0400u32.to_le_bytes());
+    // Recipe 0x00010300 declares a 3-block chain, so three blocks follow.
+    out[0x0C..0x10].copy_from_slice(&0x0001_0300u32.to_le_bytes());
+    out[0x10..0x14].copy_from_slice(&3u32.to_le_bytes());
+    out[0x14..0x16].copy_from_slice(&3u16.to_be_bytes());
+    out[0x16] = 0x00;
+    out[0x17] = 0x0C;
+    for corner in [[0.0f32, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]] {
+        for value in corner {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    // Block fields are big-endian: id, count, elemSize.
+    out.extend_from_slice(&0x0000_0001u32.to_be_bytes());
+    out.extend_from_slice(&3u32.to_be_bytes());
+    out.extend_from_slice(&2u16.to_be_bytes());
+    for index in [0u16, 1, 2] {
+        out.extend_from_slice(&index.to_le_bytes());
+    }
+    out.extend_from_slice(&0x1500_0608u32.to_be_bytes());
+    out.extend_from_slice(&1u32.to_be_bytes());
+    out.extend_from_slice(&4u16.to_be_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&0x0A00_0400u32.to_be_bytes());
+    out.extend_from_slice(&3u32.to_be_bytes());
+    out.extend_from_slice(&16u16.to_be_bytes());
+    for _ in 0..3 {
+        for value in [0.0f32, 0.0, 0.0, 1.0] {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    // Tail: nv, K1 = 2, the K1 payload, nBones, the 4/0/0/0 word, one range,
+    // then the 14-byte T2 entry.
+    out.extend_from_slice(&3u32.to_be_bytes());
+    out.push(2);
+    out.push(0);
+    for index in 0..2u8 {
+        out.push(index);
+        out.extend_from_slice(&[0xFF, 0xFF, 0x00]);
+    }
+    out.extend_from_slice(&1u32.to_be_bytes());
+    out.extend_from_slice(&[4, 0, 0, 0]);
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&3u32.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&4u32.to_le_bytes());
+    out.extend_from_slice(&0u32.to_be_bytes());
+    out.extend_from_slice(&31u16.to_be_bytes());
+    out.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+    out.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+    out
+}
+
 /// A document with `count` blocks all pointing at the same rigblock.
 fn document(count: usize) -> CreatorDocument {
     CreatorDocument {
@@ -106,7 +168,7 @@ fn complete_source() -> MemorySource {
     );
     source.insert(
         ResourceKey::new(TYPE_GMSH, GROUP_PART, INSTANCE),
-        vec![1, 2, 3, 4],
+        gmsh_record(),
     );
     source
 }
@@ -116,6 +178,13 @@ fn a_complete_chain_resolves_and_carries_its_skeleton() {
     let source = complete_source();
     let composition = compose(&document(3), &source).expect("composes");
 
+    eprintln!(
+        "unresolved: {:?}",
+        composition
+            .unresolved()
+            .map(|u| u.summary())
+            .collect::<Vec<_>>()
+    );
     let counts = composition.counts();
     assert_eq!(
         counts,
@@ -168,7 +237,7 @@ fn a_missing_rigblock_stops_at_that_hop_and_says_which_key_it_tried() {
     );
     source.insert(
         ResourceKey::new(TYPE_GMSH, GROUP_PART, INSTANCE),
-        vec![1, 2, 3, 4],
+        gmsh_record(),
     );
 
     let key = ResourceKey::new(RIGBLOCK, CREATURE_GROUP, INSTANCE);
@@ -261,7 +330,10 @@ fn a_container_without_a_skeleton_resolves_with_no_body_graph() {
         ResourceKey::new(TYPE_RW4, GROUP_PART, INSTANCE),
         empty_container,
     );
-    source.insert(ResourceKey::new(TYPE_GMSH, GROUP_PART, INSTANCE), vec![9]);
+    source.insert(
+        ResourceKey::new(TYPE_GMSH, GROUP_PART, INSTANCE),
+        gmsh_record(),
+    );
 
     let composition = compose(&document(1), &source).expect("composes");
     let counts = composition.counts();
@@ -318,7 +390,10 @@ fn the_first_pointer_wins_and_a_disagreement_with_the_block_downgrades_the_hop()
         ResourceKey::new(TYPE_RW4, GROUP_PART, OTHER),
         container_with_skeleton(&[(spore_rigblock::identity_of("root").unwrap().to_raw(), -1)]),
     );
-    source.insert(ResourceKey::new(TYPE_GMSH, GROUP_PART, OTHER), vec![7]);
+    source.insert(
+        ResourceKey::new(TYPE_GMSH, GROUP_PART, OTHER),
+        gmsh_record(),
+    );
 
     let composition = compose(&document(1), &source).expect("composes");
     let part = composition.resolved().next().expect("resolves");

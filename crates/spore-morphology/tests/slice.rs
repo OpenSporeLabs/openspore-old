@@ -84,6 +84,9 @@ struct Tally {
     with_skeleton: usize,
     bones: usize,
     named_bones: usize,
+    vertices: usize,
+    triangles: usize,
+    parts_with_geometry: usize,
     by_family: BTreeMap<Family, (usize, usize, usize)>,
     stops: BTreeMap<(&'static str, &'static str), usize>,
     stops_without_key: usize,
@@ -107,6 +110,11 @@ impl Tally {
         for part in composition.resolved() {
             self.bones += part.bones().map(<[spore_rigblock::Bone]>::len).unwrap_or(0);
             self.named_bones += part.named_bones().len();
+            if part.geometry.is_some() {
+                self.parts_with_geometry += 1;
+                self.vertices += part.vertex_count().unwrap_or(0);
+                self.triangles += part.triangle_count().unwrap_or(0);
+            }
             if part.trail.weakest_grade() == spore_morphology::Grade::Inferred {
                 self.inferred_hops += 1;
             }
@@ -169,6 +177,14 @@ fn the_whole_slice_runs_over_the_real_corpus() {
 
     // A zero here would mean the slice proved nothing.
     assert!(tally.resolved > 0, "nothing resolved: the slice is broken");
+    assert_eq!(
+        tally.parts_with_geometry, tally.resolved,
+        "every resolved part must carry decoded geometry, or 'resolved' means less than it says"
+    );
+    assert!(
+        tally.vertices > 0 && tally.triangles > 0,
+        "geometry is empty"
+    );
     assert!(
         tally.unresolved > 0,
         "nothing failed: the corpus gap vanished?"
@@ -181,6 +197,10 @@ fn the_whole_slice_runs_over_the_real_corpus() {
     eprintln!(
         "{} resolved parts carry a body graph; {} bones, {} named",
         tally.with_skeleton, tally.bones, tally.named_bones
+    );
+    eprintln!(
+        "{} carry geometry: {} vertices, {} triangles",
+        tally.parts_with_geometry, tally.vertices, tally.triangles
     );
     for (family, (blocks, resolved, unresolved)) in &tally.by_family {
         eprintln!(

@@ -102,7 +102,153 @@ pub enum RigblockError {
         bone: usize,
     },
 
-    /// A vocabulary lookup was asked for something that cannot be looked up.
-    #[error("vocabulary: {0}")]
-    Vocabulary(String),
+    /// A `gmsh` recipe declares a zero-length block chain.
+    ///
+    /// Every observed recipe declares 3 to 35 blocks, so zero is not a shape this
+    /// format has.
+    #[error("gmsh: recipe {recipe:#010x} declares no attribute blocks")]
+    GmshNoBlocks {
+        /// The recipe word.
+        recipe: u32,
+    },
+
+    /// A `gmsh` header's two constant bytes at `0x16`/`0x17` are not `0x00`/`0x0C`.
+    ///
+    /// `0x14` is not one integer: read little-endian it looks like an opaque
+    /// `0x0c00xxxx`, and read as `u16` big-endian plus those two bytes it is the
+    /// vertex count. A record where the bytes differ is a different shape.
+    #[error("gmsh: header bytes 0x16/0x17 are {byte_16:#04x}/{byte_17:#04x}, expected 0x00/0x0c")]
+    GmshHeaderShape {
+        /// Byte at `0x16`.
+        byte_16: u8,
+        /// Byte at `0x17`.
+        byte_17: u8,
+    },
+
+    /// A `gmsh` block header would read past the record.
+    #[error("gmsh: the block starting at {at} overruns the record")]
+    GmshBlockOverrun {
+        /// Byte offset of the block header.
+        at: usize,
+    },
+
+    /// A `gmsh` block declared an element size of zero.
+    #[error("gmsh: the block starting at {at} declares a zero element size")]
+    GmshZeroElementSize {
+        /// Byte offset of the block header.
+        at: usize,
+    },
+
+    /// A `gmsh` record did not hold exactly one index block.
+    #[error("gmsh: expected exactly one triangle index block, found {found}")]
+    GmshIndexBlockCount {
+        /// How many were found.
+        found: usize,
+    },
+
+    /// The `gmsh` index block's element size was not 2.
+    #[error("gmsh: the index block's element size is {found}, expected 2")]
+    GmshIndexElementSize {
+        /// What was found.
+        found: u16,
+    },
+
+    /// The `gmsh` index count is not a multiple of three.
+    #[error("gmsh: {count} indices is not a whole number of triangles")]
+    GmshIndexCountNotTriangles {
+        /// The index count.
+        count: usize,
+    },
+
+    /// A `gmsh` index pointed at or past the vertex count.
+    #[error("gmsh: index {index} is outside the {vertex_count} vertices")]
+    GmshIndexOutOfRange {
+        /// The offending index.
+        index: u16,
+        /// How many vertices there are.
+        vertex_count: usize,
+    },
+
+    /// The `gmsh` bone-range table does not line up with the index count.
+    #[error("gmsh: {ranges} bone ranges for {bones} bones")]
+    GmshBoneRangeCount {
+        /// Ranges found.
+        ranges: usize,
+        /// Bones declared.
+        bones: u32,
+    },
+
+    /// A `gmsh` bone range did not start where the previous one ended.
+    ///
+    /// A gap means a triangle no bone owns, which would be drawn by nothing.
+    #[error("gmsh: a bone range starts at {got} but the previous one ended at {expected}")]
+    GmshBoneRangeGap {
+        /// Where the tiling should have continued.
+        expected: u32,
+        /// Where it actually started.
+        got: u32,
+    },
+
+    /// A `gmsh` bone range ran backwards.
+    #[error("gmsh: bone {bone}'s range runs backwards, start {start} end {end}")]
+    GmshBoneRangeInverted {
+        /// Which bone.
+        bone: u32,
+        /// Its start.
+        start: u32,
+        /// Its end.
+        end: u32,
+    },
+
+    /// A `gmsh` bone-range entry's `bone` word is not the entry's own index.
+    #[error("gmsh: bone-range entry {entry} carries bone {bone}")]
+    GmshBoneOrdinal {
+        /// The entry position.
+        entry: usize,
+        /// The bone word it carried.
+        bone: u32,
+    },
+
+    /// The `gmsh` bone ranges did not cover the whole index buffer.
+    #[error("gmsh: bone ranges cover {covered} of {total} indices")]
+    GmshBoneRangeShortfall {
+        /// Indices covered.
+        covered: u32,
+        /// Indices there are.
+        total: u32,
+    },
+
+    /// A `gmsh` bone-range entry had a non-zero pad word.
+    #[error("gmsh: the bone-range entry for bone {bone} has a non-zero pad")]
+    GmshBoneRangePad {
+        /// Which bone.
+        bone: usize,
+    },
+
+    /// The `gmsh` tail's vertex count disagreed with the header's.
+    #[error("gmsh: the tail says {declared} vertices, the header says {actual}")]
+    GmshTailVertexMismatch {
+        /// What the tail said.
+        declared: usize,
+        /// What the header said.
+        actual: usize,
+    },
+
+    /// A `gmsh` tail byte was not the constant the measured layout requires.
+    #[error("gmsh: tail byte {at} is {found:#04x}, which the layout does not allow")]
+    GmshTailShape {
+        /// The byte offset within the tail.
+        at: usize,
+        /// What was there.
+        found: u8,
+    },
+
+    /// A `gmsh` tail ordinal entry was not the measured shape.
+    #[error("gmsh: the tail ordinal entry {index} at byte {at} does not match `u8 index, u16 FFFF, u8 0`")]
+    GmshTailOrdinalShape {
+        /// Which ordinal.
+        index: usize,
+        /// The byte offset within the tail.
+        at: usize,
+    },
 }

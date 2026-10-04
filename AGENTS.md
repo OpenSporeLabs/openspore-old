@@ -141,6 +141,15 @@ cargo test -p spore-differential --release -- --ignored --nocapture
   parts. Measured by `spore-morphology`'s slice test; the resolver grades the hop
   `Inferred` when the two disagree (485 of 678 parts).
 
+- **A `gmsh` record is big-endian everywhere except its 24-byte header.** Block
+  `id`, `count` and `elemSize` are BE; `nv` is a `u16` BE inside header word
+  `0x14`. Read LE, the ids come out as consecutive values increasing by one per
+  block (they look like offsets) and the index block — id `0x00000001` — never
+  matches at all. The chain length is `(recipe >> 8) & 0xFF`, verified for all 16
+  recipe versions; without it a decoder either eats the bone tail or stops early.
+  And the bone-range table is stored **unsorted in 599 of 1824 records**, so a
+  tiling check written in file order fails on a third of the corpus.
+
 ### Evidence discipline (unchanged by the migration, now enforced in code)
 
 - `spore_core::EvidenceLevel` is the canonical 7-rung scale. Attach a grade to

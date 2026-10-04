@@ -28,7 +28,7 @@
 
 use spore_core::ResourceKey;
 use spore_creator_core::{BlockId, BlockIndex, CreatorDocument};
-use spore_rigblock::{Rigblock, Skeleton};
+use spore_rigblock::{GmshMesh, Rigblock, Skeleton};
 
 use crate::error::{MorphologyError, Result};
 use crate::provenance::{Grade, Stage, StopReason, Trail};
@@ -114,7 +114,7 @@ impl<'a> Resolver<'a> {
             });
         };
         match self.walk(block_id) {
-            Ok(resolved) => crate::PartSlot::Resolved(resolved.with_block_index(index)),
+            Ok(resolved) => crate::PartSlot::Resolved(Box::new(resolved.with_block_index(index))),
             Err(Stop { trail, reason }) => {
                 let stage = trail.furthest();
                 crate::PartSlot::Unresolved(crate::UnresolvedPart {
@@ -212,26 +212,25 @@ impl<'a> Resolver<'a> {
         };
         trail = trail.reached(Stage::Prop, prop_key, prop_grade);
 
-        // Hop 3: the part pair at 0x40606000, keyed by the rigblock's instance.
+        // Hop 3: the part pair at 0x40606000, at the instance the prop selected.
         //
-        // The pointer is checked against the instance we are resolving. When it
-        // disagrees the pointer is not silently ignored and not silently obeyed:
-        // the hop is reported as inferred, because the corpus shows the pair is
-        // addressed by the rigblock's own instance and a disagreeing pointer is a
-        // finding about that record rather than a reason to pick one.
-        // The pair is addressed by the instance the prop selected, not by the
-        // block's own instance: measured, and the two frequently differ.
+        // Measured, and the two frequently differ: the block's own instance is
+        // the right address in only a minority of cases. A disagreeing pointer
+        // downgrades the grade rather than being silently ignored or obeyed.
         let pair_instance = pointer.instance;
         let container_key = ResourceKey::new(TYPE_RW4, GROUP_PART, pair_instance);
         let geometry_key = ResourceKey::new(TYPE_GMSH, GROUP_PART, pair_instance);
         let grade = prop_grade;
 
-        let (container_bytes, geometry_present) = match (
+        // Both halves are required: the geometry carries no bone names and the
+        // container carries no vertices. A part with only one of them is a
+        // different thing from a part.
+        let (container_bytes, geometry_bytes) = match (
             self.source.record(&container_key),
             self.source.record(&geometry_key),
         ) {
-            (Some(container), Some(_)) => (container, true),
-            (None, _) | (_, None) => {
+            (Some(container), Some(geometry)) => (container, geometry),
+            _ => {
                 return Err(Stop {
                     trail: trail.stopped_at(
                         Stage::PartPair,
@@ -240,6 +239,20 @@ impl<'a> Resolver<'a> {
                         StopReason::NoSuchRecord,
                     ),
                     reason: StopReason::NoSuchRecord,
+                })
+            }
+        };
+        let geometry = match GmshMesh::decode(&geometry_bytes) {
+            Ok(geometry) => Some(geometry),
+            Err(_) => {
+                return Err(Stop {
+                    trail: trail.stopped_at(
+                        Stage::PartPair,
+                        Some(container_key),
+                        grade,
+                        StopReason::Undecodable,
+                    ),
+                    reason: StopReason::Undecodable,
                 })
             }
         };
@@ -259,7 +272,8 @@ impl<'a> Resolver<'a> {
             rigblock,
             prop_key: Some(prop_key),
             container_key,
-            geometry_key: geometry_present.then_some(geometry_key),
+            geometry_key: Some(geometry_key),
+            geometry,
             skeleton,
             trail,
         })
@@ -279,10 +293,13 @@ pub struct ResolvedPart {
     /// The container half of the pair.
     pub container_key: ResourceKey,
     /// The geometry half of the pair.
-    ///
-    /// `None` when the container exists but the geometry does not. That is a
-    /// measured asymmetry, distinct from the pair being absent.
     pub geometry_key: Option<ResourceKey>,
+    /// The decoded geometry: positions, indices and the rigid skinning.
+    ///
+    /// `None` only when the record exists but will not decode. The geometry's
+    /// bones are anonymous local ordinals; the *names* are in
+    /// [`crate::ResolvedPart::skeleton`], from the paired container.
+    pub geometry: Option<GmshMesh>,
     /// The decoded body graph, when the container holds one.
     ///
     /// `None` is a real corpus state (256 of 1824 containers hold no skeleton),
@@ -296,6 +313,18 @@ impl ResolvedPart {
     /// Which block in the document this part came from.
     pub fn block(&self) -> BlockIndex {
         self.block
+    }
+
+    /// The vertex count of the decoded geometry.
+    pub fn vertex_count(&self) -> Option<usize> {
+        self.geometry
+            .as_ref()
+            .map(|geometry| geometry.positions.len())
+    }
+
+    /// The triangle count of the decoded geometry.
+    pub fn triangle_count(&self) -> Option<usize> {
+        self.geometry.as_ref().map(GmshMesh::triangle_count)
     }
 
     /// The bones of the body graph, when there is one.

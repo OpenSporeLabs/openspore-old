@@ -852,6 +852,69 @@ not that 485 parts are questionable.
 * Which of a part's transforms is its **rest pose** — UNKNOWN.
 * Whether `attach` / `csnap` bones cross part boundaries — UNKNOWN, and it is the
   highest-value open question (§10.4).
-* The `gmsh` geometry is still undecoded in Rust, so a resolved part currently
-  yields a **body graph but no vertices**. Report 09 recovered the byte layout,
-  so this is known work, not unknown work.
+* The `gmsh` geometry is now decoded too — see §12.
+
+---
+
+## 12. The geometry layer, decoded — the part is complete
+
+Added 2026-10-04. `spore_rigblock::gmsh` reads the `0x01C135DA` half of the
+pair, so a resolved part now carries vertices as well as a body graph.
+
+### 12.1 Measured over all 1824 records
+
+```
+1824 meshes: 1222646 vertices, 1368951 triangles, 973 single-bone, 16 recipes
+max per mesh: 18800 vertices, 16578 triangles
+46 distinct channel block ids
+```
+
+Every figure matches report 09's independent Python measurement exactly, which is
+the point of running both.
+
+### 12.2 Three things that are easy to get wrong
+
+**Every block field is big-endian; only the 24-byte header is little-endian.**
+`id`, `count` and `elemSize` are all BE. Read LE, the ids come out as a run of
+consecutive values increasing by one per block — they look like offsets, not
+identifiers — and the index block (id `0x00000001`) never matches at all. The
+discriminator is `elemSize = 48`: LE reads 12 288 and overruns immediately.
+
+**The chain length is a formula.** `(recipe >> 8) & 0xFF` matches all 16 observed
+recipe versions (3 … 35 blocks) with zero exceptions. This matters because the
+tail follows the last block: a decoder that walks "until the bytes run out" eats
+the bone tail, and one that trusts a stale block count stops early. Deriving the
+count is what makes the boundary knowable.
+
+**The bone-range table is not sorted.** 599 of 1824 records store the ranges out
+of order, and only 1225 happen to be ascending. Validated in file order, a tiling
+check fails on a third of the corpus while looking entirely reasonable; the
+`ranges_by_start()` accessor exists because of that. The `bone` word *is* the
+entry index in file order (1824/1824) — so file order indexes bones, and sorting
+reorders ranges. Conflating those two is the trap.
+
+### 12.3 What the geometry says about skinning
+
+**Rigid, per triangle, with no weights anywhere.** The bone table is the literal
+list `0 … nBones-1` — anonymous local ordinals — and influence is decided by a
+half-open index range per bone, which tiles `[0, nIndices)` exactly. 973 of 1824
+meshes are bound to a single bone.
+
+This is why the pair is not optional: the geometry record cannot name a bone, and
+the container record has no vertices. A part is only complete when both are read,
+and the geometry's `bone_at(index)` is what binds a triangle to the *ordinal*,
+which the skeleton then resolves to a *name*.
+
+### 12.4 Still not decoded, deliberately
+
+The remaining 46−3 channel blocks are exposed as **opaque blocks with their id and
+element size** and no interpretation. Report 09 grades most of them INFERRED
+("packed bytes, not float" / "2 floats per vertex" / "float3 channel"), and this
+crate does not promote an inference to a decode. `Block::as_f32` returns `None`
+for an element size that is not a multiple of 4, and its documentation says
+plainly that a 4-byte block is float-*shaped* without being float-*correct* — the
+1232 records whose 4-byte blocks are implausible as floats are exactly why.
+
+The fifth word of a bone-range entry is also not a constant: `4` in most entries,
+`0x02000000` and `0x03000000` elsewhere. It is carried verbatim as `tag` and
+claimed nothing, correcting report 09's "constant == 4, 1824/1824".

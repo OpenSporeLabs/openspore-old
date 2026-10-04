@@ -18,10 +18,15 @@ use crate::provenance::{Stage, StopReason, Trail};
 use crate::resolve::ResolvedPart;
 
 /// One block's slot.
+///
+/// The resolved half is boxed because a [`ResolvedPart`] carries a decoded mesh —
+/// 110 037 vertices across a whole composition — and an unboxed variant would
+/// make every slot as large as the heaviest part while the unresolved half needs
+/// a few dozen bytes.
 #[derive(Debug, Clone)]
 pub enum PartSlot {
     /// The block resolved to a part.
-    Resolved(ResolvedPart),
+    Resolved(Box<ResolvedPart>),
     /// The block did not resolve, and says where it stopped.
     Unresolved(UnresolvedPart),
 }
@@ -35,7 +40,7 @@ impl PartSlot {
     /// The resolved part, if any.
     pub fn resolved(&self) -> Option<&ResolvedPart> {
         match self {
-            Self::Resolved(part) => Some(part),
+            Self::Resolved(part) => Some(part.as_ref()),
             Self::Unresolved(_) => None,
         }
     }

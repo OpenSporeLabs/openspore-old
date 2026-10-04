@@ -42,6 +42,7 @@
 
 pub mod claims;
 pub mod error;
+pub mod gmsh;
 pub mod rigblock;
 pub mod skeleton;
 pub mod vocabulary;
@@ -49,6 +50,7 @@ pub mod vocabulary;
 pub use vocabulary::entries;
 
 pub use error::{Result, RigblockError};
+pub use gmsh::{Block as GmshBlock, BoneRange, GmshMesh};
 pub use rigblock::{Cell, Rigblock, TYPE_RIGBLOCK};
 pub use skeleton::{Bone, Skeleton, SECTION_SKELETON};
 pub use vocabulary::{identity_of, BoneName, Confidence, Entry};

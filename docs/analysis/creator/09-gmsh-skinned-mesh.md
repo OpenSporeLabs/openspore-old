@@ -686,3 +686,27 @@ everything else in the header and the block `id` is LE.
 * **Corpus cross-check.** Every count in this document was taken over the full 1824 records at
   group `0x40606000`. Where a claim is narrower, the narrower count is quoted.
 * **No file outside this one was created or modified.** No asset byte is reproduced.
+
+> **CORRECTION (2026-10-04, from the Rust decoder in `spore-rigblock::gmsh`).**
+> Two statements in §4.3 are wrong as written, and both would have produced a
+> decoder that rejects real records:
+>
+> 1. **"sorted `[start,end)` ranges == exact tiling of `[0, nIndices)` — 1824/1824"
+>    is only true after sorting.** The table is stored **unsorted in 599 of 1824
+>    records**; 1225 happen to be ascending. Validated in file order the tiling
+>    check fails on a third of the corpus. Re-measured: tiling holds 1824/1824
+>    once ordered by `start`.
+> 2. **"constant field == 4 — 1824/1824 (all but the last entry)" is false.** The
+>    fifth word is `4` in most entries but `0x02000000` and `0x03000000` occur too.
+>    It is now carried verbatim as `BoneRange::tag` and claimed nothing.
+>
+> What stands: the `bone` column **is** the entry index (`0…nBones` in order,
+> 1824/1824), the pad word is 0, the ranges tile `[0, nIndices)` once sorted, and
+> there are no weights. §2's endianness claim needed one word corrected too: the
+> block `id` is big-endian like `count` and `elemSize`, not little-endian as §1's
+> opening implies — read LE the ids come out as consecutive offsets and the index
+> block never matches.
+>
+> The layout, the byte accounting and every §3 census figure reproduced exactly in
+> Rust: 1 222 646 vertices, 1 368 951 triangles, 973 single-bone, 16 recipes,
+> 46 channel ids, 18 800 max vertices.

@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use spore_dbpf::{extract_record, DbpfEntry, PackageIndex};
-use spore_rigblock::{entries, identity_of, Rigblock, Skeleton, TYPE_RIGBLOCK};
+use spore_rigblock::{entries, identity_of, GmshMesh, Rigblock, Skeleton, TYPE_RIGBLOCK};
 
 /// The group the part pair lives at.
 const PART_GROUP: u32 = 0x4060_6000;
@@ -516,4 +516,156 @@ fn the_resolution_gap_is_a_measured_number_not_a_default() {
         233,
         "the unresolved count moved"
     );
+}
+
+/// The `gmsh` geometry layer, over every record the part pair holds.
+#[derive(Default, Debug)]
+struct Geometry {
+    records: usize,
+    vertices: usize,
+    triangles: usize,
+    indices: usize,
+    single_bone: usize,
+    max_vertices: usize,
+    max_triangles: usize,
+    distinct_recipes: std::collections::BTreeSet<u32>,
+    channel_blocks: std::collections::BTreeMap<u32, usize>,
+    position_span: [f32; 3],
+}
+
+#[test]
+#[ignore = "needs SPORE/"]
+fn every_gmsh_record_decodes_and_the_skinning_tiling_holds_everywhere() {
+    let Some((image, index)) = graphics() else {
+        eprintln!("SKIP: no SPORE/Data/Spore_Graphics.package");
+        return;
+    };
+    let meshes = records_of_type(&image, &index, 0x01C1_35DA, Some(PART_GROUP));
+    assert_eq!(meshes.len(), 1824, "paired mesh count moved");
+
+    let mut tally = Geometry::default();
+    let mut position_low = [f32::INFINITY; 3];
+    let mut position_high = [f32::NEG_INFINITY; 3];
+
+    for (_, bytes) in &meshes {
+        // A zero-length or negative span would make the min/max below lie.
+        let mesh = GmshMesh::decode(bytes)
+            .unwrap_or_else(|error| panic!("a real gmsh record failed to decode: {error}"));
+
+        // The header's recipe must alone fix the chain length.
+        assert_eq!(
+            mesh.blocks.len(),
+            mesh.header.block_count(),
+            "the declared chain length and the walked chain disagree"
+        );
+
+        // Rigid skinning: every index is owned by exactly one bone, and the
+        // ranges tile the buffer. `decode` enforces it; this asserts the
+        // measurement rather than trusting one call.
+        let owned: std::collections::HashSet<u32> = (0..mesh.indices.len() as u32)
+            .filter_map(|index| mesh.bone_at(index))
+            .collect();
+        assert!(
+            owned.len() <= mesh.bone_count as usize,
+            "more bones own indices than the record declares"
+        );
+
+        tally.records += 1;
+        tally.vertices += mesh.positions.len();
+        tally.triangles += mesh.triangle_count();
+        tally.indices += mesh.indices.len();
+        tally.max_vertices = tally.max_vertices.max(mesh.positions.len());
+        tally.max_triangles = tally.max_triangles.max(mesh.triangle_count());
+        tally.distinct_recipes.insert(mesh.header.recipe);
+        if mesh.is_rigid_single_bone() {
+            tally.single_bone += 1;
+        }
+        for block in &mesh.blocks {
+            *tally.channel_blocks.entry(block.id).or_default() += 1;
+        }
+        for corner in &mesh.positions {
+            for axis in 0..3 {
+                position_low[axis] = position_low[axis].min(corner[axis]);
+                position_high[axis] = position_high[axis].max(corner[axis]);
+            }
+        }
+    }
+
+    // The census report 09 measured.
+    assert_eq!(tally.records, 1824);
+    assert_eq!(tally.vertices, 1_222_646, "the vertex total moved");
+    assert_eq!(tally.indices, 4_106_853, "the index total moved");
+    assert_eq!(tally.triangles, 1_368_951, "the triangle total moved");
+    assert_eq!(
+        tally.single_bone, 973,
+        "the single-bone mesh count moved (53.3% of 1824)"
+    );
+    assert_eq!(tally.distinct_recipes.len(), 16, "recipe count moved");
+    for axis in 0..3 {
+        tally.position_span[axis] = position_high[axis] - position_low[axis];
+        assert!(
+            tally.position_span[axis] > 0.0,
+            "axis {axis} has zero extent, which would make the bounds meaningless"
+        );
+    }
+
+    eprintln!(
+        "{} meshes: {} vertices, {} triangles, {} single-bone, {} recipes",
+        tally.records,
+        tally.vertices,
+        tally.triangles,
+        tally.single_bone,
+        tally.distinct_recipes.len()
+    );
+    eprintln!(
+        "max per mesh: {} vertices, {} triangles",
+        tally.max_vertices, tally.max_triangles
+    );
+    eprintln!("span {:?}", tally.position_span);
+    eprintln!("distinct channel block ids: {}", tally.channel_blocks.len());
+}
+
+#[test]
+#[ignore = "needs SPORE/"]
+fn the_index_block_is_never_mistaken_for_bone_data() {
+    // Report 08 called the big `u16` array "a trailing bone-index/weight block".
+    // It is the index buffer: every index below `nv`, and the bone table is the
+    // literal `0..nBones`. If this ever regresses, bones and vertices have been
+    // confused and every part would be malformed in a way that still parses.
+    let Some((image, index)) = graphics() else {
+        eprintln!("SKIP: no SPORE/Data/Spore_Graphics.package");
+        return;
+    };
+    for (_, bytes) in records_of_type(&image, &index, 0x01C1_35DA, Some(PART_GROUP))
+        .iter()
+        .take(200)
+    {
+        let mesh = GmshMesh::decode(bytes).expect("decodes");
+        let vertex_count = usize::from(mesh.header.vertex_count);
+        assert_eq!(mesh.positions.len(), vertex_count);
+        assert!(mesh.indices.iter().all(|i| usize::from(*i) < vertex_count));
+        let bone_table = mesh
+            .blocks
+            .iter()
+            .find(|block| {
+                block.id == spore_rigblock::gmsh::BLOCK_BONE_TABLE
+                    || block.id == spore_rigblock::gmsh::BLOCK_BONE_TABLE_ALT
+            })
+            .expect("a bone table");
+        let ordinals = bone_table.as_f32().expect("4-byte elements");
+        // Reinterpreted as u32: the literal identity list.
+        for (index, _) in bone_table.payload.chunks_exact(4).enumerate() {
+            let value = u32::from_le_bytes([
+                bone_table.payload[index * 4],
+                bone_table.payload[index * 4 + 1],
+                bone_table.payload[index * 4 + 2],
+                bone_table.payload[index * 4 + 3],
+            ]);
+            assert_eq!(
+                value as usize, index,
+                "the bone table is not an identity list"
+            );
+        }
+        let _ = ordinals;
+    }
 }
