@@ -508,12 +508,13 @@ impl Builder {
     pub fn build(&self) -> Vec<u8> {
         let mut out = Vec::new();
         push_u32(&mut out, self.version);
-        // The one big-endian word in the format.
+        // The one big-endian *run* in the format: the count and all three words
+        // of every key behind it.
         out.extend_from_slice(&(self.refs.len() as u32).to_be_bytes());
         for key in &self.refs {
-            // On-disk order: instance, group, type.
+            // On-disk order: instance, group, type — each big-endian.
             for word in key {
-                push_u32(&mut out, *word);
+                out.extend_from_slice(&word.to_be_bytes());
             }
         }
         push_u32(

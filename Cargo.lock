@@ -3526,6 +3526,8 @@ name = "spore-gmdl"
 version = "0.1.0"
 dependencies = [
  "spore-core",
+ "spore-dbpf",
+ "spore-rw4",
  "thiserror 2.0.21",
 ]
 

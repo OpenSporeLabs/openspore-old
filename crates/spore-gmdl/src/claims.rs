@@ -61,6 +61,24 @@ pub const SHADER_DATA_PAYLOADS: &str = "shader_data_payloads";
 /// means.
 pub const MESH_TABLE_ZERO_WORD: &str = "mesh_table_zero_word";
 
+/// Why a `BLENDINDICES` slot is always a multiple of three.
+pub const BLEND_INDEX_STRIDE: &str = "blend_index_stride";
+
+/// What a `{start, count}` entry of the trailer's bone-range table counts.
+pub const BONE_RANGE_MEANING: &str = "bone_range_meaning";
+
+/// What the `type_code` word of a vertex element holds.
+pub const VERTEX_ELEMENT_TYPE_CODE: &str = "vertex_element_type_code";
+
+/// What a descriptor that declares bone indices and no weights means.
+pub const WEIGHTLESS_BLEND_INDICES: &str = "weightless_blend_indices";
+
+/// What the joint transforms the vertex stream names actually live in.
+pub const JOINT_TRANSFORM_LOCATION: &str = "joint_transform_location";
+
+/// What the RW4 section codes of a referenced container are called.
+pub const RW4_SECTION_CODE_NAMES: &str = "rw4_section_code_names";
+
 /// One recorded claim: what is claimed, how strongly, and on what basis.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GmdlClaim {
@@ -88,11 +106,16 @@ fn claims() -> &'static [GmdlClaim] {
             ),
             claim_of(
                 REFERENCED_FILES_ROLE,
-                "The refCount key table names files this model depends on. What they are - shared \
-                 geometry, materials, a level dependency - is not determined; the keys are carried and \
-                 never followed.",
-                EvidenceLevel::Inferred,
-                "docs/CELLSTAGE-RECON.md",
+                "Every key in the refCount table names an rw4 container (type 0x2F4E681B) in the same \
+                 package: 7989 of 7989 resolve against the real DBPF index. 466 of the 1006 distinct \
+                 targets carry RW4 section codes 0x70001, 0x70002, 0x70003, 0x7000C, 0x7000F and \
+                 0xFF0001, which the repository's two name tables call KeyframeAnim / Skeleton / \
+                 AnimationSkin / Animations; the other 540 carry only 0x80003. That a model is \
+                 *animated by* a given key is not established: only 44 of the 315 records that \
+                 declare bone ranges reference anything at all, and no joint transform has been \
+                 decoded.",
+                EvidenceLevel::Supported,
+                "docs/ANIMATION.md",
             ),
             claim_of(
                 FILE_BOUNDS_COVERAGE,
@@ -144,6 +167,66 @@ fn claims() -> &'static [GmdlClaim] {
                  value is not evidence of a meaning.",
                 EvidenceLevel::Observed,
                 "src/assets/Gmdl.hpp",
+            ),
+            claim_of(
+                BLEND_INDEX_STRIDE,
+                "Every value stored in a BLENDINDICES element is a multiple of 3, in 2109 of the 2109 \
+                 corpus records that declare one, and the gap between consecutive distinct values is \
+                 3 in 48623 cases against 1163 for every larger gap combined. The joint table is \
+                 therefore addressed with a stride of three and the joint id is slot / 3. Why the \
+                 stride is three - three words per joint, three copies of the skeleton, or a \
+                 reserved slot - is not determined, so slot / 3 is a reading and not a definition.",
+                EvidenceLevel::Supported,
+                "docs/ANIMATION.md",
+            ),
+            claim_of(
+                BONE_RANGE_MEANING,
+                "The trailer's bone-range entries are read as {start, count} pairs and reproduced \
+                 verbatim; the sum of their counts bounds the joint ids the vertex stream names in \
+                 313 of the 315 records that declare any (every BLENDINDICES slot / 3 is below it). \
+                 That it is a joint count is consistent with the data and unproven: the two \
+                 exceptions exceed it, and nothing inside the record says what the counts count.",
+                EvidenceLevel::Inferred,
+                "docs/ANIMATION.md",
+            ),
+            claim_of(
+                VERTEX_ELEMENT_TYPE_CODE,
+                "The 4-byte type_code of a vertex element is a constant per D3DDECLUSAGE across the \
+                 whole corpus: POSITION 0, TEXCOORD 2, NORMAL 6, BLENDINDICES 14, BLENDWEIGHT 15, \
+                 TANGENT 19, over 5945 descriptors. It is carried verbatim and never used to \
+                 interpret the element.",
+                EvidenceLevel::Observed,
+                "docs/ANIMATION.md",
+            ),
+            claim_of(
+                WEIGHTLESS_BLEND_INDICES,
+                "829 of the 2159 descriptors that declare BLENDINDICES declare no BLENDWEIGHT \
+                 element, across 812 records; no descriptor declares a weight without indices. \
+                 Whether those meshes are rigidly bound, use implicit equal weights, or read weights \
+                 from a stream this walk does not reach is unknown, and no weights are synthesised \
+                 for them.",
+                EvidenceLevel::Observed,
+                "docs/ANIMATION.md",
+            ),
+            claim_of(
+                JOINT_TRANSFORM_LOCATION,
+                "A gmdl record carries no joint transform. The record names joints, through the \
+                 vertex stream's BLENDINDICES slots and the trailer's bone ranges; the matrices that \
+                 move them are in the rw4 containers the refCount table names, in sections whose \
+                 payloads this crate does not read. Until that is decoded a skeleton can be counted \
+                 but not posed, and no transform here is invented to fill the gap.",
+                EvidenceLevel::Supported,
+                "docs/ANIMATION.md",
+            ),
+            claim_of(
+                RW4_SECTION_CODE_NAMES,
+                "The referenced containers' section type codes are read directly and are OBSERVED, \
+                 but their names are not established here: the repository holds two tables that \
+                 disagree about them (spore_rw4::cpp_type_name calls 0x70001 KeyframeAnim and \
+                 0x70002 Skeleton; spore_rw4::python_type_name calls the same codes SkinsInK and has \
+                 no entry for 0x70002). Both are reproduced; neither is promoted.",
+                EvidenceLevel::Inferred,
+                "spore-rw4/src/type_codes.rs",
             ),
         ]
     })

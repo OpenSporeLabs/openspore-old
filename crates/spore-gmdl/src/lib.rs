@@ -29,13 +29,20 @@
 //!
 //! # The one thing to read before trusting this decoder
 //!
-//! **The gmdl `refCount` word is big-endian while every other word in the
-//! record is little-endian.** A little-endian read multiplies the count by
-//! `0x01000000` and walks the referenced-file table straight off the end of the
-//! record. This was the most expensive bug in the format's history — 1 510 of
-//! the 4 209 gmdl records in `Spore_Content.package` failed to walk because of
-//! it — so it is spelled out at the call site, kept as a separate reader
-//! method, and pinned by `tests/refcount_be.rs`.
+//! **The gmdl `refCount` table is big-endian — the count word *and* all three
+//! words of every `{instance, group, type}` key — while every other word in the
+//! record is little-endian.** Two independent bugs live there. A little-endian
+//! count multiplies it by `0x01000000` and walks the key table straight off the
+//! end of the record; that was the most expensive bug in the format's history,
+//! breaking 1 510 of the 4 209 gmdl records in `Spore_Content.package`. A
+//! big-endian count with little-endian *keys* is worse in one respect and better
+//! in another: the walk lands in bounds and yields
+//! [`GmdlModel::referenced_files`] that address nothing — 0 of 7 989 resolve
+//! against the real DBPF index, where the big-endian reading resolves 7 989.
+//! Both are spelled out at the call site, kept as a separate reader method, and
+//! pinned by `tests/refcount_be.rs` (synthetic) and `tests/corpus_animation.rs`
+//! (real index resolution, `#[ignore]`d). `docs/ANIMATION.md` §2 has the
+//! measurement.
 //!
 //! # Strict, then best-effort
 //!
@@ -63,6 +70,7 @@ mod error;
 mod mesh;
 mod parse;
 mod reader;
+mod skin;
 mod tables;
 
 pub use claims::{all_claims, claim, vertex_normal_encoding_level, GmdlClaim};
@@ -73,6 +81,7 @@ pub use parse::{
     GmdlVertexBuffer, GmdlVertexElement, PartialGmdl, StopReason, TrailerStage, TrailerWalk,
     WalkStage,
 };
+pub use skin::GmdlSkinBinding;
 pub use tables::{
     shader_data_size, vertex_stride, DeclType, DeclUsage, ShaderDataSize, PRIM_TRIANGLE_LIST,
     SHADER_DATA_SIZES, TEXTURE_SET_ID,

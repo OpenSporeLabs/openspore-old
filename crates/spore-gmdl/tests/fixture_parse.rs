@@ -9,7 +9,7 @@
 
 mod common;
 
-use common::{mini_gmdl, MINI_GMDL_LEN};
+use common::{mini_gmdl, Builder, MINI_GMDL_LEN};
 use spore_core::ResourceKey;
 use spore_gmdl::{parse, GmdlModel, TrailerWalk};
 
@@ -35,13 +35,59 @@ fn header_fields_match_the_record() {
 #[test]
 fn the_single_referenced_file_is_reordered_from_its_on_disk_word_order() {
     let model = fixture_model();
-    // On disk: instance 0x11111111, group 0x22222222, type 0x00E6BCE5 - the
-    // order gen_fixtures.py writes. ResourceKey spells identity as
-    // type/group/instance, so the decoder reorders it. Getting this backwards
-    // produces a key that names a record which does not exist.
+    // The committed fixture writes its one ref key as
+    // `{instance 0x11111111, group 0x22222222, type 0x00E6BCE5}`
+    // (`tests/fixtures/gen_fixtures.py:182`), and `ResourceKey` spells identity
+    // as type/group/instance, so the decoder reorders the three words. Getting
+    // the reorder backwards produces a key that names a record which does not
+    // exist.
+    //
+    // The *byte order* of those three words is the part this test can no longer
+    // assert. The generator packs them little-endian
+    // (`struct.pack('<III', ...)`), and the corpus proves that wrong: over
+    // `Spore_Content.package`, reading every key big-endian resolves 7 989 of
+    // 7 989 declared keys to real DBPF index rows and reading them
+    // little-endian resolves 0 (see `docs/ANIMATION.md` §2, measured by
+    // `tests/corpus_animation.rs`). So the fixture's third word is a byte
+    // reversal of the identity it was written to mean, and this decoder — which
+    // reads the whole table big-endian — reports exactly that.
+    //
+    // The fix belongs in `tests/fixtures/gen_fixtures.py` (`'<III'` -> `'>III'`),
+    // which is outside this crate. Until it lands, the divergence is pinned here
+    // rather than papered over: the value below is what the committed bytes
+    // decode to, and the ordering is asserted on a record built big-endian.
+    let key = model.referenced_files.first().expect("one reference");
+    assert_eq!(model.referenced_files.len(), 1);
+    assert_eq!(key.instance_id, 0x1111_1111, "palindromic, order-agnostic");
+    assert_eq!(key.group_id, 0x2222_2222, "palindromic, order-agnostic");
+    assert_eq!(
+        key.type_id,
+        u32::from_be_bytes(0x00E6_BCE5u32.to_le_bytes()),
+        "0x00E6BCE5 packed little-endian and read back big-endian"
+    );
+    assert_ne!(
+        key.type_id,
+        spore_gmdl::GMDL_TYPE,
+        "the committed fixture packs the type word the wrong way round; see above"
+    );
+}
+
+#[test]
+fn a_big_endian_reference_key_is_reordered_into_type_group_instance() {
+    // The same three values, packed the way the corpus says they are stored.
+    // This is the assertion that states the decoder's actual contract; the test
+    // above states what the shared fixture's bytes happen to decode to.
+    let data = Builder::minimal()
+        .refs(vec![[0x1111_1111, 0x2222_2222, spore_gmdl::GMDL_TYPE]])
+        .build();
+    let model = parse(&data).expect("synthetic record");
     assert_eq!(
         model.referenced_files,
-        vec![ResourceKey::new(0x00E6_BCE5, 0x2222_2222, 0x1111_1111)]
+        vec![ResourceKey::new(
+            spore_gmdl::GMDL_TYPE,
+            0x2222_2222,
+            0x1111_1111
+        )]
     );
     let key = model.referenced_files.first().expect("one reference");
     assert_eq!(key.type_id, spore_gmdl::GMDL_TYPE);

@@ -62,9 +62,10 @@ impl<'a> Reader<'a> {
 
     /// Reads a **big-endian** `u32`.
     ///
-    /// This exists for exactly one word in the whole format — the gmdl
-    /// reference count — and is deliberately not the default. See the loud note
-    /// at its call site in [`crate::parse`].
+    /// This exists for exactly 52 bytes in the whole format — the gmdl
+    /// reference count and the three words of every key behind it — and is
+    /// deliberately not the default. See the loud note at its call site in
+    /// [`crate::parse`].
     pub(crate) fn read_u32_be(&mut self) -> Option<u32> {
         Some(u32::from_be_bytes(self.take(4)?.try_into().ok()?))
     }

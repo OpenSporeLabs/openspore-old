@@ -10,3 +10,10 @@ description = "GMDL (GameModel) record decoder and static mesh extraction for Sp
 [dependencies]
 spore-core = { workspace = true }
 thiserror = { workspace = true }
+
+# Corpus tests only. Both are Bevy-free and GPU-free like the crate itself; they
+# exist so the `refCount` endianness claim can be settled by *index resolution*
+# against a real package instead of against this crate's own output.
+[dev-dependencies]
+spore-dbpf = { workspace = true }
+spore-rw4 = { workspace = true }

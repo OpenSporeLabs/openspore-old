@@ -1,25 +1,38 @@
 //! The gmdl record walk: header, referenced files, bounds, index buffers,
 //! vertex descriptors, vertex buffers, mesh refs, materials, material info.
 //!
-//! # The `refCount` word is big-endian
+//! # The `refCount` table is big-endian — the count *and* every key word
 //!
-//! **Every other word in this format is little-endian. The reference-count
-//! word alone is big-endian.** A little-endian read of a record with `N`
-//! referenced files yields `N << 24` — 16 777 216 for a single reference — and
-//! then the walk asks the record for `N << 24 * 12` bytes of file keys, which
-//! runs straight off the end and either truncates mid-record or, worse, decodes
-//! plausible nonsense out of geometry data.
+//! **Every other word in this format is little-endian. The 4-byte count and all
+//! 36 bytes of each `{instance, group, type}` key behind it are big-endian.**
 //!
-//! This is the single most expensive bug in this format's history. It was found
-//! in this repository by reading a 175 KB record whose little-endian count came
-//! out as `0x05000000` (`docs/CELLSTAGE-RECON.md` §2) and it explained 1 510 of
-//! the 4 209 gmdl walk failures in `Spore_Content.package` — every record with
-//! at least one reference. `tests/test_textures.py` pins it against three named
-//! real records plus a strided 40-record sample; `tests/refcount_be.rs` pins it
-//! again against synthetic records so it cannot regress in *this* crate.
+//! Two separate bugs live in those 4 bytes, and they are independent: fixing the
+//! count and leaving the keys little-endian produces a record that parses and
+//! carries keys that address nothing at all.
+//!
+//! *Count.* A little-endian read of a record with `N` referenced files yields
+//! `N << 24` — 16 777 216 for a single reference — and the walk then asks the
+//! record for `N << 24 * 12` bytes of file keys, which runs straight off the
+//! end and either truncates mid-record or, worse, decodes plausible nonsense
+//! out of geometry data. This is the single most expensive bug in this format's
+//! history. It was found in this repository by reading a 175 KB record whose
+//! little-endian count came out as `0x05000000` (`docs/CELLSTAGE-RECON.md` §2)
+//! and it explained 1 510 of the 4 209 gmdl walk failures in
+//! `Spore_Content.package` — every record with at least one reference.
+//!
+//! *Keys.* Over `Spore_Content.package`, reading the three words of every key
+//! big-endian resolves **7 989 of 7 989** declared keys to real DBPF index rows;
+//! reading them little-endian resolves **0 of 7 989**. The count word was
+//! already correct, which is exactly why this survived: the walk consumed the
+//! right number of bytes and produced plausible `ResourceKey`s that named
+//! nothing. All six orderings of the three words were tried; exactly one —
+//! `(instance, group, type)`, the order this crate documents — resolves, and
+//! only big-endian. See `docs/ANIMATION.md` §2.
 //!
 //! The reader keeps `read_u32` and `read_u32_be` as separate methods precisely
-//! so that getting this wrong requires typing the exception.
+//! so that getting this wrong requires typing the exception. Pinning:
+//! `tests/refcount_be.rs` (synthetic) and `tests/corpus_animation.rs`
+//! (index resolution against the installed package, `#[ignore]`d).
 //!
 //! # Strict, then best-effort
 //!
@@ -504,8 +517,9 @@ impl<'a> Walk<'a> {
 
     fn read_referenced_files(&mut self) -> Result<(), GmdlError> {
         // ===================================================================
-        // BIG-ENDIAN. The one word in this format that is not little-endian.
-        // See the module docs for what a little-endian read costs here.
+        // BIG-ENDIAN — the count AND all three words of every key behind it.
+        // See the module docs; this is 52 bytes in the same record read two
+        // different ways.
         // ===================================================================
         let count = self.r.read_u32_be().ok_or(GmdlError::TruncatedRefCount)?;
         let needed = u64::from(count) * REF_KEY_SIZE;
@@ -525,10 +539,11 @@ impl<'a> Walk<'a> {
         for _ in 0..count {
             // On-disk order is instance, group, type; ResourceKey is
             // type, group, instance. The reorder is the whole reason this read
-            // is three separate words instead of a slice copy.
-            let instance = self.r.read_u32().ok_or_else(|| truncated.clone())?;
-            let group = self.r.read_u32().ok_or_else(|| truncated.clone())?;
-            let type_id = self.r.read_u32().ok_or_else(|| truncated.clone())?;
+            // is three separate words instead of a slice copy — and every one
+            // of the three is big-endian too.
+            let instance = self.r.read_u32_be().ok_or_else(|| truncated.clone())?;
+            let group = self.r.read_u32_be().ok_or_else(|| truncated.clone())?;
+            let type_id = self.r.read_u32_be().ok_or_else(|| truncated.clone())?;
             self.model
                 .referenced_files
                 .push(ResourceKey::new(type_id, group, instance));
