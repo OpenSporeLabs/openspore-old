@@ -220,7 +220,10 @@ fn a_model_record_with_no_materials_resolves_to_no_materials() {
     }
     support::push_u32(&mut record, 0); // the observed zero word
     support::push_u32(&mut record, 0); // material-info block count
-    for _ in 0..6 {
+                                       // Five trailer words: bone-range count, anim-data count and the three-word
+                                       // key. A sixth would leave four bytes unread and make the record look
+                                       // partially walked when it is not.
+    for _ in 0..5 {
         support::push_u32(&mut record, 0); // trailer words
     }
 

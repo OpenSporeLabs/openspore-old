@@ -247,9 +247,33 @@ impl ResolvedTexture {
 ///
 /// `meshes[i].slots[j]` names `model.texture_refs[i * M/N + j]` when
 /// [`Self::scope`] is [`BindingScope::PerMeshBlock`], and
-/// `model.texture_refs[j]` when it is [`BindingScope::WholeModel`]. Both are
-/// **inferred** — [`BindingScope::is_inferred`] is `true` for both variants,
-/// because nothing establishes that material-info block `i` is mesh `i`.
+/// `model.texture_refs[j]` when it is [`BindingScope::WholeModel`] or
+/// [`BindingScope::Undetermined`]. All three are **inferred** —
+/// [`BindingScope::is_inferred`] is `true` for every variant, because nothing
+/// establishes that material-info block `i` is mesh `i`, and because
+/// [`BindingScope::Undetermined`] additionally means the list `M` is not the
+/// record's whole texture set.
+///
+/// # The reference list may be shorter than the record's
+///
+/// `M` is whatever the gmdl walk collected. On 619 of the 4 209 gmdl records of
+/// `Spore_Content.package` that walk stops inside the material-info table on the
+/// undocumented shader-data id `0x218`, and in 100 of them it stops before the
+/// last declared block — so for those, `model.texture_refs` is a strict prefix of
+/// the record's texture references.
+///
+/// [`Self::scope`] is where that shows up: it is
+/// [`BindingScope::Undetermined`] when the record's own group-id ordinals
+/// contradict the cut, which is what a short list looks like from inside this
+/// crate. Read it with [`Self::ordinal_agreement`], which under
+/// [`BindingScope::PerMeshBlock`] reports `N` of `N` agreeing — the record was
+/// asked and it agreed — and reports `checked() == false` for the other two
+/// scopes, where no per-mesh ordinal was derived to check.
+///
+/// A caller that used [`spore_gmdl::parse_recovering`] has the typed
+/// [`spore_gmdl::StopReason`] in hand and should report it itself; this struct
+/// does not restate it, because this crate's strict entry point
+/// ([`resolve_model_record`]) can only produce a model whose table closed.
 ///
 /// # Roles
 ///
@@ -326,6 +350,12 @@ impl ModelTextures {
     /// no slots; a slot whose record failed contributes
     /// [`TextureRole::Unidentified`], which is how a renderer can tell "this
     /// mesh has no textures" from "this mesh's texture did not decode".
+    ///
+    /// Under [`BindingScope::WholeModel`] and [`BindingScope::Undetermined`]
+    /// every mesh's `Vec` is the model's **whole** collected list, so the `Vec`s
+    /// are identical to one another. That is the point: the two scopes say
+    /// "these textures belong to this model", not "this mesh uses this texture",
+    /// and a renderer that binds per mesh must read [`Self::scope`] first.
     pub fn roles(&self) -> Vec<Vec<TextureRole>> {
         self.meshes
             .iter()
@@ -350,7 +380,12 @@ impl ModelTextures {
             BindingScope::PerMeshBlock { refs_per_mesh } => {
                 mesh_index as usize * refs_per_mesh + within
             }
-            BindingScope::WholeModel => within,
+            // Both of these hand every mesh the whole collected list, so a slot's
+            // flat position is its index in that mesh's slice. `Undetermined` is
+            // NOT folded into the first arm: it is precisely the case where
+            // multiplying by a per-mesh width would put one mesh's references on
+            // another.
+            BindingScope::WholeModel | BindingScope::Undetermined { .. } => within,
         }
     }
 
@@ -701,7 +736,13 @@ fn observe_shape(
     }
 }
 
-/// Counts the slots whose derived ordinal the group id's low byte agreed with.
+/// Counts the slots whose derived ordinal the record's own group id agreed with.
+///
+/// A slot whose group id states **no** ordinal — one naming group id `0`, which
+/// 150 corpus references do — is skipped rather than counted as agreeing or as
+/// conflicting: it said nothing. `compared` is therefore "slots that were
+/// actually checked", and [`OrdinalAgreement::checked`] is `false` when it is
+/// zero, which is not the same as "nothing disagreed".
 fn observe_ordinal_agreement(meshes: &[MeshMaterial]) -> OrdinalAgreement {
     let mut agreement = OrdinalAgreement {
         compared: 0,
@@ -709,11 +750,11 @@ fn observe_ordinal_agreement(meshes: &[MeshMaterial]) -> OrdinalAgreement {
     };
     for mesh in meshes {
         for slot in &mesh.slots {
-            let Some(ordinal) = slot.ordinal else {
+            if slot.ordinal.is_none() || !slot.group_states_an_ordinal() {
                 continue;
-            };
+            }
             agreement.compared += 1;
-            if ordinal == slot.group_stated_ordinal() {
+            if slot.ordinal_agrees() {
                 agreement.agreed += 1;
             }
         }

@@ -326,9 +326,75 @@ multiple of the block count, and the block count equals the mesh count. The
 remaining assumption — block *i* is mesh *i* — is a **naming-order inference**
 and is recorded as the non-finding `material_block_is_mesh`.
 
-`BindingScope::is_inferred()` returns `true` for **both** variants. There is no
+`BindingScope::is_inferred()` returns `true` for **every** variant. There is no
 proven binding in this build, and a scope that claimed otherwise would be the
 failure this crate exists to prevent.
+
+### 7.2a The list the division cuts is not always the record's whole list
+
+**PERMESH, 2026-10-04.** The three measurements above are all taken over
+records whose material-info table **closes**. It does not always close: the walk
+stops on the undocumented shader-data id `0x218`, whose payload size is UNKNOWN
+(`docs/COLOUR-SOURCES.md` §2.4 — 850 candidate sizes, all eliminated, so a size
+is not guessed). Over all **4 209** gmdl records:
+
+| | count |
+|---|---:|
+| material-info closes | **3 589** |
+| walk stops on `0x218` | **619** |
+| …of those, stopping **before the last declared block** | **100** |
+| …of those, the truncated list still dividing evenly | **100** |
+| …of those, the truncated list dividing evenly *by the mesh count* | **100** |
+
+The missing part is *whole blocks*, so a truncated list frequently divides
+evenly and the arithmetic succeeds on an incomplete input. Before the fix all
+**619** reported `BindingScope::PerMeshBlock`. `0x218` is the **last** entry of
+a block, so the other **519** stop *after* their last block's texture set was
+read in full — their list is the record's whole list and the cut is sound, which
+is why the fix does not refuse those.
+
+`spore-material` cannot be told whether the table closed: `GmdlModel` carries no
+such statement, and it is not derivable from the fields it does have —
+**1 767** records whose material-info closed still leave bytes unread, so
+`GmdlModel::fully_walked()` is a fact about bytes, not about the texture list.
+
+So the cut is asked of the **record** instead, using §7.3's second statement:
+`partition_texture_refs` offers the cut only when every slot's derived ordinal
+equals the ordinal its group id states.
+
+| scope | records (after) | before |
+|---|---:|---:|
+| `PerMeshBlock` | **4 108** | 4 208 |
+| `WholeModel` | **0** | 0 |
+| `Undetermined` | **100** | 0 |
+
+The **100** match, one for one, the 100 the independent block walk in
+`crates/spore-differential/tests/material_block_binding.rs` measures as stopping
+before their last declared block — two implementations, agreeing on the same set.
+**0** of the 16 428 slots in the 4 108 offered cuts are contradicted by the
+record.
+
+### 7.2b Block order is not merely unproven — it is unfalsifiable here
+
+The one thing that could **refute** block-*i*-is-mesh-*i* is a record whose
+blocks name **different** texture sets: then a permutation would move textures
+between meshes and be visible. Measured over all 4 209 gmdl records:
+
+| | count |
+|---|---:|
+| cut records with more than one mesh | **1 685** |
+| …of those, **every** per-mesh slice naming the **same** texture set | **1 685** |
+| …of those, slices that differ | **0** |
+
+That matches the independent `(meshes, blocks)` census exactly: `(2, 2, 3)` in
+1 615 records plus `(3, 3, 3)` in 70.
+
+So permuting the blocks of any record in this corpus changes **no byte a
+renderer can observe**. The ordering is not a gap a better partition function
+could close: the evidence that would settle it is not in the texture references.
+It would take the per-block `0x210` render parameters, the vertex buffers' UV
+sets, or geometry — none of which this workspace has read. `material_block_is_mesh`
+stays a non-finding, and `is_inferred()` stays `true` for all three scopes.
 
 ### 7.3 Two independent statements of each slot's ordinal
 
@@ -342,6 +408,16 @@ and `TextureSlot::ordinal_agrees()` expose the cross-check, and
 `ModelTextures::ordinal_agreement` reports the count for a given model. The group
 id is a **convenient cross-check, never a source of truth**: a naming convention
 would survive the records it describes being reordered.
+
+**One reference states nothing at all.** 150 references across 132 models name
+group id **zero** (§7.5), which belongs to none of the six `0x40XX2900` families,
+so its low byte is `0` by arithmetic rather than by statement.
+`TextureSlot::group_states_an_ordinal()` says so, and both `ordinal_agrees()`
+and the cut in `partition_texture_refs` **skip** such a slot rather than reading
+it as "slot 0". Measured cost of that rule: **0** of the 132 records lose their
+cut. Reading it as ordinal `0` instead would have refused **132** sound cuts —
+the same mistake in the opposite direction, and the reason the census asserts
+the number rather than the intent.
 
 ### 7.4 The corpus regularity — and why it is not the basis of a role
 
@@ -412,7 +488,10 @@ Stated as a list, because "unavailable" is never zero, empty or `false`.
 2. **Which shader stage each texture feeds.** No shader has been read.
    `sampler_role` — `UNKNOWN`, `no_role_field_in_texture_entry`.
 3. **Whether material-info block *i* is mesh *i*.** `material_block_is_mesh` —
-   `UNKNOWN`, `material_info_block_order_not_established`.
+   `UNKNOWN`, `material_info_block_order_not_established`. **And unfalsifiable
+   from this corpus**: all 1 685 cut records with more than one mesh have every
+   per-mesh slice naming the same texture set, so a permutation is invisible
+   (§7.2b).
 4. **Whether the DXT5 colour field's 12 bits are meant to be visible.** §4.
    `spore-texture`'s question; unanswerable from these records.
 5. **The 4 and 12 stray bytes** in the 373 DXT5 records that do not divide into
@@ -430,6 +509,12 @@ Stated as a list, because "unavailable" is never zero, empty or `false`.
 10. **The three documented-asset group names** (`0x40632900/01/02`) remain absent
     from `spore-core`'s table, so `resolved_group_name` is still a non-finding.
     §7 now explains what those ids *encode* without naming them.
+11. **`0x218`'s on-disk size**, and therefore whether a record's flat reference
+    list is its whole set. UNKNOWN and must stay that way: 850 candidates, all
+    eliminated by a trailer that cannot close for this family
+    (`docs/COLOUR-SOURCES.md` §2.4). `spore-material` does not guess it and does
+    not need it — it asks the record's own ordinals instead (§7.2a) — but the
+    question stays open.
 
 ---
 
@@ -507,7 +592,15 @@ for mesh in &resolved.meshes {
         let flat = match resolved.scope {
             BindingScope::PerMeshBlock { refs_per_mesh } =>
                 mesh.mesh_index as usize * refs_per_mesh + within,
-            BindingScope::WholeModel => within,
+            // CHANGED 2026-10-04 (PERMESH): a third arm. `Undetermined` means
+            // the flat list is SHORTER than the record's whole texture set --
+            // the gmdl walk stopped on the undocumented shader-data id 0x218
+            // before reading every block's texture set -- so every mesh holds
+            // the whole short list and `within` is the flat index. Falling
+            // through to the `PerMeshBlock` arm here is exactly the bug that
+            // fix closed: it bound mesh 1 to a texture out of mesh 0's block.
+            // Prefer `resolved.roles()`, which already handles all three.
+            BindingScope::WholeModel | BindingScope::Undetermined { .. } => within,
         };
         let role = resolved.role_of(flat);
         match role {
@@ -590,6 +683,9 @@ tangent-space-normal 1` tail directly.
 | apply the first texture as diffuse colour | no raster record in the corpus decodes as one (§4) |
 | read `texture.image` and call it the model's colour | it is layer 0 of layer 0 of slot 0 |
 | assume `textures[i]` belongs to `meshes[i]` | only under `PerMeshBlock`, and the mapping is `i * refs_per_mesh + j` |
+| match on `BindingScope` with only two arms | there are **three**; `Undetermined { collected, contradicted }` is the one where the reference list is short (§7.2a), and its slots are the whole collected list |
+| assume `ordinal_conflicts == 0` means the ordinals agreed | `ModelTextures::ordinal_agreement.compared == 0` means **nothing was compared**; read `.checked()` |
+| bind mesh *i* to `textures[i * refs_per_mesh]` without reading `scope` | under `Undetermined` there is no per-mesh width, and multiplying by one is the wrong binding |
 | treat `BindingScope::PerMeshBlock` as proven | `is_inferred()` is `true`; block *i* is not known to be mesh *i* |
 | read file byte 0 of a normal map as R | it is **Z** |
 | name a mask plane "specular" or "gloss" | UNKNOWN (§9.1); `tests/honesty.rs` fails if a recorded value does |
@@ -601,7 +697,7 @@ tangent-space-normal 1` tail directly.
 | asset | meshes | scope | shape | roles |
 |---|---:|---|---|---|
 | `…:0x40637e03:0x067a07f0` | 1 | `PerMeshBlock { refs_per_mesh: 3 }` | `MaskMaskNormal` | mask, mask, normal — `3/3` resolved, ordinals `3/3` agree |
-| `…:0x40627100:0x067c79d2` | 2 (per the mission brief) | per the division | — | all DXT5 are `512²×10` × 2 layers |
+| `…:0x40627100:0x067c79d2` | 2 | **`Undetermined { collected: 2, contradicted: 1 }`** — was `PerMeshBlock { refs_per_mesh: 1 }`, which was wrong (§7.2a) | `Unavailable` | both meshes are handed the **whole** collected list: mask, normal. `ordinal_agreement.compared == 0` — nothing was compared, so read `.checked()` |
 
 The first row is asserted by `tests/real_corpus_roles.rs::the_documented_assets_roles`,
 which prints every field above. Run it before trusting any of this.
@@ -612,21 +708,27 @@ which prints every field above. Run it before trusting any of this.
 
 | file | what it protects | count |
 |---|---|---:|
-| `src/role.rs` (unit) | signatures, statistics exactness, `Unidentified` landing | 18 |
-| `src/material.rs` (unit) | the cut, ordinals, claim grades | 18 |
-| `src/claims.rs` (unit) | grade/reason consistency, uniqueness | 10 |
-| `src/resolve.rs` (unit) | refusals, assumed type, group-name non-finding | 7 |
+| `src/{material,claims,resolve,role,error}.rs` (unit) | the cut and the record cross-check, ordinals, claim grades, role signatures, refusals | **62** |
 | `tests/roles.rs` | role assignment from synthetic records; Z-first order; layer publication | 12 |
-| `tests/bindings.rs` | per-mesh partition, fallbacks, cross-checks | 9 |
+| `tests/resolve.rs` | the resolve surface, strict-gmdl refusals, assumed type | 13 |
+| `tests/errors.rs` | typed refusals, each named | 13 |
+| `tests/robustness.rs` | empty and corrupt inputs answer rather than panic | 10 |
 | `tests/honesty.rs` | non-findings, and the sharpened purpose sweep | 10 |
-| `tests/errors.rs` | pre-existing, updated for the API change | 13 |
-| `tests/resolve.rs` | pre-existing, updated for the API change | 13 |
-| `tests/robustness.rs` | pre-existing, updated for the API change | 10 |
+| `tests/bindings.rs` | per-mesh partition, fallbacks, cross-checks | 9 |
+| `tests/reference_completeness.rs` | **the truncated-list fix**: 5 hermetic, 1 `#[ignore]`d corpus census | **6** |
 | `tests/real_asset.rs` | the documented asset end to end (`#[ignore]`d) | 1 |
 | `tests/real_corpus_roles.rs` | **6 `#[ignore]`d corpus censuses** | 6 |
 
-**122 hermetic tests, 7 corpus tests.** `cargo test -p spore-material` stays
+**129 hermetic tests, 8 corpus tests.** `cargo test -p spore-material` stays
 hermetic and needs no game, no GPU and no network.
+
+`tests/reference_completeness.rs` is the file that pins §7.2a and §7.2b. Its
+fixture `truncated_material_gmdl` reproduces the documented creature's material
+info byte for byte — `0x210` (20 bytes), then a two-entry `0x20D`, then `0x218`,
+with **two** declared blocks — so the hermetic tests drive the **real**
+`spore_gmdl::parse_recovering` and observe the real typed `StopReason`. It
+asserts that `2 / 2 == 1` divides, that the cut is refused anyway, and that
+every mesh is handed the whole collected list.
 
 `tests/real_asset.rs` is worth a note: it used to assert that the documented
 asset yields *two* images and *one* `UnsupportedFourcc` refusal, on the stated

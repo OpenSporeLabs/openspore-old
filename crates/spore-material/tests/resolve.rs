@@ -574,9 +574,15 @@ fn a_model_record_resolves_through_the_gmdl_layer() {
         "all three references now resolve"
     );
 
-    // One mesh, no name, five non-findings, and this mesh's own slice of the
-    // model's texture set. One mesh and three references divides evenly, so the
-    // scope is the inferred per-mesh cut rather than the whole-model fallback.
+    // One mesh, no name, SIX non-findings, and this mesh's own slice of the
+    // model's texture set. One mesh and three references divides evenly and the
+    // record's own group-id ordinals agree with the division, so the scope is
+    // the inferred per-mesh cut rather than a fallback.
+    //
+    // Six, not five: `per_mesh_cut_contradicted_by_record_ordinals` was added
+    // with the third scope, and on this record it is a non-finding -- the record
+    // was asked whether the cut was its block boundaries and it said yes.
+    // (Asserted against `material` below, once it is bound.)
     assert_eq!(resolved.meshes.len(), 1);
     assert_eq!(
         resolved.scope,
@@ -586,7 +592,7 @@ fn a_model_record_resolves_through_the_gmdl_layer() {
     assert_eq!(material.material_id, DOCUMENTED_MATERIAL_ID);
     assert_eq!(material.name, None);
     assert_eq!(material.slots.len(), 3);
-    assert_eq!(material.unknowns().count(), 5);
+    assert_eq!(material.unknowns().count(), 6);
 
     // With a genuinely corrupt third record, the failure is still paired with
     // the reference it belongs to, in order.

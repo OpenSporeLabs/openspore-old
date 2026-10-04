@@ -144,6 +144,19 @@ pub const PER_MESH_TEXTURE_PARTITION: &str = "per_mesh_texture_partition";
 /// That material-info block `i` is mesh `i`. Not established.
 pub const MATERIAL_BLOCK_IS_MESH: &str = "material_block_is_mesh";
 
+/// The record's own group-id ordinals contradict the per-mesh cut the division
+/// produces, which is what a **short** reference list looks like from here.
+///
+/// Graded when at least one slot is contradicted and a non-finding otherwise.
+/// This is the observation the third [`BindingScope`](crate::BindingScope)
+/// variant is built on: the gmdl material-info walk stops inside the table on
+/// the undocumented shader-data id `0x218` in 619 of 4 209 gmdl records of
+/// `Spore_Content.package`, and in 100 of those it stops before the last
+/// declared block, so the flat list covers fewer blocks than there are meshes.
+/// All 100 divide evenly by the mesh count, which is why the arithmetic alone
+/// cannot be trusted and the record has to be asked instead.
+pub const CUT_CONTRADICTED_BY_RECORD: &str = "per_mesh_cut_contradicted_by_record_ordinals";
+
 /// The observed layout of one gmdl texture-set entry: 16 skipped bytes, then the
 /// referenced record's instance and group ids.
 pub const TEXTURE_SET_ENTRY_LAYOUT: &str = "texture_set_entry_layout";
@@ -201,17 +214,38 @@ pub const MEANING_NOT_ESTABLISHED: &str = "meaning_not_established";
 pub const MATERIAL_BLOCKS_NOT_ASSOCIATED: &str =
     "material_info_blocks_not_associated_with_material_ids";
 
-/// Nothing measured establishes that material-info block `i` is mesh `i`.
+/// Nothing measured establishes that material-info block `i` is mesh `i`, and
+/// over this corpus nothing could.
 ///
 /// Separate from [`MATERIAL_BLOCKS_NOT_ASSOCIATED`] on purpose: that one says
-/// the *walk* discards the block boundaries, and this one says the *ordering*
-/// is an inference. The partition this crate offers is therefore graded
-/// `INFERRED` even when the arithmetic divides exactly.
+/// the *walk* discards the block boundaries, and this one says the *ordering* is
+/// an inference. The partition this crate offers is therefore graded `INFERRED`
+/// even when the arithmetic divides exactly.
+///
+/// The stronger half is measured: all 1 685 cut records with more than one mesh
+/// have every per-mesh slice naming the *same* texture set, so a permutation of
+/// the blocks is invisible. See the spec's basis.
 pub const BLOCK_ORDER_NOT_ESTABLISHED: &str = "material_info_block_order_not_established";
 
-/// The model's texture references do not divide evenly by its mesh count, so no
-/// per-mesh cut was attempted and every mesh holds the whole set.
-pub const TEXTURE_SET_DID_NOT_DIVIDE: &str = "texture_set_did_not_divide_by_mesh_count";
+/// No per-mesh cut was attempted, so every mesh holds the whole collected
+/// reference list.
+///
+/// Two situations reach it, and *which* one happened is stated by
+/// [`BindingScope`](crate::BindingScope) and by
+/// [`CUT_CONTRADICTED_BY_RECORD`] rather than by this code: the list did not
+/// divide evenly by the mesh count, or it did and the record's own group-id
+/// ordinals contradicted the result. The second is the dangerous one -- it is a
+/// short list that divides -- so it must never be reported under a reason that
+/// says "did not divide".
+pub const TEXTURE_SET_NOT_CUT_PER_MESH: &str = "texture_set_not_cut_per_mesh";
+
+/// Every slot stated an ordinal and every one of them agreed with the cut.
+///
+/// The non-finding arm of [`CUT_CONTRADICTED_BY_RECORD`], and the reason it earns
+/// its keep: a record carrying it has been checked against its own bytes and the
+/// bytes agreed, which is neither the same as a record nobody looked at nor the
+/// same as one whose slots stated nothing.
+pub const NO_CUT_CONTRADICTION: &str = "no_ordinal_contradiction_between_record_and_derived_cut";
 
 // ---------------------------------------------------------------------------
 // Provenance references — the paths a graded claim is sourced from
@@ -490,22 +524,61 @@ pub const ALL_CLAIMS: &[ClaimSpec] = &[
     },
     ClaimSpec {
         subject: PER_MESH_TEXTURE_PARTITION,
-        // Graded when the division came out even, a non-finding when it did not.
-        // The grade is INFERRED in the first case and UNKNOWN in the second, and
-        // the second must never borrow the first's confidence: a partition that
-        // was not made carries no value at all.
+        // Graded only when the division came out even AND the record's own
+        // group-id ordinals agreed with it; a non-finding otherwise. The grade is
+        // INFERRED in the first case and UNKNOWN in the second, and the second
+        // must never borrow the first's confidence: a partition that was not made
+        // carries no value at all.
+        //
+        // The reason code was RENAMED from
+        // `texture_set_did_not_divide_by_mesh_count` to
+        // `texture_set_not_cut_per_mesh` when the third scope was added. The old
+        // spelling was FALSE for the new arm: that list does divide evenly, and
+        // the cut was refused because the record contradicted the result.
         kind: ClaimKind::GradedOrNonFinding {
             level: EvidenceLevel::Inferred,
-            reason: TEXTURE_SET_DID_NOT_DIVIDE,
+            reason: TEXTURE_SET_NOT_CUT_PER_MESH,
         },
         basis: "the cut is made by dividing the model's flat texture_refs by its \
                 mesh count, which is sound only if every material-info block \
-                contributed the same number of references. Measured two ways: \
-                spore-gmdl's own reader partitions 3589 of 3589 mesh-bearing gmdl \
-                records in Spore_Content.package evenly and not one unevenly, and \
-                mesh_count equals the block count in 1819/1819 records the \
-                Python oracle walks. Inference from a regularity, not a \
-                byte-level link -- see MATERIAL_BLOCK_IS_MESH.",
+                contributed the same number of references AND the list is the \
+                record's whole texture set. Measured three ways: spore-gmdl's own \
+                reader partitions 3589 of 3589 mesh-bearing gmdl records in \
+                Spore_Content.package evenly and not one unevenly; mesh_count \
+                equals the block count in 1819/1819 records the Python oracle \
+                walks; and every slot's derived ordinal equals the ordinal its \
+                referenced group id states, which is what refuses the 100 records \
+                whose material-info walk stops before its last declared block. \
+                Still an inference from regularities, not a byte-level link -- see \
+                MATERIAL_BLOCK_IS_MESH.",
+    },
+    ClaimSpec {
+        subject: CUT_CONTRADICTED_BY_RECORD,
+        // A yes/no observation about this record: did the record's own group-id
+        // ordinals disagree with the cut? Graded when at least one did, a
+        // non-finding when none did. Neither arm claims the list is short -- that
+        // is spore-gmdl's typed `StopReason` to state, and it is not reachable
+        // from a `&GmdlModel` -- only what the record's own bytes say here.
+        kind: ClaimKind::GradedOrNonFinding {
+            level: EvidenceLevel::Observed,
+            reason: NO_CUT_CONTRADICTION,
+        },
+        basis: "a texture-set entry's ordinal is stated twice -- by the entry's \
+                first header word and by the referenced record's group id low \
+                byte, in agreement in 6684/6684 references. Dividing a COMPLETE \
+                flat list by the mesh count reproduces those ordinals; dividing a \
+                list the walk stopped reading does not. Measured over all 4209 \
+                gmdl records of Spore_Content.package, the records whose group \
+                ids contradict the cut are exactly the 100 whose material-info \
+                walk stops before its last declared block, and no others. NOT \
+                CHECKED: a reference whose group id is 0 belongs to no group \
+                family and so states no ordinal; 150 references across 132 \
+                records do. Such a slot is skipped rather than read as ordinal 0, \
+                because reading it that way refused the cut of 132 records whose \
+                cut is sound -- the same mistake in the opposite direction. The \
+                remaining hole is that a cut made ENTIRELY of such slots is \
+                unchecked, and an unchecked cut is refused rather than offered. \
+                Both numbers are counted in the corpus census.",
     },
     ClaimSpec {
         subject: MATERIAL_BLOCK_IS_MESH,
@@ -513,8 +586,15 @@ pub const ALL_CLAIMS: &[ClaimSpec] = &[
         basis: "mesh_count == material-info block count in 1819/1819 records, and \
                 an even division in 3589/3589 records spore-gmdl walks, are strong \
                 regularities and still not a link: nothing in the record says block \
-                i is mesh i, only that there are as many of each. The per-mesh \
-                partition is therefore offered as INFERRED and labelled as such, \
+                i is mesh i, only that there are as many of each. WORSE THAN \
+                UNPROVEN, and measured: every one of the 1685 cut records with \
+                more than one mesh has all of its per-mesh slices naming the SAME \
+                texture set, so permuting material-info blocks changes nothing a \
+                renderer can observe. The ordering is therefore UNFALSIFIABLE from \
+                the reference data in this corpus, not merely unproven -- settling \
+                it needs something outside the texture references (a per-mesh 0x210 \
+                parameter block, geometry, or UV evidence) that nothing here has \
+                read. The partition is offered as INFERRED and labelled as such, \
                 never as a resolved binding.",
     },
     ClaimSpec {
@@ -783,7 +863,15 @@ mod tests {
             .is_some());
         assert_eq!(
             non_finding(PER_MESH_TEXTURE_PARTITION).reason(),
-            Some(TEXTURE_SET_DID_NOT_DIVIDE)
+            Some(TEXTURE_SET_NOT_CUT_PER_MESH)
+        );
+        assert_eq!(
+            grade_of(CUT_CONTRADICTED_BY_RECORD),
+            EvidenceLevel::Observed
+        );
+        assert_eq!(
+            non_finding(CUT_CONTRADICTED_BY_RECORD).reason(),
+            Some(NO_CUT_CONTRADICTION)
         );
         assert_eq!(grade_of(MATERIAL_BLOCK_IS_MESH), EvidenceLevel::Unknown);
         assert_eq!(

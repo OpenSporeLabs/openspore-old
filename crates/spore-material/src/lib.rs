@@ -35,8 +35,38 @@
 //! | question | answer | where |
 //! |---|---|---|
 //! | What are a record's **texels**? | **measured, per record** | [`TextureRole`], [`crate::TextureRole`] |
-//! | Which **mesh** owns which texture? | **an inference, labelled** | [`BindingScope`], [`partition_texture_refs`] |
+//! | Which **mesh** owns which texture? | **an inference, labelled — and refused when the record contradicts it** | [`BindingScope`], [`partition_texture_refs`] |
 //! | Which **sampler stage** does the game bind it to? | **no** | [`SamplerRole`], one variant |
+//!
+//! # The per-mesh cut is checked against the record, not just the arithmetic
+//!
+//! A gmdl material-info walk that stops part-way leaves a texture reference list
+//! that is **shorter than the record's whole set**. Dividing such a list by the
+//! mesh count usually still comes out even, because what is missing is whole
+//! blocks — so the arithmetic succeeds and returns a confident, structurally
+//! wrong binding. Measured over `Spore_Content.package`: the walk stops on the
+//! undocumented shader-data id `0x218` in 619 of 4 209 gmdl records, in 100 of
+//! them before the last declared block, and **619 of 619** divided evenly, so
+//! every one of them reported [`BindingScope::PerMeshBlock`] before this was
+//! fixed.
+//!
+//! [`partition_texture_refs`] therefore takes the cut only when the record's own
+//! second statement of each entry's position agrees with it — the group id's low
+//! byte, which equals the entry's ordinal in 6 684 of 6 684 references measured.
+//! When the record contradicts the division the scope is
+//! [`BindingScope::Undetermined`], which carries the collected and contradicted
+//! counts, hands every mesh the whole short list, and records the contradiction
+//! as [`claims::CUT_CONTRADICTED_BY_RECORD`]. The documented creature
+//! `0x00e6bce5:0x40627100:0x067c79d2` is one of those 100: block 0 yields both
+//! its references, so `refs_per_mesh = 2/2 = 1` used to hand mesh 1 a texture
+//! out of mesh 0's block.
+//!
+//! `Undetermined` is deliberately **not** folded into [`BindingScope::WholeModel`].
+//! The two mean different things — an uneven list, and a list the record
+//! contradicts — and collapsing them is how a wrong binding hides inside an
+//! honest-sounding fallback. Its known cost is stated on [`BindingScope`]: a
+//! reference whose group id is `0` states ordinal `0` whatever its position, so a
+//! record naming one is refused the cut even when its list is complete.
 //!
 //! # Roles come from content, never from position
 //!
@@ -96,6 +126,7 @@
 //! | name a texture's purpose | no shader has been read, and no mask plane's job is established | [`SamplerRole`] has one variant; [`ChannelRole::purpose_established`] is `false` for three of six |
 //! | call a texture "diffuse" | no raster record in the corpus decodes as a colour map | no such [`TextureRole`] variant; `tests/honesty.rs` sweeps for the word |
 //! | assign a role from a texture's position in the list | position correlates with content in this corpus but does not determine it | [`role::classify`] takes content statistics; [`TextureSlot::ordinal_agrees`] is a cross-check |
+//! | cut a texture list per mesh because the division worked | a short list divides just as neatly as a complete one | [`partition_texture_refs`] refuses a cut the record contradicts; [`BindingScope::Undetermined`] is the answer then |
 //! | bury the type assumption | the reference carries no type word | `assumed_type` is a parameter of every entry point, and [`claims::ASSUMED_RECORD_TYPE`] records it at `INFERRED` |
 //! | return an empty image instead of an error | an absent texel and a black texel must not look alike | [`decode_raster`](spore_texture::decode_raster) refusals arrive as typed [`MaterialError`] variants |
 //!

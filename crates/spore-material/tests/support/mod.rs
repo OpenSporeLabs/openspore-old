@@ -155,6 +155,24 @@ pub fn dbpf_package(records: &[(ResourceKey, Vec<u8>)]) -> Vec<u8> {
 }
 
 /// A one-package [`ContentStore`] over `records`.
+/// The `Spore_Content.package` of the installed game, or `None` when it is not
+/// there.
+///
+/// The path is resolved against the workspace root rather than the crate
+/// directory: `cargo test` runs a test with its own crate as the working
+/// directory, so a bare relative path is a coin flip.
+pub fn content_store() -> Option<ContentStore> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../SPORE/Data/Spore_Content.package");
+    if !path.exists() {
+        println!("SKIP: {} is not installed", path.display());
+        return None;
+    }
+    let mut store = ContentStore::new();
+    store.push(Package::open("Spore_Content", path).expect("Spore_Content.package opens"));
+    Some(store)
+}
+
 pub fn store_over(records: &[(ResourceKey, Vec<u8>)]) -> ContentStore {
     let mut store = ContentStore::new();
     store.push(Package::from_vec("synthetic", dbpf_package(records)).expect("synthetic DBPF"));
@@ -468,6 +486,27 @@ fn push_texture_entry(out: &mut Vec<u8>, index: u32, reference: GmdlTextureRef) 
 /// index buffer, one descriptor with a single `POSITION/FLOAT3` element, and one
 /// empty vertex buffer, all shared by every mesh.
 pub fn gmdl_record(meshes: usize, material_ids: &[u32], block: MaterialBlock) -> Vec<u8> {
+    let mut out = gmdl_through_material_ids(meshes, material_ids);
+    push_u32(&mut out, 1); // material-info block count
+    push_u32(&mut out, 1); // entries in this block
+    match block {
+        MaterialBlock::TextureSet(textures) => {
+            push_texture_set(&mut out, &textures);
+        }
+        MaterialBlock::UndocumentedShader(id) => {
+            // No payload: an id with no documented size has none to skip.
+            push_u32(&mut out, id);
+        }
+    }
+    push_complete_trailer(&mut out);
+    out
+}
+
+/// Everything up to and including the per-mesh material ids: the version word,
+/// the empty big-endian reference table, the bounds, one empty triangle-list
+/// index buffer, one descriptor, one empty vertex buffer, the mesh table and the
+/// material ids.
+fn gmdl_through_material_ids(meshes: usize, material_ids: &[u32]) -> Vec<u8> {
     let mut out = Vec::new();
     push_u32(&mut out, spore_gmdl::SUPPORTED_VERSION);
     // The one big-endian word in the format.
@@ -510,31 +549,31 @@ pub fn gmdl_record(meshes: usize, material_ids: &[u32], block: MaterialBlock) ->
         push_u32(&mut out, *material_id);
     }
     push_u32(&mut out, 0); // the observed zero word
-
-    push_u32(&mut out, 1); // material-info block count
-    push_u32(&mut out, 1); // entries in this block
-    match block {
-        MaterialBlock::TextureSet(textures) => {
-            push_u32(&mut out, TEXTURE_SET_ID);
-            push_u32(&mut out, textures.len() as u32);
-            for (index, reference) in textures.iter().enumerate() {
-                push_texture_entry(&mut out, index as u32, *reference);
-            }
-        }
-        MaterialBlock::UndocumentedShader(id) => {
-            // No payload: an id with no documented size has none to skip.
-            push_u32(&mut out, id);
-        }
-    }
-
-    // Trailer: no bone ranges, no anim data, the three-word trailing key.
-    push_u32(&mut out, 0);
-    push_u32(&mut out, 0);
-    push_u32(&mut out, 0);
-    push_u32(&mut out, 0);
-    push_u32(&mut out, 0);
-    push_u32(&mut out, 0);
     out
+}
+
+/// Writes one `0x20D` texture set: the id, the count, then that many entries.
+fn push_texture_set(out: &mut Vec<u8>, textures: &[GmdlTextureRef]) {
+    push_u32(out, TEXTURE_SET_ID);
+    push_u32(out, textures.len() as u32);
+    for (index, reference) in textures.iter().enumerate() {
+        push_texture_entry(out, index as u32, *reference);
+    }
+}
+
+/// The trailer a complete record ends with: no bone ranges, no anim data, the
+/// three-word trailing key.
+///
+/// **Five** words, which is exactly what `spore_gmdl`'s trailer walk reads:
+/// `bone_range_count`, `anim_data_count`, and the three-word key. A sixth word
+/// leaves four bytes the walk never reads, which makes
+/// `GmdlModel::fully_walked()` false on a record that in fact decoded
+/// completely — the byte-level statement and the meaning-level one coming apart,
+/// which is the trap this comment exists to stop a future edit from walking into.
+fn push_complete_trailer(out: &mut Vec<u8>) {
+    for _ in 0..5 {
+        push_u32(out, 0);
+    }
 }
 
 /// A gmdl record shaped like the documented asset: one mesh, material id
@@ -566,9 +605,7 @@ pub fn meshless_gmdl() -> Vec<u8> {
     push_u32(&mut out, 0); // vertex buffers
     push_u32(&mut out, 0); // the observed zero word
     push_u32(&mut out, 0); // material-info block count
-    for _ in 0..6 {
-        push_u32(&mut out, 0); // trailer: no bone ranges, no anim data, the key
-    }
+    push_complete_trailer(&mut out);
     out
 }
 
@@ -581,4 +618,60 @@ pub fn undocumented_shader_gmdl() -> Vec<u8> {
         &[DOCUMENTED_MATERIAL_ID],
         MaterialBlock::UndocumentedShader(UNDOCUMENTED_SHADER_ID),
     )
+}
+
+/// The shader-data id that opens every creature-model material-info block, and
+/// its documented payload length.
+const RENDER_PARAMS_ID: u32 = 0x210;
+const RENDER_PARAMS_SIZE: usize = 20;
+
+/// A gmdl record shaped like the documented creature
+/// `0x00e6bce5:0x40627100:0x067c79d2`: `meshes` meshes, **`declared_blocks`
+/// declared material-info blocks**, and a block 0 that is `0x210` (20 bytes) then
+/// a `0x20D` texture set of `block0_refs` references then the undocumented
+/// `0x218`.
+///
+/// That last entry is what makes this the shape the fix exists for: the walk
+/// reads block 0's texture set, collects its references, and then **stops** —
+/// so `declared_blocks - 1` blocks are never read and `model.texture_refs` is a
+/// strict prefix of the record's texture references. With `meshes == 2` and two
+/// references the division still comes out even, which is exactly the trap.
+pub fn truncated_material_gmdl(
+    meshes: usize,
+    declared_blocks: usize,
+    block0_refs: Vec<GmdlTextureRef>,
+) -> Vec<u8> {
+    let mut out = gmdl_through_material_ids(meshes, &vec![DOCUMENTED_MATERIAL_ID; meshes]);
+    push_u32(&mut out, declared_blocks as u32);
+    // Block 0: render parameters, the texture set, then the id that stops the
+    // walk. The real record's order, verified against the package.
+    push_u32(&mut out, 3); // entries in this block
+    push_u32(&mut out, RENDER_PARAMS_ID);
+    for word in 0..RENDER_PARAMS_SIZE / 4 {
+        push_u32(&mut out, 0x2644_5C07 + word as u32);
+    }
+    push_texture_set(&mut out, &block0_refs);
+    push_u32(&mut out, UNDOCUMENTED_SHADER_ID);
+    // Blocks 1.. are never reached, but the record must be long enough that the
+    // stop is the ONLY reason the walk ends: 4 bytes of trailer follow, so a
+    // reader that somehow skipped `0x218` would find the record end rather than
+    // running out of it.
+    push_complete_trailer(&mut out);
+    out
+}
+
+/// The two references the documented creature's block 0 contributes, with the
+/// group ids it carries: low bytes `0` and `1`, which is what makes the partial
+/// list's own ordinals contradict a division by two.
+pub fn creature_block0_refs() -> Vec<GmdlTextureRef> {
+    vec![
+        GmdlTextureRef {
+            instance_id: 0x067C_79D2,
+            group_id: 0x4062_2900,
+        },
+        GmdlTextureRef {
+            instance_id: 0x067C_79D2,
+            group_id: 0x4062_2901,
+        },
+    ]
 }

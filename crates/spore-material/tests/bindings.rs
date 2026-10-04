@@ -389,6 +389,11 @@ fn the_partition_helper_refuses_rather_than_rounding() {
 /// hand from the reader's documented layout rather than from a parser, so the
 /// partition's arithmetic is checked against an independent construction.
 fn model_with(meshes: usize, refs: usize) -> GmdlModel {
+    // `refs` spread over `meshes` blocks as evenly as possible, remainder first,
+    // so an uneven total (the case `the_partition_helper_refuses` exercises) is
+    // still a real reference list and not an empty one.
+    let per_block = refs.checked_div(meshes).unwrap_or(refs);
+    let remainder = if meshes == 0 { 0 } else { refs % meshes };
     GmdlModel {
         version: spore_gmdl::SUPPORTED_VERSION,
         referenced_files: Vec::new(),
@@ -406,12 +411,20 @@ fn model_with(meshes: usize, refs: usize) -> GmdlModel {
             })
             .collect(),
         material_ids: vec![DOCUMENTED_MATERIAL_ID; meshes],
-        texture_refs: (0..refs)
-            .map(|index| GmdlTextureRef {
-                instance_id: 0x067A_07F0,
-                // Distinct per reference, and its low byte carries the ordinal,
-                // so the cross-check has something to agree with.
-                group_id: 0x4063_2900 + index as u32,
+        // One texture set per mesh, each entry's group id low byte equal to its
+        // position INSIDE that set, and each block drawn from its own group
+        // family. The per-set ordinal is the record's own statement of where an
+        // entry sits, which is what `partition_texture_refs` cross-checks the
+        // division against, so a fixture that numbered across the whole flat list
+        // would be modelling a truncated record rather than a sound one.
+        texture_refs: (0..meshes.max(1))
+            .flat_map(|mesh| {
+                let family = 0x4063_2900u32 + (mesh as u32) * 0x100;
+                let count = per_block + usize::from((mesh as u32) < remainder as u32);
+                (0..count).map(move |within| GmdlTextureRef {
+                    instance_id: 0x067A_07F0,
+                    group_id: family + within as u32,
+                })
             })
             .collect(),
         bone_ranges: Vec::new(),
