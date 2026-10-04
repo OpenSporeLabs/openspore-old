@@ -49,13 +49,14 @@ crates/spore-cellcontent    the 12 Cell Stage gameplay record layouts
 crates/spore-semantic-bridge  read-only consumer of the spore-semantic passport
 crates/spore-creator-core  the authoring core: <sporemodel> creator documents
 crates/spore-rigblock  the part layer: rigblock bounds, RW4 skeleton body graph, bone names
+crates/spore-morphology  composition: block -> part resolution with provenance + unresolved counts
 crates/spore-engine      the Bevy runtime
 crates/spore-tools       `osptool`, the inspection CLI
 ```
 
 **The load-bearing invariant: everything above `loader` is renderer-agnostic
 and Bevy-free.** `spore-core` … `spore-material`, `spore-creator-core`,
-`spore-rigblock` and
+`spore-rigblock`, `spore-morphology` and
 `spore-differential` must never gain a `bevy` dependency, and `spore-assets`
 must never touch a GPU. That is what makes the asset layer testable with no
 window and no game install, and it is why `--info` decodes a real record in
@@ -130,6 +131,15 @@ cargo test -p spore-differential --release -- --ignored --nocapture
   graded per name by what witnesses them, and an exhaustive 62M-string search is
   expected to produce **29 accidental collisions** — so a single unrepeated hit
   proves nothing. Never re-derive the hash; use `spore_rigblock::vocabulary`.
+
+- **A prop record's FIRST container pointer is the part, not its own-instance
+  entry.** A block's part lives at the instance named by the *first* validated
+  `{instance, type, 0x2F4E681B, group, 0x00A00CE4}` entry in the `prop`, and that
+  is frequently **not** the block's own instance (rigblock `0xc66a14b8` carries
+  exactly one pointer, to `0x10fe9dc4`). Reading report 08 §5 as "the pointer names
+  the rigblock's own instance" silently costs a body graph on 484 of 678 real
+  parts. Measured by `spore-morphology`'s slice test; the resolver grades the hop
+  `Inferred` when the two disagree (485 of 678 parts).
 
 ### Evidence discipline (unchanged by the migration, now enforced in code)
 

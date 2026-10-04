@@ -756,3 +756,102 @@ rows that moved:
 
 The one that must not be over-read: a paper "body" and a rigblock container's
 skeleton are **not shown to be the same unit**, and the table says so.
+
+---
+
+## 11. The vertical slice, measured end to end
+
+Added 2026-10-04. New crate `spore-morphology` closes the loop from a shipped
+`<sporemodel>` record to a named body graph, with a resolver that reports its own
+coverage instead of implying it.
+
+### 11.1 What it runs
+
+```text
+Spore_Game.package ─DBPF─> <sporemodel> ─> spore-creator-core
+                                                    │ canonical authoring data
+                                                    ▼
+                                       spore-morphology ─ block resolution + provenance
+                                                    │
+                                                    ▼
+                                       spore-rigblock ─ part pair, skeleton, bone names
+```
+
+### 11.2 Measured over the real corpus
+
+From `cargo test -p spore-morphology --release --test slice -- --ignored`:
+
+```
+68 documents, 680 blocks -> 678 resolved / 2 unresolved
+677 resolved parts carry a body graph; 677 bones, 557 named
+
+  Creature  blocks 486  resolved 486  unresolved 0
+  Cell      blocks  79  resolved  79  unresolved 0
+  Vehicle   blocks  57  resolved  57  unresolved 0
+  Ufo       blocks  47  resolved  47  unresolved 0
+  Building  blocks   8  resolved   8  unresolved 0
+  Flora     blocks   3  resolved   1  unresolved 2
+
+  stopped at part_pair because no_such_record: 1
+  stopped at prop      because wrong_structure: 1
+```
+
+Two things a reader must not misread:
+
+* **678/680 at the block layer is not 1316/1549 at the rigblock layer.** The
+  680 `<blockref>` blocks name fewer distinct rigblocks than the 1549 records
+  exist, and two denominators must not be compared. A test asserts both counts so
+  a future change cannot quietly conflate them.
+* **Flora's gap is a rigblock-layer fact, not a block-layer one.** Report 08
+  measured 0 of 107 flora rigblocks reaching a part; the documents place only 3
+  flora blocks, and 1 of them does resolve. "Flora has no parts" is true of one
+  layer and false of the other, and the slice reports what it measured.
+
+### 11.3 The resolver's selection rule, measured not assumed
+
+Which instance does a block's part live at? The obvious reading of report 08 §5 —
+the `prop` pointer naming the rigblock's own instance — is **wrong for most
+parts**, and finding that out cost a body graph on 484 of 678.
+
+Measured over 370 sampled rigblocks: the **first** validated
+`{instance, type, group, 0x00A00CE4}` entry pointing at `0x2F4E681B` is the part,
+and it frequently is *not* the block's own instance. Example: rigblock
+`0xc66a14b8` carries exactly one pointer, to `0x10fe9dc4`, and that is the one
+whose container holds a skeleton.
+
+The resolver therefore:
+
+* selects the **first** validated container entry, and
+* grades the hop `Measured` only when that entry also equals the block's own
+  instance — two signals agreeing — and `Inferred` otherwise.
+
+**485 of 678 real parts report an inferred hop**, and that is the honest number.
+It says the selection rule is measured but the choice is unconfirmed per record,
+not that 485 parts are questionable.
+
+### 11.4 What the API makes impossible
+
+* **Silently skipping a block.** Every block gets a slot; `resolved +
+  unresolved == blocks` is asserted exactly, so a future "skip the unresolvable
+  ones" fails the test rather than shipping.
+* **Inventing a part.** There is no default mesh, no placeholder body, and no
+  substitution path. `UnresolvedPart` carries the block, the block id, the stage
+  reached, the reason, and the key that was tried.
+* **Confusing "absent" with "undecodable".** `StopReason` separates
+  `no_such_record`, `wrong_structure`, `undecodable` and `not_applicable`.
+* **Presenting an inferred hop as measured.** `Trail::weakest_grade` is a `max`
+  over a rank where `Inferred` outranks `Measured`, so one inferred hop makes the
+  whole trail inferred.
+* **Debug strings as provenance.** `Trail` is typed fields; `as_provenance()`
+  derives `spore_core::Provenance` from the same values the resolver used.
+
+### 11.5 What is still not established
+
+* The 2 unresolved blocks are counted, not diagnosed: one flora block has no part
+  pair, one block's `prop` record holds no validated pointer.
+* Which of a part's transforms is its **rest pose** — UNKNOWN.
+* Whether `attach` / `csnap` bones cross part boundaries — UNKNOWN, and it is the
+  highest-value open question (§10.4).
+* The `gmsh` geometry is still undecoded in Rust, so a resolved part currently
+  yields a **body graph but no vertices**. Report 09 recovered the byte layout,
+  so this is known work, not unknown work.

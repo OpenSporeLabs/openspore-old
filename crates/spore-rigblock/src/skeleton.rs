@@ -64,6 +64,11 @@ pub struct Skeleton {
     ///
     /// Never the record's own instance id (0 of 6270). Meaning unknown.
     pub id: u32,
+    /// The three pointers as stored, unmodified.
+    ///
+    /// Reported rather than trusted. Feed them to
+    /// [`Skeleton::verify_pointers`] with the section's address to check them.
+    pub reported_pointers: [u32; 3],
     /// The bones, in array order.
     ///
     /// **Array order is not hierarchy order.** Bones are stored as three parallel
@@ -117,27 +122,17 @@ impl Skeleton {
             return Err(RigblockError::SkeletonEmpty);
         }
 
-        // The three self-relative pointers are redundant with the size identity,
-        // so they are *verified* rather than trusted: a container that stores
-        // them differently from the measured layout is a different format, and
-        // silently reading array 1 where array 2 lives would be undetectable.
-        for (slot, offset, expected) in [
-            (0x00usize, 0x18usize, 0usize),
-            (0x04, 0x18 + 4 * bone_count, 1),
-            (0x08, 0x18 + 8 * bone_count, 2),
-        ] {
-            let recorded = read_u32(slot) as usize;
-            // The pointers are stored record-absolute and equal to `base + offset`
-            // of the section, so compare as a relative displacement.
-            let _ = expected;
-            if recorded == 0 && offset != 0x18 {
-                return Err(RigblockError::SkeletonPointerMismatch {
-                    array: expected + 1,
-                    recorded,
-                    expected: offset,
-                });
-            }
-        }
+        // The three pointers are reported, not verified here.
+        //
+        // An earlier revision of this decoder rejected only *zero* pointers,
+        // which passed every real section (their pointers are non-zero) and every
+        // synthetic fixture, and therefore verified nothing at all. That is the
+        // worst kind of check: it looks rigorous and catches no wrong data.
+        //
+        // The real check needs the section's address inside the record, which a
+        // bare payload slice does not carry, so it is a separate call:
+        // [`Skeleton::verify_pointers`]. What *is* verified here is the size
+        // identity `0x18 + 12·N`, which is what actually places the arrays.
 
         let array1 = 0x18;
         let array2 = array1 + 4 * bone_count;
@@ -166,7 +161,11 @@ impl Skeleton {
             });
         }
 
-        let skeleton = Self { id, bones };
+        let skeleton = Self {
+            id,
+            bones,
+            reported_pointers: [read_u32(0x00), read_u32(0x04), read_u32(0x08)],
+        };
 
         // Exactly one root, 6270/6270.
         let roots = skeleton.bones.iter().filter(|b| b.parent.is_none()).count();
@@ -189,6 +188,38 @@ impl Skeleton {
     /// Whether there are no bones. Always false for a decoded skeleton.
     pub fn is_empty(&self) -> bool {
         self.bones.is_empty()
+    }
+
+    /// Checks that the reported pointers address the three arrays.
+    ///
+    /// `base` is the section's byte address **inside its record**, because the
+    /// pointers are record-absolute: they equal `base + 0x18`, `base + 0x18+4N`
+    /// and `base + 0x18+8N`. A caller that sliced the payload out of a container
+    /// knows `base` from the section row; a caller with only the payload cannot
+    /// check, and must not be told it did.
+    ///
+    /// Verified on all 6270 corpus sections.
+    pub fn verify_pointers(&self, base: u32) -> Result<()> {
+        let base = base as usize;
+        let bone_count = self.bones.len();
+        // The order is NOT ascending by array: `d+0x00` points at array 2,
+        // `d+0x04` at array 3 and `d+0x08` at array 1. Writing this loop in
+        // ascending order would have "verified" three wrong addresses and passed.
+        for (recorded, array, offset) in [
+            (self.reported_pointers[0], 2usize, 0x18 + 4 * bone_count),
+            (self.reported_pointers[1], 3, 0x18 + 8 * bone_count),
+            (self.reported_pointers[2], 1, 0x18),
+        ] {
+            let expected = base + offset;
+            if recorded as usize != expected {
+                return Err(RigblockError::SkeletonPointerMismatch {
+                    array,
+                    recorded: recorded as usize,
+                    expected,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// The one root bone's index.
@@ -338,6 +369,12 @@ mod tests {
         let payload = section(&[(ROOT, 0, -1), (0x3693_2030, 1, 0)], 0xAAAA_BBBB);
         let skeleton = Skeleton::decode(&payload).expect("decodes");
         assert_eq!(skeleton.len(), 2);
+        // The fixture's pointers are payload-relative, so they check at base 0.
+        assert!(skeleton.verify_pointers(0).is_ok());
+        assert!(
+            skeleton.verify_pointers(0x1000).is_err(),
+            "the wrong base must fail"
+        );
         assert_eq!(skeleton.root(), 0);
         assert_eq!(skeleton.children(0), vec![1]);
         assert!(skeleton.children(1).is_empty());

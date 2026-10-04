@@ -1,0 +1,15 @@
+[package]
+name = "spore-morphology"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Composing creator documents into morphology: block resolution, part provenance, and explicit unresolved reporting."
+
+[dependencies]
+spore-core = { workspace = true }
+spore-creator-core = { workspace = true }
+spore-rigblock = { workspace = true }
+spore-dbpf = { workspace = true }
+thiserror = { workspace = true }

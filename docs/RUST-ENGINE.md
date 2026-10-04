@@ -50,9 +50,9 @@ ends at pixels:
 > **The rule: everything above `loader` is renderer-agnostic and Bevy-free.**
 
 `spore-dbpf`, `spore-rw4`, `spore-gmdl`, `spore-texture`, `spore-core`,
-`spore-assets`, `spore-material`, `spore-creator-core`, `spore-rigblock` and
-`spore-tools` have **no `bevy` dependency at all**. You can confirm it by reading
-their `Cargo.toml` — none of the ten lists one. They speak in `spore_gmdl::Mesh` and
+`spore-assets`, `spore-material`, `spore-creator-core`, `spore-rigblock`,
+`spore-morphology` and `spore-tools` have **no `bevy` dependency at all**. You
+can confirm it by reading their `Cargo.toml` — none of the eleven lists one. They speak in `spore_gmdl::Mesh` and
 `spore_texture::RasterImage`, never in Bevy assets, components or GPU handles.
 
 That is not tidiness; it is what makes the asset layer testable. `spore-assets`
@@ -91,6 +91,7 @@ exception path carry the weaker form on purpose:
 | `spore-tools` | `osptool`, an offline inspector. Library-first, binary-as-shim, so every command is drivable from a test with an in-memory sink. |
 | `spore-creator-core` | The authoring core: Spore's own `<sporemodel>` creator documents (68 of them, six record families), decoded into plain Rust. Depends on `spore-core` and nothing else. See `docs/CREATOR-CORE.md`. |
 | `spore-rigblock` | The part layer: rigblock bounds records (`0x5CAA5E28`), the RW4 `Skeleton (0x70002)` body graph, and the bone-name vocabulary. Also `spore-core` only. |
+| `spore-morphology` | Composition: a creator document resolved into parts, with a typed provenance trail per hop and **explicit** unresolved reporting. Measured at 680 blocks → 678 resolved / 2 unresolved. |
 
 ---
 

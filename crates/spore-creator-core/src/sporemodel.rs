@@ -37,7 +37,7 @@ use crate::xml::{self, Element};
 /// `docs/CREATOR-CORE.md` carried hand-converted hex that matched **no record in
 /// the tree**; these were re-read from the index
 /// (`docs/analysis/creator/07-architecture-review.md` §1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Family {
     /// `0x2B978C46` — 47 records, group `0x40626200`.
     Creature,

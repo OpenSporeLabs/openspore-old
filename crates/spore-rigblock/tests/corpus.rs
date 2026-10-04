@@ -190,6 +190,7 @@ fn every_skeleton_section_decodes_with_exactly_one_root() {
     assert_eq!(containers.len(), 1824, "paired container count moved");
 
     let mut sections = 0usize;
+    let mut pointers_verified = 0usize;
     let mut records_with_skeleton = 0usize;
     let mut bone_total = 0usize;
     let mut max_bones = 0usize;
@@ -207,6 +208,13 @@ fn every_skeleton_section_decodes_with_exactly_one_root() {
             });
             sections += 1;
             here += 1;
+            // The pointer check that an earlier decoder only pretended to make.
+            skeleton
+                .verify_pointers(offset as u32)
+                .unwrap_or_else(|error| {
+                    panic!("a real skeleton section's pointers do not address its arrays: {error}")
+                });
+            pointers_verified += 1;
             bone_total += skeleton.len();
             max_bones = max_bones.max(skeleton.len());
             depths.push(skeleton.max_depth());
@@ -236,8 +244,13 @@ fn every_skeleton_section_decodes_with_exactly_one_root() {
         deepest >= 4,
         "a corpus skeleton should have chains deeper than a flat list, saw {deepest}"
     );
+    assert_eq!(
+        pointers_verified, sections,
+        "every section's three pointers must address arrays 1, 2 and 3"
+    );
     eprintln!(
-        "{sections} sections, {records_with_skeleton} records, {bone_total} bones, \
+        "{sections} sections ({pointers_verified} pointer-verified), \
+         {records_with_skeleton} records, {bone_total} bones, \
          max bones {max_bones}, deepest chain {deepest}"
     );
 }
