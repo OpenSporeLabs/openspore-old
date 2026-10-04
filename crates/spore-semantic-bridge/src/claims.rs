@@ -126,14 +126,23 @@ pub mod claim {
     /// enveloped groups. It publishes **nothing** for its plain nullable fields,
     /// so grading them needs a code from somewhere. These three are marked
     /// bridge-local so no consumer mistakes them for format vocabulary:
-    /// [`crate::REASON_NO_SDK_NAME`],
-    /// [`crate::REASON_NO_SUBSYSTEM`] and
+    /// [`crate::REASON_NO_SDK_NAME`], [`crate::REASON_NO_SUBSYSTEM`] and
     /// [`crate::REASON_CONVENTION_UNDETERMINED`].
     ///
     /// A fourth, `"no_reconstruction_package"`, is *not* bridge-local: it is the
     /// format's own code, reused for a package that is `null` inside an available
     /// reconstruction record.
     pub const BRIDGE_LOCAL_REASON_CODES: &str = "bridge_local_reason_codes";
+
+    /// A fourth bridge-local reason code, added with the contract layer.
+    ///
+    /// [`crate::REASON_NO_ABI_RECORD`] answers a question the format does not
+    /// publish: the ABI group was unavailable, and the crate's own
+    /// [`crate::AbiStanding`] wants to distinguish "no group" from "a group with
+    /// no convention". The format's own code (`no_evidence_pack` and friends) is
+    /// carried first in the reason a caller sees whenever the group published one;
+    /// this code is the fallback.
+    pub const BRIDGE_LOCAL_REASON_CODES_EXPANDED: &str = "bridge_local_reason_codes_expanded";
 
     /// The reader refuses an unsorted snapshot; the Go loader does not.
     ///
@@ -227,11 +236,108 @@ pub mod claim {
     /// instead of being refused — while every verdict inside it is still validated in
     /// full, and a wrong shape in one is still a schema error.
     pub const OPEN_MAPS_NOT_CLOSED: &str = "open_maps_not_closed";
+
+    /// The contract layer states **no platform API and no interface name**.
+    ///
+    /// The rules in [`crate::invariants`] were distilled from a runtime run of the
+    /// original binary, and that run went through a graphics API OpenSpore does
+    /// not implement. Naming one would turn an engine requirement into an
+    /// instruction to reproduce an API this project does not target.
+    ///
+    /// **What this crate does:** states each rule in engine terms, and refuses a
+    /// leaked name mechanically — [`crate::FORBIDDEN_IN_STATEMENTS`] is matched
+    /// against every statement and every anchor note by
+    /// [`crate::SemanticInvariant::coherence`]. The vocabulary those observations
+    /// arrived in is recorded in `docs/SEMANTIC-CONTRACTS.md` as *provenance*, in
+    /// the place that is allowed to be specific.
+    pub const CONTRACTS_ENCODE_NO_PLATFORM_API: &str = "contracts_encode_no_platform_api";
+
+    /// A runtime observation enters as a **reference**, never as a parse.
+    ///
+    /// [`crate::RuntimeBasis`] carries a portable artifact id and the observation
+    /// restated in engine terms. It does not open a producer's report, and this
+    /// crate compiles and tests with no runtime producer present at all: the
+    /// correct flow is producer → runtime evidence → `spore-semantic` → semantic
+    /// contract → OpenSpore, and the contract is the last step that still depends
+    /// on nothing but a documented artifact id.
+    ///
+    /// The overlay *join* stays where it belongs, in `spore-semantic runtime`
+    /// (see [`RUNTIME_OVERLAYS_NOT_READ`]): re-implementing it here would be a
+    /// second answer to the same question in a second language.
+    pub const RUNTIME_BASIS_IS_A_REFERENCE_NOT_A_PARSE: &str =
+        "runtime_basis_is_a_reference_not_a_parse";
+
+    /// A contract's consumer is an **identifier**, and nothing is wired.
+    ///
+    /// [`crate::EngineComponent`] names a workspace path, because this crate is
+    /// Bevy-free and cannot name a Bevy type. Every entry in the catalog has at
+    /// least one consumer, which is what makes "a contract with no consumer is a
+    /// note" checkable — but no engine system reads any of it yet, and
+    /// `docs/SEMANTIC-CONTRACTS.md` says per rule what the assertion would be.
+    /// Reporting otherwise would be a second claim with no consumer.
+    pub const CONTRACT_CONSUMERS_ARE_NOT_YET_WIRED: &str = "contract_consumers_are_not_yet_wired";
+
+    /// A lifecycle role read off a name token is `INFERRED`, whatever the name's
+    /// own grade is.
+    ///
+    /// 1 171 of the committed snapshot's records carry an SDK name and 1 167 of
+    /// those are graded `CONFIRMED` (one `SUPPORTED`, three `UNKNOWN`). A
+    /// `CONFIRMED` *name* does not make "this function is a teardown step" a
+    /// confirmed claim, so
+    /// [`crate::LifecycleRole::ROLE_LEVEL`] caps the role at
+    /// [`spore_core::EvidenceLevel::Inferred`] and
+    /// [`crate::SemanticContract::capped_from_fact`] is the only constructor that
+    /// lowers a grade.
+    ///
+    /// The token set is **exact**, closed at seven tokens over 55 records, with no
+    /// prefix matching. A `Create\w*` prefix would add 38 records, among them
+    /// `CreateSpaceCommEvent` and `CreateCivCommEvent`, which create no resource
+    /// at all — a role read off a prefix would be wrong for them and would read
+    /// exactly as confidently as the ones it got right.
+    pub const LIFECYCLE_ROLE_IS_INFERRED_FROM_A_NAME: &str =
+        "lifecycle_role_is_inferred_from_a_name";
+
+    /// "The passport is silent about this address" is computed by a **stated
+    /// rule**, not asserted in prose.
+    ///
+    /// [`crate::ContractLedger::states_anything`] defines it: a record *states*
+    /// something when it carries an SDK name, an ABI record, a table membership, a
+    /// semantic record or a reconstruction record; all five absent is an explicit
+    /// silence, which is a different statement from having no record at all. It is
+    /// this crate's rule, not the format's, and it is the predicate behind
+    /// [`crate::PassportStance::ExplicitlySilent`] — which is why the rule is a
+    /// public function rather than a private detail.
+    pub const PASSPORT_SILENCE_IS_COMPUTED_BY_A_STATED_RULE: &str =
+        "passport_silence_is_computed_by_a_stated_rule";
+
+    /// A measurement from one environment is evidence of a **shape**, not of a
+    /// value.
+    ///
+    /// The run behind `device_memory_budget_is_a_policy_input` read an
+    /// available-memory figure that, in that environment, was a saturated 32-bit
+    /// wrap. The producer deliberately did not copy it, because adopting it would
+    /// encode one machine's arithmetic as the program's behaviour. This crate
+    /// records the shape — a byte count, consumed after the device exists — and
+    /// states no number, so the same rule holds whatever the next run sees.
+    pub const ENVIRONMENT_MEASUREMENTS_ARE_NOT_ENGINE_BEHAVIOUR: &str =
+        "environment_measurements_are_not_engine_behaviour";
+
+    /// No contract in the catalog is `CONFIRMED` or `VERIFIED`.
+    ///
+    /// Every entry's `level` is bounded by its `basis`
+    /// ([`crate::InvariantCore::grade_is_coherent`], checked by
+    /// [`crate::SemanticInvariant::coherence`]), and no observation in this
+    /// catalog came from a repeatable differential against the original binary —
+    /// which is what `VERIFIED` means in this repository's vocabulary. Nine
+    /// entries are `OBSERVED` observations generalised to `INFERRED` rules and one
+    /// is `UNKNOWN` on both rungs. Raising a grade here would need a differential,
+    /// not an argument.
+    pub const CONTRACT_GRADES_ARE_CAPPED_AND_LOW: &str = "contract_grades_are_capped_and_low";
 }
 
 /// Every claim id, for a caller that wants to enumerate this crate's non-findings
 /// (a `--list-claims` style call, or a report that cites them by id).
-pub const ALL_CLAIMS: [&str; 17] = [
+pub const ALL_CLAIMS: [&str; 24] = [
     claim::CLASSIFICATION_EVIDENCE_VOCABULARY,
     claim::SUBSYSTEM_UNKNOWN_SENTINEL,
     claim::PROMOTION_RECORD_ZERO_PATH,
@@ -249,6 +355,13 @@ pub const ALL_CLAIMS: [&str; 17] = [
     claim::NO_PANICS_ANY_INPUT,
     claim::SINGLE_CONNECTION_DIGEST,
     claim::OPEN_MAPS_NOT_CLOSED,
+    claim::CONTRACTS_ENCODE_NO_PLATFORM_API,
+    claim::RUNTIME_BASIS_IS_A_REFERENCE_NOT_A_PARSE,
+    claim::CONTRACT_CONSUMERS_ARE_NOT_YET_WIRED,
+    claim::LIFECYCLE_ROLE_IS_INFERRED_FROM_A_NAME,
+    claim::PASSPORT_SILENCE_IS_COMPUTED_BY_A_STATED_RULE,
+    claim::ENVIRONMENT_MEASUREMENTS_ARE_NOT_ENGINE_BEHAVIOUR,
+    claim::CONTRACT_GRADES_ARE_CAPPED_AND_LOW,
 ];
 
 #[cfg(test)]
@@ -281,6 +394,13 @@ mod tests {
             claim::NO_PANICS_ANY_INPUT,
             claim::SINGLE_CONNECTION_DIGEST,
             claim::OPEN_MAPS_NOT_CLOSED,
+            claim::CONTRACTS_ENCODE_NO_PLATFORM_API,
+            claim::RUNTIME_BASIS_IS_A_REFERENCE_NOT_A_PARSE,
+            claim::CONTRACT_CONSUMERS_ARE_NOT_YET_WIRED,
+            claim::LIFECYCLE_ROLE_IS_INFERRED_FROM_A_NAME,
+            claim::PASSPORT_SILENCE_IS_COMPUTED_BY_A_STATED_RULE,
+            claim::ENVIRONMENT_MEASUREMENTS_ARE_NOT_ENGINE_BEHAVIOUR,
+            claim::CONTRACT_GRADES_ARE_CAPPED_AND_LOW,
         ] {
             assert!(!id.is_empty());
             assert!(
@@ -289,6 +409,6 @@ mod tests {
                  miss it"
             );
         }
-        assert_eq!(ALL_CLAIMS.len(), 17);
+        assert_eq!(ALL_CLAIMS.len(), 24);
     }
 }

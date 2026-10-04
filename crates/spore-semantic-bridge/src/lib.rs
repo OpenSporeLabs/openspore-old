@@ -14,9 +14,24 @@
 //!          │
 //!   spore-semantic-bridge          <-- THIS CRATE: strict streaming reader
 //!          │
-//!   spore-engine (not wired up yet)
+//!          ├── contracts             <-- engine-facing claims, graded and sourced
+//!          └── invariants            <-- the committed rule catalog
+//!          │
+//!          v
+//!   spore-engine (not wired yet: docs/SEMANTIC-CONTRACTS.md says what each
+//!                rule would assert and where)
 //! ```
 //!
+//! # Contracts: what an engine author reaches for
+//!
+//! The passport answers "what is at this address". An engine needs three more
+//! answers, and [`contracts`] supplies them two honest ways: a **committed
+//! contract** — a rule with a grade, a provenance and a named consuming
+//! component — and a **projection** of already-graded facts into engine
+//! questions ([`ContractLedger`]). Neither invents a fact the source did not
+//! state, and [`SemanticInvariant::coherence`] is the machine-checked list of
+//! what a committed rule must satisfy before it may exist: a consumer, a source,
+//! a legal grade, and no platform API name.
 //! # What this crate does not do
 //!
 //! **It derives nothing.** The rule the whole exchange rests on is: *if a fact
@@ -84,6 +99,8 @@
 //! | [`snapshot`] | [`Snapshot`], the streaming index, canonicalization, [`Verification`] |
 //! | [`passport`] | [`Passport`] and the engine-facing accessors |
 //! | [`metadata`] | line 1: binary identity, input digests, counters |
+//! | [`contracts`] | [`ContractLedger`] and the contract types an engine asserts |
+//! | [`invariants`] | the committed rule catalog, each entry graded and sourced |
 //! | [`claims`] | **what this crate does not know** — read it before trusting an answer |
 //! | `envelope`, `json`, `schema`, `sha256` | the strict reader, private |
 
@@ -92,7 +109,9 @@
 
 pub mod address;
 pub mod claims;
+pub mod contracts;
 pub mod error;
+pub mod invariants;
 pub mod metadata;
 pub mod passport;
 pub mod snapshot;
@@ -103,7 +122,16 @@ mod schema;
 mod sha256;
 
 pub use address::{format_va, AddressError, Va};
+pub use contracts::{
+    AbiStanding, AddressContracts, AuditedAnchor, BehavioralInvariant, ContractLedger,
+    ContractSubject, DispatchContract, EngineComponent, EvidenceAnchor, InvariantAudit,
+    InvariantCore, LifecycleContract, LifecyclePhase, LifecycleRole, LifecycleRoleKind,
+    PassportStance, PhaseOrderViolation, ProbedInput, ResourceContract, ResourceDecision,
+    RuntimeBasis, RuntimeGateContract, SemanticContract, SemanticInvariant,
+    FORBIDDEN_IN_STATEMENTS, REASON_NO_ABI_RECORD,
+};
 pub use error::BridgeError;
+pub use invariants::{all_invariants, invariant, ARTIFACT_MAIN_LOOP, DOCS_REFERENCE};
 pub use metadata::{AbsentInput, Counts, ExportNotes, Generator, InputDigest, Metadata};
 pub use passport::{
     AbiRecord, AdditionalPack, AddressResolution, Canonicalization, Classification, Cleanup,

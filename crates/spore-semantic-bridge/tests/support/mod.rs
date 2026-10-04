@@ -140,6 +140,282 @@ pub fn snapshot_file(records: &[String]) -> String {
     out
 }
 
+// ---------------------------------------------------------------------------
+// A record builder, for the fact groups the contract tests need
+// ---------------------------------------------------------------------------
+
+/// How the `abi` group should be published.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AbiShape {
+    /// An explicit absence with this reason code.
+    Absent(&'static str),
+    /// Available, naming a convention.
+    Known {
+        /// The convention, or `None` for an undetermined record.
+        convention: Option<&'static str>,
+        /// The convention's grade.
+        confidence: &'static str,
+    },
+}
+
+/// How the `vtable` group should be published.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VtShape {
+    /// An explicit absence.
+    Absent,
+    /// Available with these `(table_va, slot, slot_width)` memberships.
+    Memberships(Vec<(u32, u32, Option<u32>)>),
+}
+
+/// How the `reconstruction` group's runtime gate should be published.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GateShape {
+    /// No reconstruction record at all.
+    Absent,
+    /// A record that states the gate, or states nothing about it.
+    Stated(Option<bool>),
+}
+
+/// Composes one fully valid synthetic record.
+///
+/// The shape [`record`] writes is the shape 58,085 of the committed records have:
+/// every fact group an explicit absence. This builder exists because the contract
+/// layer needs the other shapes — a named record, a table membership, an ABI
+/// record, a stated gate — and hand-writing four JSON blobs per test is how a
+/// fixture starts disagreeing with the schema.
+#[derive(Debug, Clone)]
+pub struct RecordBuilder {
+    va: String,
+    rva: String,
+    size: i64,
+    sdk_name: Option<String>,
+    sdk_name_source: Option<String>,
+    category: &'static str,
+    evidence: &'static str,
+    subsystem: Option<&'static str>,
+    abi: AbiShape,
+    vtable: VtShape,
+    gate: GateShape,
+}
+
+impl RecordBuilder {
+    /// A record with every group absent, at `va` with `size` bytes.
+    pub fn new(va: &str, rva: &str, size: i64) -> Self {
+        Self {
+            va: va.to_owned(),
+            rva: rva.to_owned(),
+            size,
+            sdk_name: None,
+            sdk_name_source: None,
+            category: "ENGINE_IMPLEMENTATION",
+            evidence: "INFERRED",
+            subsystem: Some("App"),
+            abi: AbiShape::Absent("no_evidence_pack"),
+            vtable: VtShape::Absent,
+            gate: GateShape::Absent,
+        }
+    }
+
+    /// States an SDK name, with the artifact that stated it.
+    pub fn sdk(mut self, name: &str) -> Self {
+        self.sdk_name = Some(name.to_owned());
+        self.sdk_name_source = Some("sdk_functions.tsv".to_owned());
+        self
+    }
+
+    /// Sets the triage classifier's own view.
+    pub fn classified(mut self, category: &'static str, evidence: &'static str) -> Self {
+        self.category = category;
+        self.evidence = evidence;
+        self
+    }
+
+    /// Sets the subsystem, or `None` for the source's own `"Unknown"` sentinel.
+    pub fn subsystem(mut self, subsystem: Option<&'static str>) -> Self {
+        self.subsystem = subsystem;
+        self
+    }
+
+    /// Publishes an ABI record naming a convention.
+    pub fn abi_known(self, convention: &'static str, confidence: &'static str) -> Self {
+        Self {
+            abi: AbiShape::Known {
+                convention: Some(convention),
+                confidence,
+            },
+            ..self
+        }
+    }
+
+    /// Publishes an ABI record whose convention is `null`.
+    pub fn abi_undetermined(self, confidence: &'static str) -> Self {
+        Self {
+            abi: AbiShape::Known {
+                convention: None,
+                confidence,
+            },
+            ..self
+        }
+    }
+
+    /// Publishes table memberships.
+    pub fn vtable(self, memberships: &[(u32, u32, Option<u32>)]) -> Self {
+        Self {
+            vtable: VtShape::Memberships(memberships.to_vec()),
+            ..self
+        }
+    }
+
+    /// Publishes a reconstruction record, with or without a stated gate.
+    pub fn runtime_gate(self, gated: Option<bool>) -> Self {
+        Self {
+            gate: GateShape::Stated(gated),
+            ..self
+        }
+    }
+
+    /// The record line.
+    pub fn build(&self) -> String {
+        let bare = self.va.trim_start_matches("0x").to_owned();
+        // The trailing comma lives with the value, so the `names` object closes
+        // correctly whether or not a name and a source were stated.
+        let sdk_name = self
+            .sdk_name
+            .as_ref()
+            .map_or_else(|| "null,".to_owned(), |name| format!("\"{name}\""));
+        let sdk_source = self
+            .sdk_name_source
+            .as_ref()
+            .map_or_else(String::new, |source| {
+                format!(",\"sdk_name_source\":\"{source}\",")
+            });
+        let subsystem = self
+            .subsystem
+            .map_or_else(|| "null".to_owned(), |value| format!("\"{value}\""));
+
+        let abi = match &self.abi {
+            AbiShape::Absent(reason) => absent_envelope(reason),
+            AbiShape::Known {
+                convention,
+                confidence,
+            } => {
+                let confidence = *confidence;
+                let convention =
+                    convention.map_or_else(|| "null".to_owned(), |c| format!("\"{c}\""));
+                format!(
+                    concat!(
+                        r#"{{"state":"available","evidence_level":"{level}","evidence_state":"DERIVED","#,
+                        r#""provenance":["synthetic-fixture"],"value":{{"origin":"abi_inference","#,
+                        r#""schema":"openspore-abi-inference-1","convention":{convention},"#,
+                        r#""convention_confidence":"{confidence}","verdict":"ABI_TEST","#,
+                        r#""completeness":"CORE_RESOLVED","receiver":null,"cleanup":null,"#,
+                        r#""return":null,"sret":null,"variadic":"UNKNOWN","#,
+                        r#""stack_argument_slots":null,"seh_or_cookie_frame":null,"declared":null}}}}"#
+                    ),
+                    level = if confidence == "UNKNOWN" {
+                        "INFERRED"
+                    } else {
+                        confidence
+                    },
+                    convention = convention,
+                    confidence = confidence,
+                )
+            }
+        };
+
+        let vtable = match &self.vtable {
+            VtShape::Absent => absent_envelope("no_vtable_membership"),
+            VtShape::Memberships(memberships) => {
+                let items = memberships
+                    .iter()
+                    .map(|(table, slot, width)| {
+                        let width = width.map_or_else(|| "null".to_owned(), |w| w.to_string());
+                        format!(
+                            r#"{{"table_va":"0x{table:08x}","slot":{slot},"slot_width":{width}}}"#
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!(
+                    concat!(
+                        r#"{{"state":"available","evidence_level":"INFERRED","evidence_state":"DERIVED","#,
+                        r#""provenance":["synthetic-fixture"],"value":{{"memberships":[{items}],"#,
+                        r#""abi_attributed":null,"triage_addresses":[],"triage_family":null}}}}"#
+                    ),
+                    items = items
+                )
+            }
+        };
+
+        let reconstruction = match &self.gate {
+            GateShape::Absent => absent_envelope("no_reconstruction_package"),
+            GateShape::Stated(gated) => {
+                let gated = gated.map_or_else(|| "null".to_owned(), |value| value.to_string());
+                format!(
+                    concat!(
+                        r#"{{"state":"available","evidence_level":"VERIFIED","evidence_state":"PERSISTED","#,
+                        r#""provenance":["synthetic-fixture"],"value":{{"package":"synthetic","#,
+                        r#""status":"implemented","review_status":"reviewed","integration_status":"integrated","#,
+                        r#""reconstructed":true,"blocked":false,"promoted":"true","promotion_schema":null,"#,
+                        r#""promotion_supersedes":null,"static_status":"PASS","generated_source":[],"#,
+                        r#""handoffs":[],"metadata":[],"runtime_gated":{gated},"runtime_validated":null,"#,
+                        r#""validation":null}}}}"#
+                    ),
+                    gated = gated
+                )
+            }
+        };
+
+        format!(
+            concat!(
+                r#"{{"record":"function","#,
+                r#""identity":{{"canonical_va":"{va}","rva":"{rva}","size":{size},"size_known":true,"#,
+                r#""is_thunk":false,"section":".text","identity_resolution":null}},"#,
+                r#""names":{{"ghidra_name":"FUN_{bare}","normalized_symbol":"FUN_{bare}","sdk_name":{sdk_name}"#,
+                r#"{sdk_source}"identity_refuted":null}},"#,
+                r#""classification":{{"category":"{category}","priority":"P3","evidence":"{evidence}","#,
+                r#""subsystem":{subsystem},"cluster":null,"renderware_role":null,"#,
+                r#""subsystem_source":"triage_jsonl"}},"#,
+                r#""abi":{abi},"#,
+                r#""vtable":{vtable},"#,
+                r#""graph":{{"caller_count":0,"callee_count":0,"vtable_reference_count":0,"data_reference_count":0}},"#,
+                r#""globals":{{"state":"unavailable","evidence_level":"UNKNOWN","evidence_state":"MISSING","#,
+                r#""reason":"no_global_references"}},"#,
+                r#""types":{{"state":"unavailable","evidence_level":"UNKNOWN","evidence_state":"MISSING","#,
+                r#""reason":"no_associated_types"}},"#,
+                r#""semantics":{{"state":"unavailable","evidence_level":"UNKNOWN","evidence_state":"MISSING","#,
+                r#""reason":"no_semantic_record"}},"#,
+                r#""reconstruction":{reconstruction},"#,
+                r#""evidence":{{"pack":null,"pack_state":null,"pack_content_sha256":null,"#,
+                r#""target_address_kind":null,"validation_report":null,"promotion_record":null}}}}"#
+            ),
+            va = self.va,
+            rva = self.rva,
+            size = self.size,
+            bare = bare,
+            sdk_name = sdk_name,
+            sdk_source = sdk_source,
+            category = self.category,
+            evidence = self.evidence,
+            subsystem = subsystem,
+            abi = abi,
+            vtable = vtable,
+            reconstruction = reconstruction,
+        )
+    }
+}
+
+/// The canonical explicit-absence envelope, for a group this fixture leaves empty.
+fn absent_envelope(reason: &'static str) -> String {
+    format!(
+        concat!(
+            r#"{{"state":"unavailable","evidence_level":"UNKNOWN","evidence_state":"MISSING","#,
+            r#""reason":"{reason}"}}"#
+        ),
+        reason = reason
+    )
+}
+
 /// Two entries far enough apart to leave a gap, for the canonicalization rules.
 pub fn two_entry_file() -> TempFile {
     TempFile::new(
