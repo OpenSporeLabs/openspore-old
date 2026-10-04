@@ -26,8 +26,8 @@
 mod common;
 
 use common::{
-    luminance_record, luminance_single_mip_record, FLAT_NORMAL_TEXEL, LUM_HEIGHT, LUM_MIPS,
-    LUM_WIDTH, TILTED_NORMAL_TEXEL,
+    bc3_record, expected_addressing_bc3_8x8, luminance_record, luminance_single_mip_record,
+    FLAT_NORMAL_TEXEL, LUM_HEIGHT, LUM_MIPS, LUM_WIDTH, TILTED_NORMAL_TEXEL,
 };
 use spore_texture::{
     claims, decode_luminance_mip, decode_raster, layer_count_for, luminance_chain_size,
@@ -75,7 +75,7 @@ fn the_three_corpus_shapes_close_exactly() {
 /// number from the geometry — so this test is here to pin the *claim*, and to
 /// make it visible that the claim is about a word nothing depends on.
 #[test]
-fn field_18_is_the_base_level_byte_count_and_nothing_reads_it() {
+fn field_18_is_the_base_level_byte_count_and_a_disagreement_is_refused() {
     for (width, height, mips, size) in [
         (32u32, 32u32, 6u32, 5_508usize),
         (256u32, 256u32, 9u32, 349_584usize),
@@ -88,14 +88,26 @@ fn field_18_is_the_base_level_byte_count_and_nothing_reads_it() {
             declared as usize, size,
             "field_18 is the base level, not the record"
         );
-        // A record whose field_18 disagrees still decodes: the geometry wins and
-        // the disagreeing word is carried but unused. That is the "derived, never
-        // read" rule, and it is why no test may make a decode depend on it.
+        // A record whose field_18 disagrees is **refused**. The old rule here was
+        // "derived, never read", which was right for a word nobody understood and
+        // is wrong for one that has been measured in 4386 of 4386 records: the
+        // walk still places every level from the geometry, so it trusts neither
+        // side and refuses the contradiction by name.
         let mut bytes = luminance_record();
         bytes[0x18..0x1C].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
-        let image = decode_raster(&bytes).expect("field_18 is not load-bearing");
-        assert_eq!(image.envelope.field_18, 0xDEAD_BEEF);
-        assert_eq!(image.envelope.fourcc, LUMINANCE_FOURCC);
+        assert!(
+            matches!(
+                decode_raster(&bytes),
+                Err(TextureError::Field18Mismatch {
+                    declared: 0xDEAD_BEEF,
+                    expected: 64,
+                    width: 4,
+                    height: 4,
+                    fourcc: LUMINANCE_FOURCC
+                })
+            ),
+            "a field_18 that is not the base level's byte count is a refusal"
+        );
         assert_eq!(luminance_record_size(width, height, mips), size);
     }
 }
@@ -124,7 +136,7 @@ fn a_single_mip_record_has_no_prefix() {
 // Decoding
 // ---------------------------------------------------------------------------
 
-/// The record decodes to one layer, three mips, at the right dimensions and
+/// The record decodes to one chain, three levels, at the right dimensions and
 /// with the right bytes in every one.
 #[test]
 fn a_synthetic_record_decodes_one_layer_of_three_mips() {
@@ -135,7 +147,7 @@ fn a_synthetic_record_decodes_one_layer_of_three_mips() {
     assert_eq!(
         image.layers.len(),
         1,
-        "0x15 has no layer headers, so one layer"
+        "0x15 is one chain, like every raster"
     );
     let mips = &image.layers[0];
     assert_eq!(mips.len(), LUM_MIPS as usize);
@@ -231,7 +243,7 @@ fn a_length_prefix_that_disagrees_is_refused() {
         corrupt[prefix_offset..prefix_offset + 4].copy_from_slice(&declared.to_le_bytes());
         assert_eq!(
             decode_raster(&corrupt).expect_err("the prefix is the record's own statement"),
-            TextureError::LuminanceLengthPrefix {
+            TextureError::LevelLengthPrefix {
                 mip: 1,
                 declared: declared as usize,
                 expected: 16,
@@ -263,12 +275,13 @@ fn a_record_whose_size_does_not_close_is_refused() {
         assert_ne!(record_size, expected, "the case must not be a valid record");
         assert_eq!(
             decode_raster(&corrupt).expect_err("the framing must close exactly"),
-            TextureError::LuminanceRecordSize {
+            TextureError::RecordSizeMismatch {
                 record_size,
                 expected,
                 width: LUM_WIDTH,
                 height: LUM_HEIGHT,
                 mip_count: LUM_MIPS,
+                fourcc: LUMINANCE_FOURCC,
             },
             "size {record_size}"
         );
@@ -327,25 +340,36 @@ fn a_short_mip_payload_is_refused_not_padded() {
     assert_eq!(image.pixels.len(), 16);
 }
 
-/// The two formats' envelopes are told apart by their length, and a DXT5 record
-/// is never accepted as `0x15` or the reverse.
+/// The two formats' framings are told apart by their header length and their
+/// block size, and neither accepts the other's bytes.
+///
+/// A mislabelled record is refused by the **framing identity**, not by the
+/// format name: the walk has no idea which format it is looking at once the
+/// `fourcc` is read, so a DXT5 body wearing `0x15` fails because the record's
+/// length is not the 28-byte-header identity.
 #[test]
 fn the_two_formats_do_not_accept_each_other() {
-    // DXT5 bytes with fourcc 0x15: refused by the framing, not decoded.
-    let dxt5 = common::synthetic_record();
+    // DXT5 bytes with fourcc 0x15: refused by the identity, not decoded.
+    let dxt5 = bc3_record();
     let mut mislabelled = dxt5.clone();
     mislabelled[0x14..0x18].copy_from_slice(&LUMINANCE_FOURCC.to_le_bytes());
     assert!(matches!(
         decode_raster(&mislabelled),
-        Err(TextureError::LuminanceRecordSize { .. })
+        Err(TextureError::RecordSizeMismatch {
+            fourcc: LUMINANCE_FOURCC,
+            ..
+        })
     ));
 
-    // 0x15 bytes with fourcc 'DXT5': refused by the layer split, not decoded.
+    // 0x15 bytes with fourcc 'DXT5': refused by the identity too.
     let mut mislabelled = luminance_record();
     mislabelled[0x14..0x18].copy_from_slice(&spore_texture::DXT5_FOURCC.to_le_bytes());
     assert!(matches!(
         decode_raster(&mislabelled),
-        Err(TextureError::PayloadNotMultiple { .. })
+        Err(TextureError::RecordSizeMismatch {
+            fourcc: spore_texture::DXT5_FOURCC,
+            ..
+        })
     ));
 
     // And each still decodes under its own label.
@@ -354,13 +378,13 @@ fn the_two_formats_do_not_accept_each_other() {
 }
 
 /// The DXT5 path is untouched by the `0x15` dispatch: the same record still
-/// derives two layers and the same texels.
+/// decodes to one chain with the same texels.
 #[test]
 fn the_dxt5_path_still_works_after_the_dispatch() {
-    let image = decode_raster(&common::synthetic_record()).expect("decodes");
+    let image = decode_raster(&bc3_record()).expect("decodes");
     assert_eq!(image.envelope.fourcc, spore_texture::DXT5_FOURCC);
-    assert_eq!(image.layers.len(), 2);
-    assert_eq!(image.layers[0][0].pixels, common::expected_addressing_8x8());
+    assert_eq!(image.layers.len(), 1);
+    assert_eq!(image.layers[0][0].pixels, expected_addressing_bc3_8x8());
 }
 
 // ---------------------------------------------------------------------------

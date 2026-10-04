@@ -3,72 +3,149 @@
 //! **No committed binary fixture exists**: the real raster records live only in
 //! the git-ignored `SPORE/` tree, so every byte here is built in the test.
 //!
-//! The block constants and the expected RGBA values are transcribed from
-//! `tests/test_textures.py::TestDxt5Synthetic`, whose expected values are
-//! hand-computed there and cross-checked there against
-//! `tools/spore/dxt5/dxt5.py`. This module only *builds inputs*; the expected
-//! outputs live in the test files next to the assertions they justify.
+//! ## The framing these fixtures build
+//!
+//! ```text
+//! off        field
+//! 0x00       envelope, 32 bytes (28 for the 0x15 family)
+//! header     level 0 payload, NO length prefix
+//!            level 1 payload, no prefix (DXT5 / DXT1)
+//!            level m >= 2: u32 LE == that level's byte count, then the bytes
+//! ```
+//!
+//! The byte counts the builders below produce are the same ones every raster
+//! record in the measured corpus has; `docs/RASTER-FRAMING.md` carries the table
+//! and `crate::framing`'s own tests pin the corpus record sizes directly.
+//!
+//! ## The block codec
+//!
+//! `DXT5` is BC3 (16 bytes: BC4 alpha + BC1 colour) and `DXT1` is BC1 (8 bytes,
+//! alpha opaque) — the **published** specifications, reached because the record
+//! lengths fix the stride. There is no hand-transcribed oracle table in this
+//! module any more: the previous one recorded what an 8-byte "Spore block"
+//! decoded to, and the corpus refutes that block. What the fixtures pin instead
+//! are the *published* rules, written out by hand so a change to the decoder
+//! cannot change both sides at once.
 
 // Shared by several test binaries; not every one of them uses every helper.
 #![allow(dead_code)]
 
-/// `tests/test_textures.py::test_block_two_color_full_alpha`.
-///
-/// `a0=255 > a1=0`, so the ramp is reversed; `c0=0x20` (bit 5 set, so
-/// `rgb5 = (8,0,0)`) and `c1=0x00` (`(0,0,0)`), and `c0 > c1` selects the
-/// two-colour palette. All index bits are 0, so every texel takes
-/// `palette[0]` and the reversed ramp's `round(6*255/8) = 191`.
-pub const TWO_COLOUR_FULL_ALPHA: [u8; 8] = [255, 0, 0x20, 0x00, 0, 0, 0, 0];
+/// Bytes in a BC3 block.
+pub const BC3_BLOCK: usize = 16;
 
-/// `tests/test_textures.py::test_block_four_color_alpha_ramp`.
-///
-/// `a0=0 < a1=255`, unreversed, and each index byte is `0xE4`, which reads as
-/// codes 0,1,2,3 across the byte. `c0=0x00 < c1=0x20` selects the four-colour
-/// palette `(0,0,0)/(8,0,0)/(0,0,0)/(0,0,0)`.
-pub const FOUR_COLOUR_ALPHA_RAMP: [u8; 8] = [0, 255, 0x00, 0x08, 0xE4, 0xE4, 0xE4, 0xE4];
+/// Bytes in a BC1 block.
+pub const BC1_BLOCK: usize = 8;
 
-/// `tests/test_textures.py::test_tail_clamp`.
-///
-/// `c0=0x3F` (`(8,0,0)`), `c1=0x0F<<2 = 60` (`(8,0,0)`), `c0 > c1` so two
-/// colours. Used four times over for a 6x6 image, where the padding texels of
-/// the edge blocks must never be written.
-pub const TAIL_CLAMP: [u8; 8] = [255, 0, 0x3F, 0x0F, 0, 0, 0, 0];
+/// The two alpha endpoints of a BC3 block.
+pub const ALPHA0: u8 = 255;
+/// The second alpha endpoint of a BC3 block; `ALPHA0 > ALPHA1` selects the
+/// eight-level ramp.
+pub const ALPHA1: u8 = 0;
 
-/// Builds one 8-byte block from explicit texel codes.
+/// Packs 16 three-bit BC3 alpha indices into the six bytes that follow the two
+/// endpoints.
 ///
-/// `codes` is in texel order: index 0 is the top-left texel, and the packing is
-/// the format's own — four codes per byte, `code n` at bit `2 * (n % 4)` of byte
-/// `4 + n / 4`, low bit first.
-pub fn block(alpha0: u8, alpha1: u8, colour_lo: u8, colour_hi: u8, codes: [u8; 16]) -> [u8; 8] {
-    let mut bytes = [0u8; 8];
-    bytes[0] = alpha0;
-    bytes[1] = alpha1;
-    bytes[2] = colour_lo;
-    bytes[3] = colour_hi;
-    for (texel, code) in codes.into_iter().enumerate() {
-        let byte = 4 + texel / 4;
-        let shift = 2 * (texel % 4);
-        bytes[byte] |= (code & 0x3) << shift;
+/// `indices[t]` is texel `t`'s index. Texel order is row-major within the block:
+/// index `t` lives in row `t / 4`, column `t % 4`.
+pub fn alpha_indices(indices: [u8; 16]) -> [u8; 6] {
+    let mut words = 0u64;
+    for (t, value) in indices.into_iter().enumerate() {
+        let value = u64::from(value & 0x7);
+        words |= value << (3 * t);
     }
-    bytes
+    let bytes = words.to_le_bytes();
+    [bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5]]
 }
 
-/// A block whose texel `t` carries code `(k >> t) & 1`.
+/// Packs 16 two-bit BC1 colour indices into the four bytes that follow the two
+/// colour words.
+pub fn colour_indices(indices: [u8; 16]) -> [u8; 4] {
+    let mut words = 0u32;
+    for (t, value) in indices.into_iter().enumerate() {
+        let value = u32::from(value & 0x3);
+        words |= value << (2 * t);
+    }
+    words.to_le_bytes()
+}
+
+/// Builds one BC3 block: two alpha endpoints, 16 alpha indices, two `R5G6B5`
+/// colour words, 16 colour indices.
+pub fn bc3_block(
+    alpha0: u8,
+    alpha1: u8,
+    alpha: [u8; 16],
+    colour0: u16,
+    colour1: u16,
+    colour: [u8; 16],
+) -> [u8; 16] {
+    let mut block = [0u8; 16];
+    block[0] = alpha0;
+    block[1] = alpha1;
+    block[2..8].copy_from_slice(&alpha_indices(alpha));
+    block[8..10].copy_from_slice(&colour0.to_le_bytes());
+    block[10..12].copy_from_slice(&colour1.to_le_bytes());
+    block[12..16].copy_from_slice(&colour_indices(colour));
+    block
+}
+
+/// Builds one BC1 block: two `R5G6B5` colour words and 16 colour indices.
+pub fn bc1_block(colour0: u16, colour1: u16, colour: [u8; 16]) -> [u8; 8] {
+    let mut block = [0u8; 8];
+    block[0..2].copy_from_slice(&colour0.to_le_bytes());
+    block[2..4].copy_from_slice(&colour1.to_le_bytes());
+    block[4..8].copy_from_slice(&colour_indices(colour));
+    block
+}
+
+/// A BC3 block with **opaque alpha** in every texel and a single colour.
 ///
-/// Endpoints `a0=0 < a1=255` (unreversed) and `c0=0x20 > c1=0x00`, so the
-/// two-colour palette is `[(8,0,0), (0,0,0)]`: code 0 gives `(8,0,0)` with
-/// alpha `round(2*255/8) = 64`, code 1 gives `(0,0,0)` with alpha 0.
+/// Endpoints `(255, 255)` take the six-level ramp, whose entry 0 is 255, and
+/// every alpha index is 0 — so all sixteen texels read 255. `colour0 > colour1`
+/// keeps the colour palette at four entries, and every colour index is 0, so
+/// every texel takes `palette[0]`.
+pub const OPAQUE_SOLID: u16 = 0xF800;
+
+/// The colour every texel of [`OPAQUE_SOLID`] decodes to: pure red.
+pub const OPAQUE_SOLID_RGB: [u8; 3] = [255, 0, 0];
+
+/// One BC3 block whose every texel is opaque red.
+///
+/// Used as the base-level filler so a walk's output is a known constant rather
+/// than whatever the zero bytes happen to decode to.
+pub fn opaque_solid_block() -> [u8; 16] {
+    bc3_block(255, 255, [0u8; 16], OPAQUE_SOLID, 0x0000, [0u8; 16])
+}
+
+/// One BC1 block whose every texel is opaque red.
+pub fn opaque_solid_bc1_block() -> [u8; 8] {
+    bc1_block(OPAQUE_SOLID, 0x0000, [0u8; 16])
+}
+
+/// An **addressing** BC3 block: texel `t` carries alpha index `(k >> t) & 1`.
 ///
 /// Sixteen distinct blocks, each a different bit pattern, which is what makes
 /// this usable as an addressing probe: a wrong block offset puts visibly wrong
-/// texels on screen rather than plausible ones.
-pub fn addressing_block(k: u8) -> [u8; 8] {
-    let codes: [u8; 16] = core::array::from_fn(|t| (((u32::from(k)) >> t) & 1) as u8);
-    block(0, 255, 0x20, 0x00, codes)
+/// texels on screen rather than plausible ones. Alpha endpoints `(0, 255)` take
+/// the six-level ramp, whose entry 1 is 255 and entry 0 is 0, so index 0 reads 0
+/// and index 1 reads 255 — the two most different values the ramp offers.
+pub fn addressing_bc3(k: u8) -> [u8; 16] {
+    let indices: [u8; 16] = core::array::from_fn(|t| (u32::from(k) >> t) as u8 & 1);
+    bc3_block(0, 255, indices, 0x0000, 0xF800, [0u8; 16])
 }
 
-/// Concatenates blocks into a raw mip chain.
-pub fn chain(blocks: &[[u8; 8]]) -> Vec<u8> {
+/// An **addressing** BC1 block: colour index `(k >> t) & 1` on texel `t`.
+pub fn addressing_bc1(k: u8) -> [u8; 8] {
+    let indices: [u8; 16] = core::array::from_fn(|t| (u32::from(k) >> t) as u8 & 1);
+    bc1_block(0x0000, 0xF800, indices)
+}
+
+/// Concatenates blocks into a raw level chain.
+pub fn chain(blocks: &[[u8; 16]]) -> Vec<u8> {
+    blocks.iter().flat_map(|b| b.iter().copied()).collect()
+}
+
+/// Concatenates BC1 blocks into a raw level chain.
+pub fn chain1(blocks: &[[u8; 8]]) -> Vec<u8> {
     blocks.iter().flat_map(|b| b.iter().copied()).collect()
 }
 
@@ -77,126 +154,122 @@ pub fn push_u32(out: &mut Vec<u8>, value: u32) {
     out.extend_from_slice(&value.to_le_bytes());
 }
 
-/// The synthetic raster record every raster test decodes.
-///
-/// Layout, matching the format's own rule that **all** layer headers precede
-/// **all** payloads:
+// ---------------------------------------------------------------------------
+// The DXT5 (BC3) family
+// ---------------------------------------------------------------------------
+
+/// Width and height of the synthetic DXT5 record: 8x8, so the base level is four
+/// blocks and the block grid is two wide — the smallest size that exercises both
+/// the row stride and the padding rule.
+pub const BC3_WIDTH: u32 = 8;
+/// Height of the synthetic DXT5 record (equal to [`BC3_WIDTH`]).
+pub const BC3_HEIGHT: u32 = 8;
+/// Mip count: 8x8 then 4x4, so level 1 is bare and level 2 does not exist. The
+/// prefix path is exercised by the three-level fixture below.
+pub const BC3_MIPS: u32 = 2;
+
+/// `32 + 4 * 16 + 16` — the header, the base level's four blocks and the 4x4
+/// level's single block.
+pub const BC3_RECORD_SIZE: usize = 32 + 64 + 16;
+
+/// Builds the synthetic DXT5 record.
 ///
 /// ```text
-/// 0x00  envelope  8x8 DXT5, mip_count = 2       (32 bytes)
-/// 0x20  layer 0 header: "e9D1" + three words    (16 bytes)
-/// 0x30  layer 1 header: 0 + three words         (16 bytes)
-/// 0x40  layer 0 payload: mip0 8x8 (4 blocks) + mip1 4x4 (1 block)   (40 bytes)
-/// 0x68  layer 1 payload: mip0 8x8 (4 blocks) + mip1 4x4 (1 block)   (40 bytes)
+/// 0x00  envelope 8x8, mip_count = 2, field_18 = 64   (32 bytes)
+/// 0x20  level 0: four addressing blocks, 8x8           (64 bytes)
+/// 0x60  level 1: one solid block, 4x4                 (16 bytes)
 /// ```
 ///
-/// 144 bytes total. `chain_size(8, 8, 2)` is 40, so the layer stride is 56 and
-/// `layer_count_for` must derive 2 from it. The record was also built and
-/// decoded by `tools/spore/raster/raster.py`, which derived the same two layers
-/// and the same mip dimensions; `the_builder_reproduces_the_oracle_record`
-/// pins the exact bytes.
-pub const SYNTHETIC_RECORD_HEX: &str = concat!(
-    "01000000080000000800000002000000080000004458543500000400ffff0000",
-    "65394431111111112222222233333333",
-    "00000000444444445555555566666666",
-    "00ff20000000000000ff20000100000000ff20000400000000ff20000500000000ff0008e4e4e4e4",
-    "ff00200000000000ff00200000000000ff00200000000000ff00200000000000ff003f0f00000000",
-);
-
-/// Width and height of the synthetic record.
-pub const SYNTHETIC_WIDTH: u32 = 8;
-
-/// Height of the synthetic record (equal to [`SYNTHETIC_WIDTH`]).
-pub const SYNTHETIC_HEIGHT: u32 = 8;
-
-/// Mip count of the synthetic record.
-pub const SYNTHETIC_MIPS: u32 = 2;
-
-/// Builds the synthetic raster record from its parts.
-///
-/// The point of building it rather than embedding a blob is that every field is
-/// visible; [`SYNTHETIC_RECORD_HEX`] and a test assert that the two agree, so a
-/// silent edit to either is caught.
-pub fn synthetic_record() -> Vec<u8> {
+/// 112 bytes. `field_18` is 64, the base level's own byte count, which is the
+/// cross-check the walk enforces.
+pub fn bc3_record() -> Vec<u8> {
     let mut record = Vec::new();
     push_u32(&mut record, 1); // version
-    push_u32(&mut record, SYNTHETIC_WIDTH);
-    push_u32(&mut record, SYNTHETIC_HEIGHT);
-    push_u32(&mut record, SYNTHETIC_MIPS);
+    push_u32(&mut record, BC3_WIDTH);
+    push_u32(&mut record, BC3_HEIGHT);
+    push_u32(&mut record, BC3_MIPS);
     push_u32(&mut record, 8); // field_10: observed constant, never read
     push_u32(&mut record, 0x3554_5844); // fourcc 'DXT5'
-    push_u32(&mut record, 0x0004_0000); // field_18: observed constant, never read
+    push_u32(&mut record, 64); // field_18 == the 8x8 base level's 64 bytes
     push_u32(&mut record, 0x0000_FFFF); // field_1c
 
-    // Layer headers, both of which precede both payloads. Their contents are
-    // unresolved and are never interpreted; the distinct words here exist only
-    // so a decoder that mistakenly reads them cannot look plausible.
-    record.extend_from_slice(b"e9D1");
-    push_u32(&mut record, 0x1111_1111);
-    push_u32(&mut record, 0x2222_2222);
-    push_u32(&mut record, 0x3333_3333);
-    record.extend_from_slice(&[0, 0, 0, 0]);
-    push_u32(&mut record, 0x4444_4444);
-    push_u32(&mut record, 0x5555_5555);
-    push_u32(&mut record, 0x6666_6666);
-
-    // Layer 0: four addressing blocks for the 8x8 base, then the 4x4 mip.
     record.extend_from_slice(&chain(&[
-        addressing_block(0),
-        addressing_block(1),
-        addressing_block(2),
-        addressing_block(3),
+        addressing_bc3(0),
+        addressing_bc3(1),
+        addressing_bc3(2),
+        addressing_bc3(3),
     ]));
-    record.extend_from_slice(&FOUR_COLOUR_ALPHA_RAMP);
-
-    // Layer 1: a flat field of one texel value, then a distinct block.
-    record.extend_from_slice(&chain(&[
-        TWO_COLOUR_FULL_ALPHA,
-        TWO_COLOUR_FULL_ALPHA,
-        TWO_COLOUR_FULL_ALPHA,
-        TWO_COLOUR_FULL_ALPHA,
-    ]));
-    record.extend_from_slice(&TAIL_CLAMP);
-
+    record.extend_from_slice(&opaque_solid_block());
     record
 }
 
-/// Builds the same raster with a **single** layer, 88 bytes long.
+/// Width and height of the three-level DXT5 record: 4x4, the smallest shape for
+/// which "levels 0 and 1 are bare and level 2 onwards is prefixed" is exercised.
+pub const BC3_MIPS_WIDTH: u32 = 4;
+/// Height of the three-level DXT5 record (equal to [`BC3_MIPS_WIDTH`]).
+pub const BC3_MIPS_HEIGHT: u32 = 4;
+/// Levels: 4x4, 2x2, 1x1.
+pub const BC3_THREE_MIPS: u32 = 3;
+
+/// `32 + 16 + 16 + 4 + 16` — header, two bare levels, then a prefixed 1x1.
+pub const BC3_THREE_RECORD_SIZE: usize = 32 + 16 + 16 + 4 + 16;
+
+/// Builds the three-level DXT5 record, whose level 2 carries a length prefix.
 ///
-/// `layer_count_for` must derive 1 from it, which is what makes the derived
-/// count a fact about the record rather than a constant: the envelope is
-/// byte-identical to [`synthetic_record`]'s and only the payload differs.
-pub fn single_layer_record() -> Vec<u8> {
+/// Level 2 is deliberately a *different* block from level 1, so a walk that lost
+/// its cursor cannot pass by returning the same bytes twice.
+pub fn bc3_three_level_record() -> Vec<u8> {
     let mut record = Vec::new();
     push_u32(&mut record, 1);
-    push_u32(&mut record, SYNTHETIC_WIDTH);
-    push_u32(&mut record, SYNTHETIC_HEIGHT);
-    push_u32(&mut record, SYNTHETIC_MIPS);
+    push_u32(&mut record, BC3_MIPS_WIDTH);
+    push_u32(&mut record, BC3_MIPS_HEIGHT);
+    push_u32(&mut record, BC3_THREE_MIPS);
     push_u32(&mut record, 8);
     push_u32(&mut record, 0x3554_5844);
-    push_u32(&mut record, 0x0004_0000);
+    push_u32(&mut record, 16); // field_18 == one 4x4 BC3 block
     push_u32(&mut record, 0x0000_FFFF);
-    record.extend_from_slice(b"e9D1");
-    push_u32(&mut record, 0x1111_1111);
-    push_u32(&mut record, 0x2222_2222);
-    push_u32(&mut record, 0x3333_3333);
-    record.extend_from_slice(&chain(&[
-        addressing_block(0),
-        addressing_block(1),
-        addressing_block(2),
-        addressing_block(3),
-    ]));
-    record.extend_from_slice(&FOUR_COLOUR_ALPHA_RAMP);
+
+    record.extend_from_slice(&opaque_solid_block());
+    record.extend_from_slice(&opaque_solid_block());
+    push_u32(&mut record, 16);
+    record.extend_from_slice(&opaque_solid_block());
     record
 }
 
-/// Decodes a hex string into bytes. Panics on malformed input, which is a
-/// test-authoring bug rather than a condition under test.
-pub fn unhex(hex: &str) -> Vec<u8> {
-    assert_eq!(hex.len() % 2, 0, "hex string must have even length");
-    (0..hex.len() / 2)
-        .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).expect("valid hex literal"))
-        .collect()
+// ---------------------------------------------------------------------------
+// The DXT1 (BC1) family
+// ---------------------------------------------------------------------------
+
+/// Width and height of the synthetic DXT1 record: 8x8, four BC1 blocks.
+pub const BC1_WIDTH: u32 = 8;
+/// Height of the synthetic DXT1 record (equal to [`BC1_WIDTH`]).
+pub const BC1_HEIGHT: u32 = 8;
+/// Levels: 8x8 then 4x4.
+pub const BC1_MIPS: u32 = 2;
+
+/// `32 + 4 * 8 + 8` — header, base level's four blocks, the 4x4 level's one.
+pub const BC1_RECORD_SIZE: usize = 32 + 32 + 8;
+
+/// Builds the synthetic DXT1 record, laid out exactly like the DXT5 one.
+pub fn bc1_record() -> Vec<u8> {
+    let mut record = Vec::new();
+    push_u32(&mut record, 1);
+    push_u32(&mut record, BC1_WIDTH);
+    push_u32(&mut record, BC1_HEIGHT);
+    push_u32(&mut record, BC1_MIPS);
+    push_u32(&mut record, 8);
+    push_u32(&mut record, 0x3154_5844); // fourcc 'DXT1'
+    push_u32(&mut record, 32); // field_18 == the 8x8 base level's 32 bytes
+    push_u32(&mut record, 0x0000_0000);
+
+    record.extend_from_slice(&chain1(&[
+        addressing_bc1(0),
+        addressing_bc1(1),
+        addressing_bc1(2),
+        addressing_bc1(3),
+    ]));
+    record.extend_from_slice(&opaque_solid_bc1_block());
+    record
 }
 
 // ---------------------------------------------------------------------------
@@ -207,13 +280,13 @@ pub fn unhex(hex: &str) -> Vec<u8> {
 pub const LUM_HEADER_SIZE: usize = 28;
 
 /// Width and height of the synthetic `0x15` record: 4x4, the smallest shape for
-/// which "mip 0 has no prefix and every later mip does" is actually exercised
-/// (a 1-mip record would have no prefix at all).
+/// which "level 0 has no prefix and every later level does" is actually
+/// exercised (a 1-level record would have no prefix at all).
 pub const LUM_WIDTH: u32 = 4;
 /// Height of the synthetic `0x15` record (equal to [`LUM_WIDTH`]).
 pub const LUM_HEIGHT: u32 = 4;
 
-/// Mip count of the synthetic `0x15` record: 4x4, 2x2, 1x1.
+/// Levels: 4x4, 2x2, 1x1.
 pub const LUM_MIPS: u32 = 3;
 
 /// The texel `(255, 128, 128, mask)` repeated over a `w * h` base level.
@@ -228,34 +301,27 @@ pub const LUM_MIPS: u32 = 3;
 /// the constant is transcribed from the measurement.
 pub const FLAT_NORMAL_TEXEL: [u8; 4] = [0xFF, 0x80, 0x80, 0xFF];
 
-/// A texel that is *not* the flat normal, used to tell mip levels and layers
-/// apart: `Z=0xFF`, `X=0x00`, `Y=0xFF`, mask `0x7F`.
+/// A texel that is *not* the flat normal, used to tell mip levels apart:
+/// `Z=0xFF`, `X=0x00`, `Y=0xFF`, mask `0x7F`.
 pub const TILTED_NORMAL_TEXEL: [u8; 4] = [0xFF, 0x00, 0xFF, 0x7F];
 
-/// The synthetic `0x15` record every luminance test decodes.
-///
-/// Layout, matching the family's own framing — no layer headers, and a
-/// little-endian byte count in front of every mip past the base level:
+/// Builds the synthetic `0x15` record every luminance test decodes.
 ///
 /// ```text
-/// 0x00  envelope  4x4, mip_count = 3                 (28 bytes)
-/// 0x1c  mip 0 payload: 16 texels, flat normal       (64 bytes)
-/// 0x5c  mip 1 byte count: 16                        ( 4 bytes)
-/// 0x60  mip 1 payload: 4 texels, flat normal        (16 bytes)
-/// 0x70  mip 2 byte count: 4                         ( 4 bytes)
-/// 0x74  mip 2 payload: 1 texel,  tilted normal       ( 4 bytes)
+/// 0x00  envelope 4x4, mip_count = 3                  (28 bytes)
+/// 0x1c  level 0: 16 texels, flat normal              (64 bytes)
+/// 0x5c  level 1 byte count: 16                        ( 4 bytes)
+/// 0x60  level 1: 4 texels, flat normal               (16 bytes)
+/// 0x70  level 2 byte count: 4                         ( 4 bytes)
+/// 0x74  level 2: 1 texel,  tilted normal              ( 4 bytes)
 /// ```
 ///
-/// 120 bytes total. `luminance_record_size(4, 4, 3)` is `28 + 64 + (4+16) + (4+4)`
-/// = 120, so `layer_count_for` must derive **1** layer from it and the walk must
-/// consume it exactly.
-///
-/// The payload start at `0x1c` is the load-bearing detail: it is where
-/// `RasterEnvelope::field_1c` reports the first texel (`0xFF8080FF`), which is
-/// why the header of this family is 28 bytes and not 32.
+/// 120 bytes. The payload start at `0x1c` is the load-bearing detail: it is
+/// where `RasterEnvelope::field_1c` reports the first texel (`0xFF8080FF`), which
+/// is why the header of this family is 28 bytes and not 32.
 pub fn luminance_record() -> Vec<u8> {
     let mut record = Vec::new();
-    push_u32(&mut record, 1); // version
+    push_u32(&mut record, 1);
     push_u32(&mut record, LUM_WIDTH);
     push_u32(&mut record, LUM_HEIGHT);
     push_u32(&mut record, LUM_MIPS);
@@ -263,28 +329,23 @@ pub fn luminance_record() -> Vec<u8> {
     push_u32(&mut record, 0x0000_0015); // fourcc 0x15
     push_u32(&mut record, LUM_WIDTH * LUM_HEIGHT * 4); // field_18 = w*h*4
 
-    // Mip 0: no length prefix. Its length is already in the header.
     for _ in 0..(LUM_WIDTH * LUM_HEIGHT) {
         record.extend_from_slice(&FLAT_NORMAL_TEXEL);
     }
-    // Mip 1: 2x2, prefixed.
     push_u32(&mut record, 2 * 2 * 4);
     for _ in 0..4 {
         record.extend_from_slice(&FLAT_NORMAL_TEXEL);
     }
-    // Mip 2: 1x1, prefixed, and deliberately a *different* texel so a walk that
-    // lost its cursor cannot pass by returning the same bytes twice.
     push_u32(&mut record, 4);
     record.extend_from_slice(&TILTED_NORMAL_TEXEL);
     record
 }
 
-/// The synthetic `0x15` record with a single mip, 92 bytes long.
+/// The synthetic `0x15` record with a single level, 92 bytes long.
 ///
-/// `28 + 16 * 4` = 92. It exists for the same reason
-/// [`single_layer_record`] does for DXT5: a record with a *different* layer
-/// count and a byte-identical envelope, which is what makes the derived count a
-/// fact about the record rather than a constant read from a field.
+/// It exists because its envelope differs from [`luminance_record`]'s in
+/// `mip_count` alone, which is what makes the record-size identity a fact about
+/// the record rather than a constant.
 pub fn luminance_single_mip_record() -> Vec<u8> {
     let mut record = Vec::new();
     push_u32(&mut record, 1);
@@ -300,46 +361,31 @@ pub fn luminance_single_mip_record() -> Vec<u8> {
     record
 }
 
-/// The 4x4 decode of [`FOUR_COLOUR_ALPHA_RAMP`], byte for byte, as produced by
-/// `tools/spore/dxt5/dxt5.py`.
-///
-/// Row-major RGBA8: the index bytes `0xE4` give codes 0,1,2,3 per row, so each
-/// row is `(0,0,0,64)`, `(8,0,0,0)`, `(0,0,0,255)`, `(0,0,0,64)` and repeats.
-pub fn expected_four_colour_ramp() -> Vec<u8> {
-    unhex(concat!(
-        "00000040", "08000000", "000000ff", "00000040", "00000040", "08000000", "000000ff",
-        "00000040", "00000040", "08000000", "000000ff", "00000040", "00000040", "08000000",
-        "000000ff", "00000040",
-    ))
+/// Decodes a hex string into bytes. Panics on malformed input, which is a
+/// test-authoring bug rather than a condition under test.
+pub fn unhex(hex: &str) -> Vec<u8> {
+    assert_eq!(hex.len() % 2, 0, "hex string must have even length");
+    (0..hex.len() / 2)
+        .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).expect("valid hex literal"))
+        .collect()
 }
 
-/// The 8x8 decode of four [`addressing_block`]s, byte for byte, as produced by
-/// `tools/spore/dxt5/dxt5.py` for the same four blocks in this order.
+/// The 8x8 decode of four [`addressing_bc3`] blocks, byte for byte.
 ///
-/// Block `k` is at byte offset `k * 8`, and the block grid of an 8x8 image is
-/// two wide, so this table fails loudly if the row stride is ever taken in
-/// texels instead of blocks.
-pub fn expected_addressing_8x8() -> Vec<u8> {
-    unhex(concat!(
-        // Rows 0-3 come from blocks 0 and 1: block 0 has every code 0, block 1
-        // has only texel 0 set, so only (x=4, y=0) is dark.
-        "08000040080000400800004008000040",
-        "00000000080000400800004008000040",
-        "08000040080000400800004008000040",
-        "08000040080000400800004008000040",
-        "08000040080000400800004008000040",
-        "08000040080000400800004008000040",
-        "08000040080000400800004008000040",
-        "08000040080000400800004008000040",
-        // Rows 4-7 come from blocks 2 and 3: block 2 has only texel 2 set,
-        // block 3 has texels 0 and 2.
-        "08000040000000000800004008000040",
-        "00000000000000000800004008000040",
-        "08000040080000400800004008000040",
-        "08000040080000400800004008000040",
-        "08000040080000400800004008000040",
-        "08000040080000400800004008000040",
-        "08000040080000400800004008000040",
-        "08000040080000400800004008000040",
-    ))
+/// Block `k` is at byte offset `k * 16`, and the block grid of an 8x8 image is
+/// two wide, so this table fails loudly if the row stride is ever taken in texels
+/// instead of blocks. Alpha endpoints `(0, 255)` put every texel's alpha at
+/// exactly 0 or 255; the colour is `colour1`'s red because every colour index is
+/// 0 and `colour0 = 0x0000` is black.
+pub fn expected_addressing_bc3_8x8() -> Vec<u8> {
+    let mut out = Vec::with_capacity(8 * 8 * 4);
+    for row in 0..8u32 {
+        for x in 0..8u32 {
+            let block = (row / 4) * 2 + (x / 4);
+            let texel = (row % 4) * 4 + (x % 4);
+            let alpha = ((block >> texel) as u8) & 1;
+            out.extend_from_slice(&[0, 0, 0, alpha * 255]);
+        }
+    }
+    out
 }

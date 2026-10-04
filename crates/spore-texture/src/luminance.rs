@@ -16,47 +16,10 @@
 //!   which is exactly the encoding of the flat normal `(0, 0, 1)`; and 901 of
 //!   901 records have lane 0's mean above 230 with lanes 1 and 2 centred on
 //!   127.5.
-//! * The framing is **not** the DXT5 framing. There are no 16-byte layer
-//!   headers, the payload starts 4 bytes earlier, and every mip past the base
-//!   level is **preceded by its own little-endian byte count**.
-//!
-//! # The framing, established on 901 of 901 records
-//!
-//! ```text
-//! off  size  field
-//! 0x00   4   version       u32, always 1
-//! 0x04   4   width         u32
-//! 0x08   4   height        u32
-//! 0x0c   4   mip_count     u32
-//! 0x10   4   field_10      u32, always 8   (unresolved, never read)
-//! 0x14   4   fourcc        u32, always 0x15
-//! 0x18   4   field_18      u32 == width * height * 4   (carried, never read)
-//! 0x1c   ..  mip 0 payload, width*height*4 bytes, NO length prefix
-//!        4   mip 1 byte count, u32 LE  == mip1_width*mip1_height*4
-//!        ..  mip 1 payload
-//!        4   mip 2 byte count
-//!        ..  mip 2 payload
-//!        ...
-//! ```
-//!
-//! The proof is an exact-consume identity, not a plausibility argument:
-//!
-//! ```text
-//! record_size == 28 + width*height*4 + SUM over mips 1..mip_count of
-//!                        (4 + max(1,w>>m) * max(1,h>>m) * 4)
-//! ```
-//!
-//! evaluated against all three shapes the family occurs in the corpus
-//! (`32x32`/6 mips, `256x256`/9, `512x512`/10) and holding with **zero** bytes
-//! left over and **zero** bytes unconsumed in 901 of 901 records. The prefix
-//! values are checked too: each `u32` must equal the mip's own `w*h*4`, and a
-//! single mismatch is refused by name.
-//!
-//! The consequence for this crate is that the base level needs **no length
-//! prefix at all**: `field_18` already states its size, and the derived chain
-//! states it independently. Both say the same thing, which is why the decoder
-//! uses the derived value and leaves `field_18` unread — the crate's existing
-//! "derived, never read" rule, applied to one more header word.
+//! * Its framing differs from the block formats in exactly two measurable ways,
+//!   and both are now in the shared table in [`crate::framing`]: the header is
+//!   **28** bytes rather than 32, and the length prefix starts at **level 1**
+//!   rather than level 2.
 //!
 //! # Why there is no `decode_luminance_block`
 //!
@@ -65,8 +28,8 @@
 //! block decoder here would be inventing a structure the corpus does not have,
 //! so the module has no `BLOCK_BYTES` and no palette, and says so.
 
-use crate::dxt5::MIP_FLOOR;
 use crate::error::TextureError;
+use crate::framing::{level_dimension, level_size, LUMINANCE_FRAME};
 use crate::raster::MipImage;
 
 /// Format word at envelope offset `0x14` for this family: `0x00000015`.
@@ -74,7 +37,7 @@ use crate::raster::MipImage;
 /// Stored little-endian, so the byte on disk is `0x15` followed by three zero
 /// bytes. It is deliberately **not** a FOURCC: `'DXT5'` is four bytes of
 /// printable tag, this is one byte of format enum plus padding, and that
-/// difference is a large part of why the family needs its own walk.
+/// difference is part of why the family needs its own frame.
 pub const LUMINANCE_FOURCC: u32 = 0x0000_0015;
 
 /// Bytes in the `0x15` header: seven little-endian `u32` words.
@@ -91,68 +54,36 @@ pub const LUMINANCE_BYTES_PER_TEXEL: usize = 4;
 
 /// Bytes in the little-endian `u32` that precedes every mip past the base
 /// level, stating that mip's own payload length.
-pub const LUMINANCE_PREFIX_SIZE: usize = 4;
-
-/// Bytes per output texel: RGBA8.
-const RGBA_BYTES: usize = 4;
+pub const LUMINANCE_PREFIX_SIZE: usize = crate::framing::LEVEL_PREFIX_SIZE;
 
 /// A compile-time agreement between the two ways this module says "four bytes
 /// per texel". They are the same fact written twice, which is exactly the kind
 /// of duplication that rots, so the compiler checks it instead of a comment.
-const _: () = assert!(LUMINANCE_BYTES_PER_TEXEL == RGBA_BYTES);
+const _: () = assert!(LUMINANCE_BYTES_PER_TEXEL == 4);
 
 /// Dimension of one axis at one mip level: `max(1, base >> mip)`.
 ///
-/// The same rule and the same [`MIP_FLOOR`] cut as the DXT5 walk, for the same
-/// reason: the chain identity above only closes if every level's dimension is
-/// derived the one way both reference implementations derive it.
+/// The same rule and the same [`MIP_FLOOR`](crate::MIP_FLOOR) cut as the block
+/// walk, for the same reason: the chain identity only closes if every level's
+/// dimension is derived the one way every implementation derives it.
 pub fn luminance_dimension(base: u32, mip: u32) -> u32 {
-    if mip >= MIP_FLOOR {
-        return 1;
-    }
-    (base >> mip).max(1)
+    level_dimension(base, mip)
 }
 
 /// Payload bytes of one mip level, saturating.
 ///
 /// `mip 0` is the base level. `max(1, w>>m) * max(1, h>>m) * 4`.
 pub fn luminance_mip_size(width: u32, height: u32, mip: u32) -> usize {
-    let w = luminance_dimension(width, mip);
-    let h = luminance_dimension(height, mip);
-    (w as usize)
-        .saturating_mul(h as usize)
-        .saturating_mul(LUMINANCE_BYTES_PER_TEXEL)
+    level_size(LUMINANCE_FRAME, width, height, mip)
 }
 
 /// Payload bytes of the whole mip chain, **excluding** the header and
 /// **including** the four length prefixes that precede every mip past the base
 /// level.
 ///
-/// This is deliberately *not* the DXT5 `chain_size`: there, every layer carries
-/// one 16-byte header and the chain is pure payload; here there is no layer
-/// header and the prefixes live inside the chain. A record of this family is
-/// exactly `LUMINANCE_HEADER_SIZE + luminance_chain_size(...)` bytes — see
-/// [`luminance_record_size`].
-///
 /// Saturating, like [`luminance_mip_size`].
 pub fn luminance_chain_size(width: u32, height: u32, mip_count: u32) -> usize {
-    if mip_count == 0 {
-        return 0;
-    }
-    let mut total = luminance_mip_size(width, height, 0);
-    let bounded_mips = mip_count.min(MIP_FLOOR);
-    for mip in 1..bounded_mips {
-        total = total.saturating_add(LUMINANCE_PREFIX_SIZE);
-        total = total.saturating_add(luminance_mip_size(width, height, mip));
-    }
-    // Mips at or beyond MIP_FLOOR are all 1x1, so each still costs its prefix.
-    let extra = mip_count.saturating_sub(bounded_mips) as usize;
-    if extra > 0 {
-        let each =
-            LUMINANCE_PREFIX_SIZE.saturating_add(luminance_mip_size(width, height, MIP_FLOOR));
-        total = total.saturating_add(extra.saturating_mul(each));
-    }
-    total
+    crate::framing::chain_size(LUMINANCE_FRAME, width, height, mip_count)
 }
 
 /// The one record size an envelope of this family can legitimately have.
@@ -161,7 +92,7 @@ pub fn luminance_chain_size(width: u32, height: u32, mip_count: u32) -> usize {
 /// record's framing without decoding a single texel, and the test suite pins it
 /// against the three shapes measured in the corpus.
 pub fn luminance_record_size(width: u32, height: u32, mip_count: u32) -> usize {
-    LUMINANCE_HEADER_SIZE.saturating_add(luminance_chain_size(width, height, mip_count))
+    crate::framing::record_size(LUMINANCE_FRAME, width, height, mip_count)
 }
 
 /// Decodes one mip level's payload into row-major RGBA8.
@@ -191,7 +122,7 @@ pub fn decode_luminance_mip(img: &[u8], width: u32, height: u32) -> Result<MipIm
     }
     let out_len = (width as usize)
         .checked_mul(height as usize)
-        .and_then(|count| count.checked_mul(RGBA_BYTES));
+        .and_then(|count| count.checked_mul(LUMINANCE_BYTES_PER_TEXEL));
     let out_len = match out_len {
         Some(len) if len <= isize::MAX as usize => len,
         _ => return Err(TextureError::OutputTooLarge { width, height }),
@@ -273,7 +204,7 @@ mod tests {
     }
 
     #[test]
-    fn dimensions_use_the_same_floor_as_the_dxt5_walk() {
+    fn dimensions_use_the_same_floor_as_the_block_walk() {
         assert_eq!(luminance_dimension(512, 0), 512);
         assert_eq!(luminance_dimension(512, 9), 1);
         assert_eq!(luminance_dimension(512, 32), 1);
@@ -285,7 +216,7 @@ mod tests {
     fn beyond_32_mips_are_each_charged_a_prefix_plus_one_texel() {
         // 33 mips: mips 0..31 are walked, mip 32 is 1x1 with its prefix. The
         // rule is an approximation reproduced from the shared floor, exactly as
-        // `dxt5_chain_size`'s is, and it exists to keep the shift defined.
+        // the block walk's is, and it exists to keep the shift defined.
         let walked = luminance_chain_size(4, 4, 32);
         let beyond = luminance_chain_size(4, 4, 33);
         assert_eq!(beyond, walked + LUMINANCE_PREFIX_SIZE + 4);

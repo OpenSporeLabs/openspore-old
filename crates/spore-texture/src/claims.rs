@@ -4,65 +4,55 @@
 //!
 //! A decoder that hands back eight `u32`s has already lost the only interesting
 //! question about three of them. [`crate::RasterEnvelope`] carries `field_10`,
-//! `field_18` and `field_1c`; nothing in the type says that nobody knows what
-//! those words are. That is exactly the failure this repository exists to
-//! prevent: an observation and an interpretation becoming indistinguishable
-//! after they leave the decoder (see `spore_core::evidence`).
+//! `field_18` and `field_1c`; nothing in the type says which of those nobody
+//! knows. That is exactly the failure this repository exists to prevent: an
+//! observation and an interpretation becoming indistinguishable after they leave
+//! the decoder (see `spore_core::evidence`).
 //!
-//! So each such statement is recorded here **with its grade**, and the grades
-//! for the unresolved envelope words are [`EvidenceLevel::Unknown`] — not
-//! `Inferred`, not `Supported`, and not a plausible guess dressed up as
-//! `Observed`. A word whose value has been seen in every sample still has an
-//! unknown *meaning*, and the value being constant is not evidence about what
-//! it is.
+//! So each such statement is recorded here **with its grade**. A word whose value
+//! has been seen in every sample still has an unknown *meaning*, and the value
+//! being constant is not evidence about what it is.
 //!
 //! # The two vocabularies, kept apart
 //!
 //! * The **observation** ("`field_10` reads 8 in every sampled record; no
 //!   decoder reads it") is a fact about bytes and is plain text.
-//! * The **meaning** ("`field_10` is a format revision / a bit depth / a
-//!   padding hole") is the claim, and it is carried as a [`Fact`]. For an
-//!   unresolved field the fact is **unavailable**, which in this repository's
-//!   vocabulary means "we looked and found nothing" — never a zero, never a
-//!   default, never a silent `false`.
+//! * The **meaning** ("`field_10` is a format revision / a bit depth / a padding
+//!   hole") is the claim, and it is carried as a [`Fact`]. For an unresolved
+//!   field the fact is **unavailable**, which in this repository's vocabulary
+//!   means "we looked and found nothing" — never a zero, never a default, never a
+//!   silent `false`.
 //!
-//! # What is *not* here
+//! # What changed when the framing was re-measured (2026-10-04)
 //!
-//! Anything this crate reproduces from two independent implementations
-//! (`tools/spore/dxt5/dxt5.py` and `src/assets/Dxt5.cpp`), checked
-//! byte-for-byte against the hand-computed golden values in
-//! `tests/test_textures.py::TestDxt5Synthetic`. The block layout, the alpha
-//! ramp and its half-to-even rounding, the inverted palette test and the R5G5B5
-//! channel read are not claims in this module: they are pinned by tests. What
-//! *is* recorded is that they depart from the published BC3 specification —
-//! as [`DXT5_SPEC_DEVIATIONS`], because "this is not what the spec says" is
-//! established. "The spec is what Spore should have written" is not a question
-//! this crate asks.
+//! Four claims moved, and one of them moved because the decoder was wrong:
 //!
-//! # What changed when the `0x15` family stopped being refused
+//! * [`ENVELOPE_FIELD_18_MEANING`] is no longer format-specific and no longer a
+//!   convenient redundancy. It is the **base level's byte count**, verified in
+//!   2954 of 2954 records across all three formats, and the decoder **reads** it
+//!   as a cross-check.
+//! * [`LAYER_HEADER_CONTENTS`] and [`LAYER_INTERLEAVE`] are **refuted**. There
+//!   are no 16-byte layer headers and no grouped-header layout; the bytes that
+//!   were being skipped are the first two blocks of the base level, and they
+//!   vary from record to record.
+//! * [`DXT5_SPEC_DEVIATIONS`] is no longer a description of this crate. It is now
+//!   the record of an **8-byte block reading the corpus refutes**, kept with the
+//!   measurement that refutes it.
+//! * [`BC3_CODEC`] and [`BC1_CODEC`] are new, and both are graded `Inferred`, not
+//!   `Verified`: the framing is proven, the codec inside a 16-byte block is the
+//!   published reading of a record that declares `DXT5`, and no decode of a real
+//!   record has been compared against the game's own output.
+//! * [`BC3_COLOUR_SIX_LEVEL_ENTRIES`] turned out to be **unobservable** rather
+//!   than undecided: a BC1 colour half carries a 2-bit index, so the
+//!   punch-through entries cannot be addressed at all.
 //!
-//! [`LUMINANCE_FOURCC`] used to be a non-finding: the family was named, refused
-//! by name, and called "luminance" on the strength of a Python oracle's comment
-//! and one line of a design document. Four claims now carry what the corpus
-//! actually shows — the family is not luminance ([`LUMINANCE_FOURCC`]), it
-//! frames itself differently ([`LUMINANCE_FRAMING`]), its texels are
-//! `Z, X, Y, lane4` ([`LUMINANCE_TEXEL_LAYOUT`]), and `lane4` is independent of
-//! the normal map ([`LUMINANCE_FOURTH_LANE`]).
+//! # Refuted documents, recorded rather than dropped
 //!
-//! The old subject was **updated, not deleted**, and two claims that had been
-//! non-findings are now established: [`ENVELOPE_FIELD_18_MEANING`] is the base
-//! level's byte count in this family, and [`ENVELOPE_FIELD_1C_MEANING`] is not
-//! a field of this family at all. One claim stayed unresolved on purpose —
-//! [`LUMINANCE_CHANNEL_SWIZZLE`] — because "should the decoder re-index the
-//! channels" is a question about a shader this workspace has never read, and
-//! answering it conveniently would be exactly the failure this module exists to
-//! prevent.
-//!
-//! Two research documents are now **refuted by the bytes**, which is recorded
-//! rather than quietly dropped: `docs/MATERIALS-DESIGN.md` §1 says `field_1c`
-//! holds "a float 1.0 in 0x15 records" (it is the first texel), and calls the
-//! family luminance (it is a normal map). `docs/LUMINANCE-RASTER.md` carries the
-//! arithmetic.
+//! `docs/MATERIALS-DESIGN.md` §1 says `field_1c` holds "a float 1.0 in 0x15
+//! records" (it is the first texel) and calls the `0x15` family luminance (it is
+//! a normal map). Both disagreements are inside
+//! [`ENVELOPE_FIELD_1C_MEANING`] and [`LUMINANCE_FOURCC`]. It also reads
+//! `field_18` as unresolved, which this crate has now measured.
 
 use std::sync::OnceLock;
 
@@ -80,11 +70,37 @@ pub const ENVELOPE_FIELD_1C_MEANING: &str = "envelope_field_1c_meaning";
 /// What the envelope word at `0x00` means beyond "format revision".
 pub const ENVELOPE_VERSION_MEANING: &str = "envelope_version_meaning";
 
-/// What the 16 opaque bytes of a DXT5 layer header hold.
+/// What the 16 opaque bytes a DXT5 record was thought to start with hold.
 pub const LAYER_HEADER_CONTENTS: &str = "layer_header_contents";
 
-/// Why every DXT5 layer header precedes every layer payload.
+/// Why every layer header precedes every layer payload.
 pub const LAYER_INTERLEAVE: &str = "layer_header_payload_interleave";
+
+/// How many mip chains a raster record holds.
+pub const LAYER_COUNT: &str = "raster_layer_count";
+
+/// The first level a record prefixes with its own `u32` byte count.
+pub const FIRST_PREFIXED_LEVEL: &str = "raster_first_prefixed_level";
+
+/// That the `DXT5` records are 16-byte BC3 blocks.
+pub const BC3_CODEC: &str = "dxt5_bc3_codec";
+
+/// That the `DXT1` records are 8-byte BC1 blocks.
+pub const BC1_CODEC: &str = "dxt1_bc1_codec";
+
+/// What the BC3 decoder does with the two alpha indices a six-level palette
+/// leaves undefined.
+pub const BC3_ALPHA_SIX_LEVEL_CLAMP: &str = "bc3_alpha_six_level_clamp";
+
+/// How the BC4/BC5 alpha ramp's integer division is rounded.
+pub const BC4_RAMP_ROUNDING: &str = "bc4_ramp_rounding";
+
+/// Whether a BC1 half-block's unordered endpoints should offer the punch-through
+/// entries at all.
+pub const BC3_COLOUR_SIX_LEVEL_ENTRIES: &str = "bc3_colour_six_level_entries";
+
+/// How Spore's block decode departed from the published BC3 specification.
+pub const DXT5_SPEC_DEVIATIONS: &str = "dxt5_spec_deviations";
 
 /// What the `0x15` family actually is, and whether "luminance" describes it.
 pub const LUMINANCE_FOURCC: &str = "luminance_fourcc_family";
@@ -103,9 +119,6 @@ pub const LUMINANCE_FOURTH_LANE: &str = "luminance_0x15_fourth_lane";
 
 /// What happens to mip levels beyond 32.
 pub const MIPS_BEYOND_32: &str = "mip_chain_beyond_32";
-
-/// How Spore's block decode departs from the published BC3/DXT5 specification.
-pub const DXT5_SPEC_DEVIATIONS: &str = "dxt5_spec_deviations";
 
 /// Why an address is a `Fact` and not a value.
 ///
@@ -131,36 +144,35 @@ pub struct TextureClaim {
 
 /// The claims, in declaration order.
 ///
-/// Lazily built because [`Fact`] cannot be constructed in a `const` context:
-/// an available fact must carry a `Vec<Provenance>`.
+/// Lazily built because [`Fact`] cannot be constructed in a `const` context: an
+/// available fact must carry a `Vec<Provenance>`.
 pub fn all_claims() -> &'static [TextureClaim] {
     static CLAIMS: OnceLock<Vec<TextureClaim>> = OnceLock::new();
     CLAIMS.get_or_init(|| {
         vec![
             unresolved(
                 ENVELOPE_FIELD_10_MEANING,
-                "field_10 reads 8 in every sampled raster (the 512x512 records 0x40662900/01, the \
-                 raster_ap_5552/raster_0 family, and the 0x15 record raster_6948). No decoder \
-                 reads it: not the Python oracle, not src/assets/Texture.cpp, not this crate. \
-                 docs/MATERIALS-DESIGN.md section 1 records it as '=8 every sample; decoder must \
-                 NOT rely on it'.",
+                "field_10 reads 8 in every sampled raster of every fourcc in Spore_Content.package \
+                 and Spore_EP1_Content_01.package (4386 records). No decoder reads it: not the \
+                 Python oracle, not src/assets/Texture.cpp, not this crate. docs/MATERIALS-DESIGN.md \
+                 section 1 records it as '=8 every sample; decoder must NOT rely on it'.",
             ),
             resolved(
                 ENVELOPE_FIELD_18_MEANING,
-                "field_18 is format-specific. In every one of the 901 0x15 records of \
-                 Spore_Content.package it is exactly width*height*4: 0x1000 for the 32x32/6-mip \
-                 shape, 0x40000 for 256x256/9, 0x100000 for 512x512/10. In the DXT5 records it \
-                 reads 0x00040000 whatever the dimensions (512x512 DXT5 carries 0x40000, not the \
-                 0x100000 its w*h*4 would give), so the word does not have one meaning across \
-                 formats. No decoder reads it: the walk derives the same quantity from the \
-                 envelope's own geometry, which is this crate's existing 'derived, never read' \
-                 rule applied to one more word.",
-                EvidenceLevel::Observed,
-                "In the 0x15 family, the base level's payload length in bytes. It is redundant \
-                 with the derived chain and is deliberately not consulted, so that a record whose \
-                 header disagrees with its geometry is caught by the framing identity rather than \
-                 by trusting a word whose cross-format meaning is not shared.",
-                "Spore_Content.package, all 901 records of type 0x2F4E681C with fourcc 0x15",
+                "field_18 is the base level's own byte count, in EVERY format, not a per-format \
+                 constant: 0x40000 for a 512x512 DXT5 record (16 bytes per 4x4 block), 0x10000 for \
+                 256x256 (65536), 0x1000 for 64x64 (4096), 0x8000 for a 256x256 DXT1 record (32768, \
+                 8 bytes per block), 0x100000/0x40000/0x1000 for the 0x15 family's 512/256/32 \
+                 (w*h*4). Verified in 4386 of 4386 raster records measured. The old reading -- \
+                 '0x40000 for a 512x512 DXT5 whatever the dimensions, so the word does not have one \
+                 meaning' -- was an artefact of charging 8 bytes per block: at 8 bytes a 512x512 \
+                 base level is 131072 and field_18 read as exactly two of them.",
+                EvidenceLevel::Verified,
+                "The byte count of mip level 0. It is a REDUNDANT restatement of the geometry, and \
+                 the walk refuses a record where the two disagree rather than trusting either, which \
+                 is what makes it usable as a cross-check without making it a source of layout.",
+                "Spore_Content.package (2954 records) and Spore_EP1_Content_01.package (1432 \
+                 records), all three fourcc values",
             ),
             resolved(
                 ENVELOPE_FIELD_1C_MEANING,
@@ -173,40 +185,152 @@ pub fn all_claims() -> &'static [TextureClaim] {
                  1.0 in 0x15 records'.",
                 EvidenceLevel::Verified,
                 "Payload, not metadata. The word docs/MATERIALS-DESIGN.md section 1 describes as \
-                 'a float 1.0 in 0x15 records' is refuted by the bytes: 0x008080ff is not 1.0f \
-                 and it varies per record, and the framing identity only closes when those four \
-                 bytes are charged to the base level. RasterEnvelope still reports the word because \
-                 a caller reading an envelope should see the bytes that are there.",
+                 'a float 1.0 in 0x15 records' is refuted by the bytes: 0x008080ff is not 1.0f and \
+                 it varies per record, and the framing identity only closes when those four bytes \
+                 are charged to the base level. RasterEnvelope still reports the word because a \
+                 caller reading an envelope should see the bytes that are there.",
                 "Spore_Content.package; refutes docs/MATERIALS-DESIGN.md section 1",
             ),
             resolved(
                 ENVELOPE_VERSION_MEANING,
                 "version reads 1 in every sampled raster. No record with any other value has been \
-                 seen, so the crate does not validate it: refusing an unobserved version would be \
-                 a guess about a format nobody has.",
+                 seen, so the crate does not validate it: refusing an unobserved version would be a \
+                 guess about a format nobody has.",
                 EvidenceLevel::Observed,
                 "A format revision counter, always 1 in the records sampled so far. Never \
                  validated, because an unobserved value is not a known-bad one.",
-                "docs/MATERIALS-DESIGN.md section 1",
+                "Spore_Content.package and Spore_EP1_Content_01.package",
             ),
-            unresolved(
+            resolved(
                 LAYER_HEADER_CONTENTS,
-                "Each DXT5 layer is preceded by 16 bytes read as a 4-byte name plus three u32 (one \
-                 sample spells the name 'e9D1'). The three words are skipped, never interpreted, \
-                 and no layer's presence depends on them. The 0x15 family has NO layer header at \
-                 all, which is one of the two structural ways it differs from DXT5 -- so this \
-                 claim is about one of the two formats, not about 'a raster'.",
+                "REFUTED, and the refutation is the point. There are no 16-byte layer headers. The \
+                 bytes at 0x20 of a DXT5 record are the first two BC3 blocks of the base level: \
+                 across the 1374 512x512 records of one shape they take many distinct values, which \
+                 is what block data does and is not what a header does. The 0x15 family never had \
+                 any layer header either, so this claim was about a structure no raster record has.",
+                EvidenceLevel::Verified,
+                "Nothing -- the 16 bytes are payload. The record's level 0 begins at offset 32 \
+                 (DXT5/DXT1) or 28 (0x15) with no intervening header.",
+                "Spore_Content.package, cross-record variance at offsets 0x20-0x3f",
             ),
             resolved(
                 LAYER_INTERLEAVE,
-                "All n layer headers precede all payloads: payloadOff = 32 + n*16 = 0x40 on every \
-                 real 512x512 DXT5 record, and the block at that offset is a valid DXT5 block \
-                 (20 00 02 00 65 39 00 00). The 0x15 family has no layer headers, so the claim is \
-                 specific to DXT5's framing.",
-                EvidenceLevel::Observed,
-                "Headers are grouped at the front of the payload region rather than interleaved \
-                 with their payloads. This is what makes layer i start at 32 + n*16 + i*chain.",
-                "docs/MATERIALS-DESIGN.md section 1",
+                "REFUTED. There is no layer to interleave with, so the question is void: one chain, \
+                 one header, and per-LEVEL u32 byte counts inside it. The old claim 'all n layer \
+                 headers precede all payloads, payloadOff = 32 + n*16 = 0x40' was checked against \
+                 the first block of a real record and read '20 00 02 00 65 39 00 00' -- which is a \
+                 valid block at offset 0x40 and ALSO a valid block at offset 0x20, because the \
+                 bytes it cited could not distinguish the two.",
+                EvidenceLevel::Verified,
+                "Void. Superseded by the framing identity in crate::framing, which places each \
+                 level from the envelope's own geometry and validates a u32 length the record \
+                 itself carries at every prefixed level.",
+                "docs/MATERIALS-DESIGN.md section 1, refuted by the byte count in crate::framing",
+            ),
+            resolved(
+                LAYER_COUNT,
+                "Every raster record in the corpus is ONE chain of mip levels. There is no layer \
+                 count in the record and nothing to divide for one: record_size == header + \
+                 level0 + SUM over prefixed levels of (4 + level bytes) closes with nothing left \
+                 over in 4386 of 4386 records. The old 'derived 2 layers' was an arithmetic \
+                 artefact -- 8 bytes per 4x4 block instead of 16 makes one picture look like two \
+                 half-pictures -- and it is why 373 records used to be refused for a payload that \
+                 'is not a multiple of the layer stride'.",
+                EvidenceLevel::Verified,
+                "One. RasterImage::layers therefore has exactly one element; the nesting is kept \
+                 only so a caller written against the old two-layer reading still compiles.",
+                "Spore_Content.package and Spore_EP1_Content_01.package; docs/RASTER-FRAMING.md",
+            ),
+            unresolved(
+                FIRST_PREFIXED_LEVEL,
+                "The block formats prefix levels 2..M-1 and the 0x15 family prefixes levels 1..M-1, \
+                 and both are exact in every record. WHY they differ is not established: the bytes \
+                 where a level-1 prefix would sit in a DXT5 or DXT1 record hold block data (a \
+                 u32 there is 1939370904 on record 0x40662c00:0x824928c8, not the 2048 a prefix \
+                 would carry). No field in the envelope says which family a record belongs to \
+                 beyond the fourcc, so the rule is per-fourcc and the reason is unknown.",
+            ),
+            resolved(
+                BC3_CODEC,
+                "The DXT5 records' 16-byte blocks are read as published BC3: an 8-byte BC4 alpha \
+                 half (alpha0, alpha1, 16 three-bit indices) followed by an 8-byte BC1 colour \
+                 half. Evidence for the STRIDE is a byte count, not a judgement: a 256x256 base \
+                 level occupies 65536 bytes, which is 4096 blocks of 16; at 8 bytes it would be \
+                 32768, and every recorded level prefix is the 16-byte figure. Evidence for the \
+                 ALPHA half is measured: mean horizontal total variation of the decoded alpha over \
+                 25 sampled records per shape is 1.95 (512x512), 8.72 (256x256) and 2.20 (64x64) \
+                 under BC3, against 60.49, 106.06 and 50.25 under the previous 8-byte rule -- a \
+                 factor of 20 to 50 on every shape. Evidence for the COLOUR half is the fourcc \
+                 plus the stride; no measurement isolates it.",
+                EvidenceLevel::Inferred,
+                "BC3, i.e. BC4 alpha plus BC1 colour. The framing is proven and the alpha half is \
+                 measured; the colour half is the published reading of a record that declares \
+                 'DXT5' and is charged 16 bytes per block, which is an inference and is graded \
+                 accordingly. A decode of a real record has never been compared against the game's \
+                 own output, which is the test that would raise this to Verified.",
+                "Spore_Content.package, all 1747 DXT5 records; docs/RASTER-FRAMING.md",
+            ),
+            resolved(
+                BC1_CODEC,
+                "The DXT1 records' 8-byte blocks are read as published BC1: two R5G6B5 endpoints and \
+                 16 two-bit colour indices, alpha opaque. The STRIDE is a byte count -- a 256x256 \
+                 DXT1 base level occupies 32768 bytes, which is 4096 blocks of 8, and every \
+                 recorded level prefix is that figure -- and the fourcc names BC1. No smoothness \
+                 measurement isolates the codec: at the measured offsets these records are \
+                 low-contrast enough that a misaligned read scores just as smooth, so this is the \
+                 published reading and not a measured one.",
+                EvidenceLevel::Inferred,
+                "BC1 with opaque alpha. Chosen because the framing fixes the stride at 8 bytes and \
+                 the fourcc names BC1, which is the only standard codec of that stride; it is an \
+                 inference, not a measurement, and a real decode would be the test.",
+                "Spore_Content.package, all 306 DXT1 records; docs/RASTER-FRAMING.md",
+            ),
+            unresolved(
+                BC3_ALPHA_SIX_LEVEL_CLAMP,
+                "When a BC3 block's alpha endpoints are NOT ordered (alpha0 <= alpha1) the \
+                 specification gives six palette entries and leaves indices 6 and 7 undefined. This \
+                 decoder clamps them to alpha0. No record has been decoded both ways, so the clamp \
+                 is a defensible default and not a measured fact; a real alpha mask with such a \
+                 block would show the difference as a hard edge.",
+            ),
+            unresolved(
+                BC4_RAMP_ROUNDING,
+                "The BC4 ramp is a weighted integer mean, `(n*a0 + m*a1) / 7` in the eight-level \
+                 case and `... / 5` in the six-level one, and this decoder truncates. Reference \
+                 decoders differ: for endpoints (255, 0) truncation gives 218, 182, 145, 109, 72, \
+                 36 while a rounded variant gives 219, 183, 146, 110, 73, 37. Nothing in the \
+                 corpus chooses between them, and the difference is one LSB on most texels of a \
+                 block whose endpoints are not 0 and 255 -- so this is a real 1-LSB risk on real \
+                 pixels, and the reason it is not graded higher than the codec itself.",
+            ),
+            unresolved(
+                BC3_COLOUR_SIX_LEVEL_ENTRIES,
+                "A BC1 half-block's six-entry (punch-through) palette needs a 3-BIT colour index, \
+                 and a BC3 block's colour half carries a 2-bit one, so entries 4 and 5 are \
+                 UNREACHABLE in both block formats and this decoder does not build them. That \
+                 makes the choice unobservable rather than undecided -- no pixel here can differ \
+                 -- but it is recorded because 'which of the six entries does Spore use' is a \
+                 question a reader will otherwise assume was answered, and the honest answer is \
+                 that the format never asks it.",
+            ),
+            resolved(
+                DXT5_SPEC_DEVIATIONS,
+                "THIS IS A REFUTED CLAIM, kept as the register of what the corpus decided. The \
+                 crate previously decoded 8-byte blocks with an inverted palette-size test, R5G5B5 \
+                 channel reads, a 6/2 alpha blend on the endpoint codes and no \
+                 alpha0 == alpha1 collapse, and it claimed the records 'carry no colour: green \
+                 span 0, blue span 0, 477771 palette entries collapse to exactly 2 RGB triples'. \
+                 All four departures, and the no-colour consequence, are artefacts of that rule: \
+                 green and blue read as 0 under R5G5B5 on a 6-BIT word by construction, because a \
+                 6-bit value cannot set bits 10..19. Read as BC3 the same records carry 32 \
+                 distinct greens and 32 distinct blues.",
+                EvidenceLevel::Verified,
+                "Spore's blocks ARE BC3. The deviations listed were properties of the 8-byte \
+                 reading, which the record lengths refute; that reading has no support beyond two \
+                 implementations agreeing with each other on synthetic input.",
+                "tools/spore/dxt5/dxt5.py and src/assets/Dxt5.cpp agree with each other and with \
+                 tests/test_textures.py::TestDxt5Synthetic, none of which ever ran on a real \
+                 record; refuted by the byte count in crate::framing",
             ),
             resolved(
                 LUMINANCE_FOURCC,
@@ -219,8 +343,8 @@ pub fn all_claims() -> &'static [TextureClaim] {
                  a name with no decoder behind it and the bytes REFUTE it, as they refute \
                  docs/MATERIALS-DESIGN.md section 1 which calls this family luminance and puts it \
                  out of scope. The 'exactly three shapes' count is scoped to that one package: the \
-                 framing identity is size-driven, so a fourth shape would decode rather than \
-                 fail, and none has been seen in any corpus measured here.",
+                 framing identity is size-driven, so a fourth shape would decode rather than fail, \
+                 and none has been seen in any corpus measured here.",
                 EvidenceLevel::Verified,
                 "A tangent-space normal map plus a fourth lane: lanes 0, 1, 2 are Z, X, Y with 128 \
                  as zero, which is what the flat-normal records spell out literally. 'Luminance' \
@@ -231,16 +355,18 @@ pub fn all_claims() -> &'static [TextureClaim] {
             resolved(
                 LUMINANCE_FRAMING,
                 "A 0x15 record is 28 bytes of header followed by the base level unprefixed, then \
-                 for each further mip a little-endian u32 byte count and that many payload bytes. \
-                 The identity record_size == 28 + w*h*4 + sum over mips 1..n of (4 + \
+                 for each further level a little-endian u32 byte count and that many payload \
+                 bytes. The identity record_size == 28 + w*h*4 + sum over levels 1..n of (4 + \
                  max(1,w>>m)*max(1,h>>m)*4) holds with nothing left over in 901 of 901 records, \
-                 and each recorded prefix equals its own mip's w*h*4.",
+                 and each recorded prefix equals its own level's w*h*4. Unchanged by the 2026-10-04 \
+                 re-measurement; it is now one row of the shared table in crate::framing rather \
+                 than a rule of its own.",
                 EvidenceLevel::Verified,
                 "An exact-consume identity over the whole corpus, not a plausibility fit. It is \
-                 strictly stronger than the DXT5 rule, which divides a payload to find a layer \
+                 strictly stronger than the old DXT5 rule, which divided a payload to find a layer \
                  count; here the record size is fully determined, so a mismatch is a refusal \
-                 (LuminanceRecordSize / LuminanceLengthPrefix) rather than a rounding.",
-                "Spore_Content.package; docs/LUMINANCE-RASTER.md",
+                 rather than a rounding.",
+                "Spore_Content.package; docs/LUMINANCE-RASTER.md; docs/RASTER-FRAMING.md",
             ),
             resolved(
                 LUMINANCE_TEXEL_LAYOUT,
@@ -277,27 +403,14 @@ pub fn all_claims() -> &'static [TextureClaim] {
             ),
             resolved(
                 MIPS_BEYOND_32,
-                "dxt5_chain_size charges 8 bytes per mip past 32 because `w >> mip` is undefined \
-                 for mip >= 32. The largest chain observed is 10 mips (512x512, mipCount=10), so \
-                 no record exercises the rule.",
+                "dxt5_chain_size charges one block per level past 32 because `w >> mip` is \
+                 undefined for mip >= 32. The largest chain observed is 10 levels (512x512, \
+                 mipCount=10), so no record exercises the rule.",
                 EvidenceLevel::Approximation,
-                "One 4x4 block per mip beyond 32. Reproduced from the reference so the two agree; \
-                 it bounds an absurd header rather than describing how Spore writes a 33rd mip.",
-                "src/assets/Dxt5.cpp",
-            ),
-            resolved(
-                DXT5_SPEC_DEVIATIONS,
-                "The block decoder departs from the published BC3/DXT5 specification in four \
-                 places, all reproduced from tools/spore/dxt5/dxt5.py and src/assets/Dxt5.cpp and \
-                 all pinned by tests/dxt5_golden.rs: (1) the palette-size test is inverted - \
-                 c0 > c1 yields TWO colours, not four; (2) channels are read R5G5B5, not R6G6B5, \
-                 so a 6-bit input yields red in {0,8} only; (3) codes 0 and 3 return a 6/2 blend \
-                 of the endpoints rather than the endpoints themselves; (4) there is no \
-                 alpha0 == alpha1 collapse.",
-                EvidenceLevel::Verified,
-                "Spore's decoder, not the BC3 specification, defines these blocks. A change here \
-                 changes decoded pixels and must be justified by a record, never by the spec.",
-                "tools/spore/dxt5/dxt5.py",
+                "One block per level beyond 32. Reproduced from the previous reference so the two \
+                 would agree; it bounds an absurd header rather than describing how Spore writes a \
+                 33rd level.",
+                "The rule predates the 2026-10-04 re-measurement; no record exercises it",
             ),
         ]
     })
@@ -358,12 +471,15 @@ mod tests {
 
     #[test]
     fn every_unresolved_subject_is_unavailable_and_unknown() {
-        // The two envelope words this crate still has nothing to say about, the
-        // DXT5 layer header, and the channel-swizzle question. Each must be a
+        // The envelope word this crate still has nothing to say about, the two
+        // open framing questions and the channel-swizzle question. Each must be a
         // non-finding, never a zero and never a guess.
         for subject in [
             ENVELOPE_FIELD_10_MEANING,
-            LAYER_HEADER_CONTENTS,
+            FIRST_PREFIXED_LEVEL,
+            BC3_ALPHA_SIX_LEVEL_CLAMP,
+            BC4_RAMP_ROUNDING,
+            BC3_COLOUR_SIX_LEVEL_ENTRIES,
             LUMINANCE_CHANNEL_SWIZZLE,
         ] {
             let entry = claim(subject).unwrap_or_else(|| panic!("{subject} is not recorded"));
@@ -392,13 +508,17 @@ mod tests {
             ENVELOPE_VERSION_MEANING,
             ENVELOPE_FIELD_18_MEANING,
             ENVELOPE_FIELD_1C_MEANING,
+            LAYER_HEADER_CONTENTS,
             LAYER_INTERLEAVE,
+            LAYER_COUNT,
+            BC3_CODEC,
+            BC1_CODEC,
+            DXT5_SPEC_DEVIATIONS,
             LUMINANCE_FOURCC,
             LUMINANCE_FRAMING,
             LUMINANCE_TEXEL_LAYOUT,
             LUMINANCE_FOURTH_LANE,
             MIPS_BEYOND_32,
-            DXT5_SPEC_DEVIATIONS,
         ] {
             let entry = claim(subject).unwrap_or_else(|| panic!("{subject} is not recorded"));
             assert!(entry.meaning.is_available(), "{subject}");
@@ -411,10 +531,6 @@ mod tests {
                 entry.meaning.reason(),
                 None,
                 "{subject}: an available fact has no reason"
-            );
-            assert_eq!(
-                entry.meaning.value(),
-                Some(entry.meaning.value().unwrap_or(&""))
             );
         }
     }
@@ -452,20 +568,11 @@ mod tests {
     }
 
     #[test]
-    fn the_beyond_32_rule_is_an_approximation_not_an_observation() {
-        // Grading the reproduced reference rule as Observed would be a lie: no
-        // record has more than 10 mips.
-        assert_eq!(grade_of(MIPS_BEYOND_32), EvidenceLevel::Approximation);
-        assert_eq!(grade_of(DXT5_SPEC_DEVIATIONS), EvidenceLevel::Verified);
-        assert_eq!(grade_of(LAYER_INTERLEAVE), EvidenceLevel::Observed);
-    }
-
-    #[test]
-    fn the_grades_of_the_luminance_family_say_what_the_evidence_says() {
+    fn the_grades_say_what_the_evidence_says() {
         // Each grade is pinned here so that a convenient upgrade fails the build.
-        // In particular `LUMINANCE_FOURTH_LANE` is INFERRED, not VERIFIED: "a
-        // mask" is a reading of four bytes nobody has a name for, and the
-        // measurement only ever established independence from the normal map.
+        assert_eq!(grade_of(LAYER_COUNT), EvidenceLevel::Verified);
+        assert_eq!(grade_of(ENVELOPE_FIELD_18_MEANING), EvidenceLevel::Verified);
+        assert_eq!(grade_of(MIPS_BEYOND_32), EvidenceLevel::Approximation);
         assert_eq!(grade_of(LUMINANCE_FOURCC), EvidenceLevel::Verified);
         assert_eq!(grade_of(LUMINANCE_FRAMING), EvidenceLevel::Verified);
         assert_eq!(grade_of(LUMINANCE_TEXEL_LAYOUT), EvidenceLevel::Verified);
@@ -474,20 +581,47 @@ mod tests {
             EvidenceLevel::Inferred,
             "'a mask of some kind' is an inference and must not be graded higher"
         );
-        assert_eq!(grade_of(LUMINANCE_CHANNEL_SWIZZLE), EvidenceLevel::Unknown);
     }
 
     #[test]
-    fn the_refuted_documents_are_named_rather_than_dropped() {
-        // The two claims that contradict docs/MATERIALS-DESIGN.md section 1 must
-        // carry the refutation in their observation, so a reader of the claim
-        // alone learns that the document and the corpus disagree.
+    fn a_codec_is_never_graded_above_inferred() {
+        // The framing is proven; the codec inside a 16-byte block is not, because
+        // no decode of a real record has been compared against the game's own
+        // output. This test exists so that raising either codec to Verified is a
+        // build failure rather than a quiet edit.
+        assert_eq!(
+            grade_of(BC3_CODEC),
+            EvidenceLevel::Inferred,
+            "BC3 is the published reading of a proven stride, not a measured decode"
+        );
+        assert_eq!(grade_of(BC1_CODEC), EvidenceLevel::Inferred);
+    }
+
+    #[test]
+    fn the_refuted_claims_are_named_rather_than_dropped() {
+        // A refutation that deletes its subject leaves the next reader with
+        // nothing to contradict, which is how a wrong belief gets re-derived.
+        for subject in [
+            LAYER_HEADER_CONTENTS,
+            LAYER_INTERLEAVE,
+            DXT5_SPEC_DEVIATIONS,
+        ] {
+            let entry = claim(subject).unwrap_or_else(|| panic!("{subject} was deleted"));
+            assert!(
+                entry.observation.contains("REFUTED") || entry.observation.contains("refuted"),
+                "{subject}: the refutation must be visible in the claim itself"
+            );
+        }
+    }
+
+    #[test]
+    fn the_documents_the_bytes_refute_are_still_named() {
         for subject in [ENVELOPE_FIELD_1C_MEANING, LUMINANCE_FOURCC] {
             let entry = claim(subject).unwrap();
             assert!(
                 entry.observation.contains("MATERIALS-DESIGN")
                     || entry.observation.contains("float 1.0")
-                    || entry.observation.contains("refuted"),
+                    || entry.observation.contains("REFUTE"),
                 "{subject}: the refutation must be visible in the claim itself"
             );
         }

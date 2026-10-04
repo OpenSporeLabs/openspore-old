@@ -1,50 +1,52 @@
-//! Envelope parsing, the derived layer split, and the whole-record decode.
+//! Envelope parsing, the framing identity, and the whole-record decode.
 //!
 //! Everything here is synthetic: the real raster records live only in the
-//! git-ignored `SPORE/` tree. The one non-synthetic input is the *record bytes*
-//! in [`common::SYNTHETIC_RECORD_HEX`], which is not from a game installation
-//! either — it is a record this crate's tests build field by field, and which
-//! was also assembled and decoded by `tools/spore/raster/raster.py` so that the
-//! layer split, the mip dimensions and every texel have an independent oracle.
+//! git-ignored `SPORE/` tree. Each record is built field by field in
+//! [`common`], so every byte the walk reads is visible in the test that reads it.
+//!
+//! # What this file asserts that the previous one could not
+//!
+//! The previous version asserted a two-layer split with a 16-byte header in
+//! front of each layer, and that `layer_count_for` derived 2 from a synthetic
+//! record built to fit that rule. **The corpus refutes both**: a raster record
+//! has no layer count and no layer header, its levels carry their own `u32` byte
+//! counts, and its block is 16 bytes rather than 8. The tests below are the
+//! replacements, and they pin the *identity* — the record's length is exactly what
+//! its own envelope implies — rather than a division that happened to work.
 
 mod common;
 
 use common::*;
 use spore_texture::{
-    decode_raster, layer_count_for, parse_envelope, RasterEnvelope, TextureError, DXT5_FOURCC,
-    ENVELOPE_SIZE, LAYER_HEADER_SIZE, RASTER_TYPE,
+    decode_raster, dxt5_chain_size, dxt5_mip_size, layer_count_for, luminance_record_size,
+    mip_dimension, parse_envelope, TextureError, DXT1_FOURCC, DXT5_FOURCC, ENVELOPE_SIZE,
+    LUMINANCE_FOURCC,
 };
 
-/// The synthetic record, so the byte counts below are checkable.
+/// The synthetic DXT5 record.
 fn record() -> Vec<u8> {
-    synthetic_record()
+    bc3_record()
 }
 
 /// The envelope the synthetic record declares, for direct comparison.
-fn envelope() -> RasterEnvelope {
-    RasterEnvelope {
-        version: 1,
-        width: SYNTHETIC_WIDTH,
-        height: SYNTHETIC_HEIGHT,
-        mip_count: SYNTHETIC_MIPS,
-        field_10: 8,
-        fourcc: DXT5_FOURCC,
-        field_18: 0x0004_0000,
-        field_1c: 0x0000_FFFF,
-    }
+fn envelope() -> spore_texture::RasterEnvelope {
+    parse_envelope(&record()).expect("the fixture is a whole record")
 }
-
-// ---------------------------------------------------------------------------
-// The envelope
-// ---------------------------------------------------------------------------
 
 /// The envelope is eight little-endian `u32` words at their documented offsets.
 #[test]
 fn the_envelope_parses_field_by_field() {
-    assert_eq!(
-        parse_envelope(&record()).expect("a full record has an envelope"),
-        envelope()
-    );
+    let env = envelope();
+    assert_eq!(env.version, 1);
+    assert_eq!(env.width, 8);
+    assert_eq!(env.height, 8);
+    assert_eq!(env.mip_count, 2);
+    assert_eq!(env.field_10, 8);
+    assert_eq!(env.fourcc, DXT5_FOURCC);
+    assert_eq!(env.field_18, 64, "the 8x8 base level's four 16-byte blocks");
+    assert_eq!(env.field_1c, 0x0000_FFFF);
+    // The raw bytes, so a wrong offset cannot hide behind a correct value.
+    assert_eq!(&record()[0x14..0x18], b"DXT5");
 }
 
 /// `parse_envelope` is pure structure: it reads a format this crate does not
@@ -53,480 +55,387 @@ fn the_envelope_parses_field_by_field() {
 #[test]
 fn parse_envelope_does_not_validate_the_format() {
     let mut bytes = record();
-    bytes[0x14..0x18].copy_from_slice(&0x1500_0000u32.to_le_bytes());
-    bytes[0x0C..0x10].copy_from_slice(&0u32.to_le_bytes());
-    let parsed = parse_envelope(&bytes).expect("structure only");
-    assert_eq!(
-        parsed.fourcc, 0x1500_0000,
-        "the luminance family is readable, not decodable"
-    );
-    assert_eq!(parsed.mip_count, 0);
-    assert_eq!(parsed.field_10, 8);
-    assert_eq!(parsed.field_18, 0x0004_0000);
-    assert_eq!(parsed.field_1c, 0x0000_FFFF);
+    bytes[0x14..0x18].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+    let env = parse_envelope(&bytes).expect("structure is readable");
+    assert_eq!(env.fourcc, 0xDEAD_BEEF);
+    // And decoding it is where the format is named.
+    assert!(matches!(
+        decode_raster(&bytes),
+        Err(TextureError::UnsupportedFourcc {
+            fourcc: 0xDEAD_BEEF
+        })
+    ));
 }
 
-/// The unresolved words are carried verbatim and are never given a meaning.
+/// `field_10` is carried verbatim and never given a meaning.
 ///
-/// `field_10` and `field_18` hold the same value in every sampled record and
-/// nobody knows what they are; this test asserts only that they survive the
-/// round trip and that decoding does not depend on them.
+/// The test asserts only that the word survives the round trip and that decoding
+/// does not depend on it — which is now checkable, because the walk does read
+/// `field_18`.
 #[test]
-fn the_unresolved_words_are_carried_verbatim_and_never_decided() {
-    let mut bytes = record();
-    // Zero and non-zero values of the unresolved words must change nothing.
-    for filler in [0u32, 0xDEAD_BEEF] {
-        bytes[0x10..0x14].copy_from_slice(&filler.to_le_bytes());
-        bytes[0x18..0x1C].copy_from_slice(&filler.to_le_bytes());
-        let image = decode_raster(&bytes).expect("the unresolved words drive nothing");
-        assert_eq!(image.envelope.field_10, filler);
-        assert_eq!(image.envelope.field_18, filler);
+fn field_10_is_carried_verbatim_and_never_decided() {
+    let baseline = decode_raster(&record()).expect("decodes");
+    for value in [0u32, 1, 8, 0xFFFF_FFFF] {
+        let mut bytes = record();
+        bytes[0x10..0x14].copy_from_slice(&value.to_le_bytes());
+        let decoded = decode_raster(&bytes).expect("decodes whatever field_10 says");
+        // The envelope is carried, so it differs by construction; the pixels are
+        // the part that must not.
         assert_eq!(
-            image.layers.len(),
-            2,
-            "the split cannot depend on an unresolved word"
+            decoded.layers, baseline.layers,
+            "field_10 = {value:#x} changed the decode"
         );
-        assert_eq!(image.layers[0][0].pixels, expected_addressing_8x8());
     }
+}
+
+/// `field_18` **is** read: a record whose header disagrees with its own geometry
+/// is refused, by name, with both numbers.
+#[test]
+fn field_18_is_a_cross_check_and_a_disagreement_is_refused() {
+    let mut bytes = record();
+    bytes[0x18..0x1c].copy_from_slice(&65u32.to_le_bytes());
+    assert_eq!(
+        decode_raster(&bytes),
+        Err(TextureError::Field18Mismatch {
+            declared: 65,
+            expected: 64,
+            width: 8,
+            height: 8,
+            fourcc: DXT5_FOURCC
+        })
+    );
 }
 
 /// Every prefix shorter than the envelope is refused by name, and none panics.
 #[test]
 fn a_record_shorter_than_the_envelope_is_refused() {
     for length in 0..ENVELOPE_SIZE {
-        let bytes = vec![0u8; length];
+        let error = decode_raster(&vec![0u8; length]).unwrap_err();
         assert_eq!(
-            parse_envelope(&bytes).expect_err("a short record has no envelope"),
+            error,
             TextureError::TruncatedEnvelope { available: length },
-            "length {length}"
+            "{length} bytes"
         );
-        assert_eq!(
-            decode_raster(&bytes).expect_err("a short record decodes to nothing"),
-            TextureError::TruncatedEnvelope { available: length },
-            "length {length}"
-        );
+        assert!(!error.to_string().is_empty());
     }
-    assert_eq!(ENVELOPE_SIZE, 32);
-    assert!(
-        parse_envelope(&[0u8; ENVELOPE_SIZE]).is_ok(),
-        "32 bytes is an envelope"
-    );
 }
 
-// ---------------------------------------------------------------------------
-// The derived layer split
-// ---------------------------------------------------------------------------
-
-/// `layer_count_for` derives 2 from the record size, and agrees with the
-/// envelope's own geometry: `chain_size(8, 8, 2)` is 40, so one layer is
-/// `16 + 40 = 56` bytes and `(144 - 32) / 56 = 2`.
+/// The layer count is **1**, and it comes from the framing identity rather than
+/// from a division.
 #[test]
-fn the_layer_count_is_derived_from_the_record_size() {
+fn the_layer_count_is_one_and_the_identity_is_exact() {
     let bytes = record();
-    let parsed = parse_envelope(&bytes).expect("a full record has an envelope");
-    assert_eq!(bytes.len(), 144);
-    assert_eq!(layer_count_for(bytes.len(), &parsed), Ok(2));
-    assert_eq!((bytes.len() - ENVELOPE_SIZE) % (LAYER_HEADER_SIZE + 40), 0);
+    assert_eq!(bytes.len(), BC3_RECORD_SIZE);
+    assert_eq!(layer_count_for(bytes.len(), &envelope()), Ok(1));
+    // The identity, spelled out: 32 + 64 (bare base) + 16 (bare 4x4).
+    assert_eq!(32 + 64 + 16, BC3_RECORD_SIZE);
 }
 
-/// The two layer headers sit together at the front of the payload region, so the
-/// first payload byte is `32 + 2 * 16 = 0x40`.
+/// Every extra byte, and every missing one, is refused.
 ///
-/// This is the load-bearing layout assumption: if the headers were interleaved
-/// with their payloads, layer 0's first block would be read from `0x30` and the
-/// decode would still succeed — with different pixels. The exact-pixel
-/// assertions in [`a_synthetic_record_decodes_two_layers_of_two_mips`] are what
-/// catch that, and they pass only for the grouped layout.
+/// This is the test that replaces "the payload divides by the layer stride". A
+/// division has a remainder that could be rounded; an identity has none.
 #[test]
-fn all_layer_headers_precede_all_payloads() {
-    let bytes = record();
-    assert_eq!(
-        &bytes[ENVELOPE_SIZE..ENVELOPE_SIZE + 4],
-        b"e9D1",
-        "layer 0 header name"
-    );
-    assert_eq!(
-        &bytes[ENVELOPE_SIZE + LAYER_HEADER_SIZE..ENVELOPE_SIZE + LAYER_HEADER_SIZE + 4],
-        &[0, 0, 0, 0]
-    );
-    let first_payload = ENVELOPE_SIZE + 2 * LAYER_HEADER_SIZE;
-    assert_eq!(first_payload, 0x40);
-    assert_eq!(
-        &bytes[first_payload..first_payload + 8],
-        &[0x00, 0xFF, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00]
-    );
-}
-
-/// The whole record decodes: two layers, two mips each, with the exact pixels the
-/// oracle produces for the same bytes.
-///
-/// Layer 0's mip 0 is the four addressing blocks; its mip 1 is the
-/// four-colour ramp block. Layer 1 is a flat field of `(8,0,0,191)`.
-#[test]
-fn a_synthetic_record_decodes_two_layers_of_two_mips() {
-    let image = decode_raster(&record()).expect("the synthetic record decodes");
-    assert_eq!(image.envelope, envelope());
-    assert_eq!(
-        image.layers.len(),
-        2,
-        "two layers are derived from the record size"
-    );
-    for layer in &image.layers {
-        assert_eq!(layer.len(), 2, "mip_count is 2");
-        assert_eq!((layer[0].width, layer[0].height), (8, 8));
-        assert_eq!((layer[1].width, layer[1].height), (4, 4));
-    }
-
-    assert_eq!(image.layers[0][0].pixels.len(), 8 * 8 * 4);
-    assert_eq!(image.layers[0][0].pixels, expected_addressing_8x8());
-    assert_eq!(image.layers[0][1].pixels.len(), 4 * 4 * 4);
-    assert_eq!(image.layers[0][1].pixels, expected_four_colour_ramp());
-    assert_eq!(
-        image.layers[1][0].pixels,
-        vec![[8u8, 0, 0, 191]; 64].concat()
-    );
-    assert_eq!(image.layers[1][1].pixels, [[8u8, 0, 0, 191]; 16].concat());
-}
-
-/// Every mip image's buffer is exactly `width * height * 4` bytes, for every
-/// layer and every mip.
-#[test]
-fn every_mip_buffer_is_exactly_width_times_height_times_four() {
-    let image = decode_raster(&record()).expect("the synthetic record decodes");
-    for (layer_index, layer) in image.layers.iter().enumerate() {
-        for (mip_index, mip) in layer.iter().enumerate() {
-            assert_eq!(
-                mip.pixels.len(),
-                mip.width as usize * mip.height as usize * 4,
-                "layer {layer_index} mip {mip_index}"
-            );
+fn a_length_that_is_not_the_identity_is_refused() {
+    for delta in [-2i64, -1, 1, 2, 16] {
+        let length = (BC3_RECORD_SIZE as i64 + delta) as usize;
+        let mut bytes = record();
+        bytes.resize(length, 0);
+        let error = decode_raster(&bytes).unwrap_err();
+        match error {
+            TextureError::RecordSizeMismatch {
+                record_size,
+                expected,
+                fourcc,
+                ..
+            } => {
+                assert_eq!(record_size, length);
+                assert_eq!(expected, BC3_RECORD_SIZE);
+                assert_eq!(fourcc, DXT5_FOURCC);
+            }
+            other => panic!("{length} bytes was refused as {other:?}, not by the identity"),
         }
     }
 }
 
-/// The builder's bytes are the bytes the oracle was run against.
+/// The whole DXT5 record decodes: one chain, two levels, the exact texels the
+/// fixtures say the blocks hold.
 #[test]
-fn the_builder_reproduces_the_oracle_record_byte_for_byte() {
-    assert_eq!(record(), unhex(SYNTHETIC_RECORD_HEX));
-    assert_eq!(record().len(), 144);
+fn a_synthetic_dxt5_record_decodes_one_chain_of_two_levels() {
+    let image = decode_raster(&record()).expect("decodes");
+    assert_eq!(image.layers.len(), 1, "one chain, always");
+    let chain = &image.layers[0];
+    assert_eq!(chain.len(), 2);
+    assert_eq!(chain[0].width, 8);
+    assert_eq!(chain[0].height, 8);
+    assert_eq!(chain[1].width, 4);
+    assert_eq!(chain[1].height, 4);
+    assert_eq!(chain[0].pixels, expected_addressing_bc3_8x8());
+    // Level 1 is the solid block: opaque red, all sixteen texels.
+    for pixel in chain[1].pixels.chunks_exact(4) {
+        assert_eq!(pixel, [255, 0, 0, 255]);
+    }
 }
 
-// ---------------------------------------------------------------------------
-// Rejections
-// ---------------------------------------------------------------------------
+/// Level 2 onwards is preceded by a `u32` the walk **reads**, and a prefix that
+/// disagrees with the level's geometry is refused by name.
+#[test]
+fn a_level_length_prefix_is_read_and_checked() {
+    let bytes = bc3_three_level_record();
+    assert_eq!(bytes.len(), BC3_THREE_RECORD_SIZE);
+    let image = decode_raster(&bytes).expect("decodes");
+    assert_eq!(image.layers[0].len(), 3);
+    // Now lie about the prefix. The prefix of level 2 sits at
+    // 32 + 16 + 16 = 64.
+    let mut lying = bytes.clone();
+    lying[64..68].copy_from_slice(&17u32.to_le_bytes());
+    assert_eq!(
+        decode_raster(&lying),
+        Err(TextureError::LevelLengthPrefix {
+            mip: 2,
+            declared: 17,
+            expected: 16,
+            offset: 64,
+            width: 1,
+            height: 1
+        })
+    );
+}
 
-/// A `fourcc` this build does not decode is refused by name.
+/// Every level image's buffer is exactly `width * height * 4` bytes.
+#[test]
+fn every_level_buffer_is_exactly_width_times_height_times_four() {
+    for bytes in [
+        record(),
+        bc3_three_level_record(),
+        bc1_record(),
+        luminance_record(),
+    ] {
+        let image = decode_raster(&bytes).expect("decodes");
+        for chain in &image.layers {
+            for mip in chain {
+                assert_eq!(
+                    mip.pixels.len(),
+                    mip.width as usize * mip.height as usize * 4,
+                    "{}x{}",
+                    mip.width,
+                    mip.height
+                );
+            }
+        }
+    }
+}
+
+/// The DXT1 record decodes on the same framing, one chain, two levels.
+#[test]
+fn a_synthetic_dxt1_record_decodes_on_the_same_framing() {
+    let bytes = bc1_record();
+    assert_eq!(bytes.len(), BC1_RECORD_SIZE);
+    let image = decode_raster(&bytes).expect("decodes");
+    assert_eq!(image.layers.len(), 1);
+    let chain = &image.layers[0];
+    assert_eq!(chain.len(), 2);
+    assert_eq!(chain[0].pixels.len(), 8 * 8 * 4);
+    // BC1 carries no alpha, so every texel is opaque; the colour of each texel is
+    // black or red according to its addressing bit.
+    for (index, pixel) in chain[0].pixels.chunks_exact(4).enumerate() {
+        let x = (index % 8) as u32;
+        let y = (index / 8) as u32;
+        let block = (y / 4) * 2 + (x / 4);
+        let texel = (y % 4) * 4 + (x % 4);
+        // `colour0 = 0x0000` is black and `colour1 = 0xF800` is red, and
+        // `colour0 <= colour1` puts them at slots 0 and 1 of the six-entry
+        // palette, so index 0 reads black and index 1 red.
+        let colour = ((block >> texel) as u8) & 1;
+        assert_eq!(pixel[3], 255, "BC1 alpha is opaque");
+        assert_eq!(
+            &pixel[..3],
+            if colour == 1 {
+                &[255, 0, 0]
+            } else {
+                &[0, 0, 0]
+            }
+        );
+    }
+}
+
+/// The `0x15` family still decodes on the same walk, with its own two framing
+/// differences: a 28-byte header and a prefix from level 1.
+#[test]
+fn the_luminance_family_decodes_on_the_shared_walk() {
+    let bytes = luminance_record();
+    assert_eq!(bytes.len(), 120);
+    let image = decode_raster(&bytes).expect("decodes");
+    assert_eq!(image.layers.len(), 1);
+    let chain = &image.layers[0];
+    assert_eq!(chain.len(), 3);
+    assert_eq!(chain[0].pixels.len(), 4 * 4 * 4);
+    // Level 1's prefix is at 28 + 64 = 92, and a lie there is caught.
+    let mut lying = bytes.clone();
+    lying[92..96].copy_from_slice(&17u32.to_le_bytes());
+    assert!(matches!(
+        decode_raster(&lying),
+        Err(TextureError::LevelLengthPrefix { mip: 1, .. })
+    ));
+}
+
+/// A record whose size is not the identity is refused for the `0x15` family too.
+#[test]
+fn a_luminance_record_of_the_wrong_length_is_refused() {
+    let mut bytes = luminance_record();
+    bytes.push(0);
+    assert!(matches!(
+        decode_raster(&bytes),
+        Err(TextureError::RecordSizeMismatch {
+            record_size: 121,
+            expected: 120,
+            fourcc: LUMINANCE_FOURCC,
+            ..
+        })
+    ));
+}
+
+/// A `fourcc` this build has no measured framing for is refused by name.
 ///
-/// The set shrank when the `0x15` family stopped being refused: it is decoded
-/// now. What remains is genuinely unsupported — the `DXT1` records that are
-/// present in the corpus and whose framing was *measured not to fit* either
-/// rule, plus anything unrecognised. The refusal names both decoded formats so
-/// the message says what was available.
+/// The set is now the formats nobody has measured, which after the 2026-10-04
+/// re-measurement is **none of the corpus**. That is the point: the refusal names
+/// what *is* decoded, so a log line says what was available.
 #[test]
 fn an_unsupported_fourcc_is_refused_by_name() {
-    for fourcc in [
-        0x3154_5844u32, // 'DXT1': 306 records in Spore_Content.package
-        0x1500_0000,    // the byte-swapped spelling of 0x15, which is not it
-        0x3554_5843,    // 'DXT3'
-        0,
-    ] {
-        let mut bytes = record();
-        bytes[0x14..0x18].copy_from_slice(&fourcc.to_le_bytes());
-        assert_eq!(
-            decode_raster(&bytes).expect_err("only DXT5 and 0x15 are decoded"),
-            TextureError::UnsupportedFourcc { fourcc },
-            "fourcc 0x{fourcc:08X}"
-        );
-    }
-}
-
-/// `0x15` is no longer a refusal, so the old "refuse the luminance family" test
-/// has become "the DXT5 body's bytes are not a `0x15` record": the same input
-/// now fails with the framing error instead of the format error, and it is worth
-/// pinning that the two errors are genuinely different rather than the same
-/// refusal under a new name.
-#[test]
-fn the_dxt5_body_is_not_a_luminance_record_and_says_so() {
     let mut bytes = record();
-    bytes[0x14..0x18].copy_from_slice(&0x0000_0015u32.to_le_bytes());
-    // 8x8 with 2 mips would be 28 + 256 + 4 + 64 = 352 bytes; the record is 144.
-    assert_eq!(
-        decode_raster(&bytes).expect_err("the framing does not close"),
-        TextureError::LuminanceRecordSize {
-            record_size: 144,
-            expected: 352,
-            width: SYNTHETIC_WIDTH,
-            height: SYNTHETIC_HEIGHT,
-            mip_count: SYNTHETIC_MIPS,
-        }
+    bytes[0x14..0x18].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+    let error = decode_raster(&bytes).unwrap_err();
+    let text = error.to_string();
+    assert!(text.contains("0x12345678"), "{text}");
+    assert!(text.contains("0x35545844"), "{text}: DXT5 must be named");
+    assert!(text.contains("0x31545844"), "{text}: DXT1 must be named");
+    assert!(
+        text.contains("0x00000015"),
+        "{text}: the 0x15 family must be named"
     );
 }
 
 /// A zero dimension is refused before any allocation, and named.
 #[test]
 fn a_zero_dimension_is_refused() {
-    for (width, height) in [(0u32, SYNTHETIC_HEIGHT), (SYNTHETIC_WIDTH, 0), (0, 0)] {
+    for (width, height) in [(0u32, 4u32), (4, 0), (0, 0)] {
         let mut bytes = record();
         bytes[0x04..0x08].copy_from_slice(&width.to_le_bytes());
-        bytes[0x08..0x0C].copy_from_slice(&height.to_le_bytes());
+        bytes[0x08..0x0c].copy_from_slice(&height.to_le_bytes());
         assert_eq!(
-            decode_raster(&bytes).expect_err("a zero-sized image is refused"),
-            TextureError::ZeroDimension { width, height }
-        );
-        let parsed = parse_envelope(&bytes).expect("structure only");
-        assert_eq!(
-            layer_count_for(bytes.len(), &parsed),
+            decode_raster(&bytes),
             Err(TextureError::ZeroDimension { width, height })
         );
     }
 }
 
-/// `mip_count == 0` is refused: a zero-length chain would make the layer stride
-/// 16 bytes and quietly accept a record whose real content is something else.
+/// `mip_count == 0` is refused: a zero-length chain would make the framing
+/// identity vacuously true and accept a record whose content is something else.
 #[test]
 fn a_zero_mip_count_is_refused() {
     let mut bytes = record();
-    bytes[0x0C..0x10].copy_from_slice(&0u32.to_le_bytes());
+    bytes[0x0c..0x10].copy_from_slice(&0u32.to_le_bytes());
+    assert_eq!(decode_raster(&bytes), Err(TextureError::ZeroMipCount));
+    assert_eq!(layer_count_for(bytes.len(), &envelope()), Ok(1));
     assert_eq!(
-        decode_raster(&bytes).expect_err("no base level"),
-        TextureError::ZeroMipCount
-    );
-    let parsed = parse_envelope(&bytes).expect("structure only");
-    assert_eq!(
-        layer_count_for(bytes.len(), &parsed),
+        layer_count_for(bytes.len(), &parse_envelope(&bytes).unwrap()),
         Err(TextureError::ZeroMipCount)
     );
 }
 
-/// A payload smaller than one layer is refused, with both numbers.
+/// A record shorter than the envelope is refused by `layer_count_for` too.
 #[test]
-fn a_payload_smaller_than_one_layer_is_refused() {
-    let bytes = record();
-    let parsed = parse_envelope(&bytes).expect("a full record has an envelope");
-    let per_layer = LAYER_HEADER_SIZE + 40;
-    for remaining in [0usize, 1, per_layer / 2, per_layer - 1] {
-        let size = ENVELOPE_SIZE + remaining;
-        assert_eq!(
-            layer_count_for(size, &parsed),
-            Err(TextureError::PayloadTooSmall {
-                available: remaining,
-                needed: per_layer
-            }),
-            "payload {remaining}"
-        );
-    }
-}
-
-/// A payload that does not divide by the layer stride is refused. This is the
-/// check that catches a wrong split rule, so it is tested from both sides.
-#[test]
-fn a_payload_that_does_not_divide_is_refused() {
-    let bytes = record();
-    let parsed = parse_envelope(&bytes).expect("a full record has an envelope");
-    let per_layer = LAYER_HEADER_SIZE + 40;
-    for extra in [1usize, 7, 16, per_layer - 1] {
-        let remaining = per_layer + extra;
-        assert_eq!(
-            layer_count_for(ENVELOPE_SIZE + remaining, &parsed),
-            Err(TextureError::PayloadNotMultiple {
-                available: remaining,
-                per: per_layer
-            }),
-            "payload {remaining}"
-        );
-    }
-    // A record with a trailing byte appended is exactly this case.
-    let mut padded = bytes.clone();
-    padded.push(0);
-    assert_eq!(
-        decode_raster(&padded).expect_err("a stray trailing byte breaks the split"),
-        TextureError::PayloadNotMultiple {
-            available: 113,
-            per: 56
-        }
-    );
-}
-
-/// A record smaller than the envelope cannot be split at all.
-#[test]
-fn layer_count_for_refuses_a_record_smaller_than_the_envelope() {
-    for record_size in 0..ENVELOPE_SIZE {
-        assert_eq!(
-            layer_count_for(record_size, &envelope()),
-            Err(TextureError::RecordShorterThanEnvelope { record_size }),
-            "record size {record_size}"
-        );
-    }
-}
-
-/// An absurd envelope is refused, and the refusal names the geometry rather than
-/// going on to slice.
-///
-/// A `u32::MAX` square needs a `2^63`-byte chain, so the payload of any realistic
-/// record size is smaller than one layer and `PayloadTooSmall` reports the
-/// impossible stride. On a 64-bit target `ChainSizeOverflow` sits behind that arm
-/// and is unreachable from `u32` arguments (the largest representable chain is
-/// `12_297_829_382_473_034_416`, below `usize::MAX`); it is the live arm on a
-/// 32-bit target, where the same call saturates. Its message is covered by
-/// `every_error_message_names_its_section`.
-#[test]
-fn an_absurd_envelope_is_refused_before_any_slicing() {
-    let huge = RasterEnvelope {
-        width: u32::MAX,
-        height: u32::MAX,
-        ..envelope()
-    };
-    let per_layer = (1usize << 63) + (1usize << 61) + 16;
-    assert_eq!(
-        layer_count_for(ENVELOPE_SIZE + 64, &huge),
-        Err(TextureError::PayloadTooSmall {
-            available: 64,
-            needed: per_layer
-        })
-    );
-}
-
-/// The per-mip slice bound is unreachable through `decode_raster` because the
-/// derived split gives each layer exactly its chain; the bound exists as the
-/// limit on that assumption, and the branch is exercised directly in the
-/// crate's own unit tests. What this test can assert is the property that makes
-/// it unreachable: every mip slice of a valid record lies inside the record.
-#[test]
-fn every_mip_slice_of_a_valid_record_lies_inside_the_record() {
-    let bytes = record();
-    let image = decode_raster(&bytes).expect("the synthetic record decodes");
-    let chain = 40usize;
-    for (layer_index, _) in image.layers.iter().enumerate() {
-        let mut cursor = ENVELOPE_SIZE + 2 * LAYER_HEADER_SIZE + layer_index * chain;
-        for mip in 0..SYNTHETIC_MIPS {
-            let size = match mip {
-                0 => 4 * 8,
-                _ => 8,
-            };
-            assert!(
-                cursor + size <= bytes.len(),
-                "layer {layer_index} mip {mip}"
-            );
-            cursor += size;
-        }
-        assert_eq!(
-            cursor,
-            ENVELOPE_SIZE + 2 * LAYER_HEADER_SIZE + (layer_index + 1) * chain,
-            "layer {layer_index}'s slices end at the next layer's start"
-        );
-    }
-    // The last layer's slices end exactly at the record end, which is what makes
-    // the out-of-record mip bound unreachable through this path.
-    for (layer_index, _) in image.layers.iter().enumerate() {
-        let mut cursor = ENVELOPE_SIZE + 2 * LAYER_HEADER_SIZE + layer_index * chain;
-        for mip in 0..SYNTHETIC_MIPS {
-            cursor += if mip == 0 { 4 * 8 } else { 8 };
-        }
-        if layer_index + 1 == image.layers.len() {
-            assert_eq!(cursor, bytes.len(), "the last layer ends at the record end");
-        }
-    }
-}
-
-/// The same envelope with one layer instead of two decodes to one layer: the
-/// count is derived from the record size, so it is a fact about the record and
-/// not a constant.
-///
-/// This is the case that a "read the layer count from the header" implementation
-/// cannot get right, because there is no such field.
-#[test]
-fn the_same_envelope_with_one_layer_derives_one_layer() {
-    let bytes = single_layer_record();
-    assert_eq!(bytes.len(), 88);
-    let parsed = parse_envelope(&bytes).expect("a full record has an envelope");
-    assert_eq!(
-        parsed,
-        envelope(),
-        "the envelope is byte-identical to the two-layer record"
-    );
-    assert_eq!(layer_count_for(bytes.len(), &parsed), Ok(1));
-
-    let image = decode_raster(&bytes).expect("one layer divides evenly");
-    assert_eq!(image.layers.len(), 1);
-    assert_eq!(image.layers[0].len(), 2);
-    assert_eq!(image.layers[0][0].pixels, expected_addressing_8x8());
-    assert_eq!(image.layers[0][1].pixels, expected_four_colour_ramp());
-}
-
-// ---------------------------------------------------------------------------
-// Truncation sweep
-// ---------------------------------------------------------------------------
-
-/// Every prefix of the synthetic record: `Ok` or `Err`, never a panic, and never
-/// an `Ok` that claims more layers or more mips than its bytes can hold.
-#[test]
-fn every_prefix_length_of_the_record_is_ok_or_err_and_never_panics() {
-    let bytes = record();
-    let mut ok_count = 0usize;
-    let mut err_count = 0usize;
-    for length in 0..=bytes.len() {
-        let prefix = &bytes[..length];
-        match decode_raster(prefix) {
-            Ok(image) => {
-                ok_count += 1;
-                assert!(
-                    !image.layers.is_empty(),
-                    "length {length}: a record with no layer"
-                );
-                for (layer_index, layer) in image.layers.iter().enumerate() {
-                    assert_eq!(layer.len() as u32, SYNTHETIC_MIPS, "length {length}");
-                    for mip in layer {
-                        assert_eq!(
-                            mip.pixels.len(),
-                            mip.width as usize * mip.height as usize * 4,
-                            "length {length}, layer {layer_index}"
-                        );
-                    }
-                }
-                // An `Ok` must mean the split consumed the record exactly.
-                assert_eq!(
-                    layer_count_for(length, &image.envelope),
-                    Ok(image.layers.len()),
-                    "length {length}"
-                );
-            }
-            Err(_) => err_count += 1,
-        }
-    }
-    assert!(
-        ok_count > 0 && err_count > 0,
-        "the sweep must see both outcomes"
-    );
-    assert_eq!(ok_count + err_count, bytes.len() + 1);
-}
-
-/// Every prefix of the envelope, fed to `layer_count_for` alongside a valid
-/// envelope: the same no-panic sweep for the derived-split entry point.
-#[test]
-fn every_record_size_against_a_valid_envelope_is_ok_or_err_and_never_panics() {
+fn layer_count_refuses_a_record_shorter_than_the_envelope() {
     let env = envelope();
-    for size in 0..=256usize {
-        let _ = layer_count_for(size, &env);
+    assert_eq!(
+        layer_count_for(8, &env),
+        Err(TextureError::RecordShorterThanEnvelope { record_size: 8 })
+    );
+}
+
+/// The corpus's own record sizes, restated as an assertion on the public API.
+///
+/// These seven numbers are the whole finding: each is a real raster record's
+/// length from `Spore_Content.package`, and `decode_raster`'s identity reproduces
+/// every one. They are duplicated from `framing`'s unit tests on purpose — those
+/// test the arithmetic, these test that the *decoder* agrees with it.
+#[test]
+fn the_corpus_record_sizes_are_reproduced_by_the_public_identity() {
+    for (fourcc, w, h, mips, size) in [
+        (DXT5_FOURCC, 512u32, 512u32, 10u32, 349_616usize),
+        (DXT5_FOURCC, 256, 256, 9, 87_468),
+        (DXT5_FOURCC, 64, 64, 7, 5_540),
+        (DXT1_FOURCC, 256, 256, 9, 43_764),
+        (LUMINANCE_FOURCC, 512, 512, 10, 1_398_164),
+        (LUMINANCE_FOURCC, 256, 256, 9, 349_584),
+        (LUMINANCE_FOURCC, 32, 32, 6, 5_508),
+    ] {
+        // An all-zero body of the right length: the identity is about framing,
+        // and this test is about the identity, so the pixels are irrelevant.
+        let mut bytes = vec![0u8; size];
+        bytes[0x00..0x04].copy_from_slice(&1u32.to_le_bytes());
+        bytes[0x04..0x08].copy_from_slice(&w.to_le_bytes());
+        bytes[0x08..0x0c].copy_from_slice(&h.to_le_bytes());
+        bytes[0x0c..0x10].copy_from_slice(&mips.to_le_bytes());
+        bytes[0x10..0x14].copy_from_slice(&8u32.to_le_bytes());
+        bytes[0x14..0x18].copy_from_slice(&fourcc.to_le_bytes());
+        let base: usize = if fourcc == LUMINANCE_FOURCC {
+            (w * h * 4) as usize
+        } else if fourcc == DXT1_FOURCC {
+            spore_texture::dxt1_mip_size(w, h, 0)
+        } else {
+            dxt5_mip_size(w, h, 0)
+        };
+        bytes[0x18..0x1c].copy_from_slice(&(base as u32).to_le_bytes());
+        // Write the level prefixes the identity expects, so the body is a real
+        // (blank) record rather than one that the prefix check must refuse.
+        let frame = spore_texture::frame_for(fourcc).expect("a frame");
+        for mip in 0..mips {
+            if mip >= frame.first_prefixed_level {
+                let at = spore_texture::framing::level_offset(frame, w, h, mip);
+                let level = spore_texture::framing::level_size(frame, w, h, mip);
+                bytes[at..at + 4].copy_from_slice(&(level as u32).to_le_bytes());
+            }
+        }
+        let env = parse_envelope(&bytes).expect("envelope");
+        assert_eq!(
+            layer_count_for(size, &env),
+            Ok(1),
+            "{fourcc:#010x} {w}x{h} mips={mips} size={size}"
+        );
+        // And the whole record decodes: a blank body is a valid (if empty) image.
+        let decoded = decode_raster(&bytes).expect("a blank body still decodes");
+        assert_eq!(decoded.layers.len(), 1);
+        assert_eq!(decoded.layers[0].len(), mips as usize);
     }
 }
 
-/// Every prefix of the first layer's payload, decoded as an mip: the block
-/// codec's own sweep, for every prefix length of a real block chain.
+/// The DXT5 chain and level sizes are the 16-byte ones, and the field is the base
+/// level's byte count.
 #[test]
-fn every_prefix_of_a_real_block_chain_is_ok_or_err_and_never_panics() {
-    let bytes = record();
-    let chain_start = ENVELOPE_SIZE + 2 * LAYER_HEADER_SIZE;
-    let chain = &bytes[chain_start..chain_start + 32];
-    for length in 0..=chain.len() {
-        let _ = spore_texture::decode_dxt5_mip(&chain[..length], 8, 8);
-    }
+fn the_block_stride_is_sixteen_bytes_and_field_18_is_the_base_level() {
+    // 512x512: 16384 blocks of 16 = 262144, which is field_18 on every real
+    // 512x512 DXT5 record. The old 8-byte reading gave 131072 and the crate
+    // therefore read "two base levels".
+    assert_eq!(dxt5_mip_size(512, 512, 0), 262_144);
+    assert_eq!(dxt5_chain_size(512, 512, 10), 349_552);
+    // 256x256: 4096 blocks of 16 = 65536.
+    assert_eq!(dxt5_mip_size(256, 256, 0), 65_536);
+    assert_eq!(dxt5_chain_size(256, 256, 9), 87_408);
+    // 64x64: 256 blocks of 16 = 4096.
+    assert_eq!(dxt5_mip_size(64, 64, 0), 4_096);
+    assert_eq!(dxt5_chain_size(64, 64, 7), 5_488);
+    // And the 0x15 family's identity is its own.
+    assert_eq!(luminance_record_size(32, 32, 6), 5_508);
+    assert_eq!(luminance_record_size(256, 256, 9), 349_584);
+    assert_eq!(luminance_record_size(512, 512, 10), 1_398_164);
 }
 
-/// The record type id is the raster type, and the fourcc is the DXT5 one: the
-/// two ids must not be confused for each other.
+/// `mip_dimension` is the shared rule every format derives levels with.
 #[test]
-fn the_record_type_and_the_fourcc_are_different_identities() {
-    assert_eq!(RASTER_TYPE, 0x2F4E_681C);
-    assert_eq!(DXT5_FOURCC, 0x3554_5844);
-    assert_ne!(RASTER_TYPE, DXT5_FOURCC);
+fn the_level_dimension_is_the_shared_rule() {
+    assert_eq!(mip_dimension(256, 0), 256);
+    assert_eq!(mip_dimension(256, 8), 1);
+    assert_eq!(mip_dimension(256, 9), 1);
+    assert_eq!(mip_dimension(3, 1), 1);
 }
