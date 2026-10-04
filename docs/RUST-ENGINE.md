@@ -38,14 +38,21 @@ ends at pixels:
         |                         |
    spore-engine               spore-tools  ->  osptool
    (Bevy)                     (no Bevy)
+
+                spore-core
+                     |
+            spore-creator-core    the authoring model: <sporemodel> documents,
+                     ^             part blocks, transforms, paint, validation
+                     |
+             (projection lives in spore-engine, never here)
 ```
 
 > **The rule: everything above `loader` is renderer-agnostic and Bevy-free.**
 
 `spore-dbpf`, `spore-rw4`, `spore-gmdl`, `spore-texture`, `spore-core`,
-`spore-assets`, `spore-material` and `spore-tools` have **no `bevy`
-dependency at all**. You can confirm it by reading their `Cargo.toml` — none of
-the eight lists one. They speak in `spore_gmdl::Mesh` and
+`spore-assets`, `spore-material`, `spore-creator-core` and `spore-tools` have
+**no `bevy` dependency at all**. You can confirm it by reading their
+`Cargo.toml` — none of the nine lists one. They speak in `spore_gmdl::Mesh` and
 `spore_texture::RasterImage`, never in Bevy assets, components or GPU handles.
 
 That is not tidiness; it is what makes the asset layer testable. `spore-assets`
@@ -82,6 +89,7 @@ exception path carry the weaker form on purpose:
 | `spore-material` | What a gmdl material id names — and what this build does not know. The narrowest crate in the workspace. |
 | `spore-engine` | The runtime: a Bevy application that loads and renders real Spore assets. |
 | `spore-tools` | `osptool`, an offline inspector. Library-first, binary-as-shim, so every command is drivable from a test with an in-memory sink. |
+| `spore-creator-core` | The authoring core: Spore's own `<sporemodel>` creator documents (68 of them, six record families), decoded into plain Rust. Depends on `spore-core` and nothing else. See `docs/CREATOR-CORE.md`. |
 
 ---
 

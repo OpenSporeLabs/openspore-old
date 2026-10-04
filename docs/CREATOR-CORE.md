@@ -1,13 +1,16 @@
 # Creator Core — architecture
 
-**Status:** design agreed with the corpus, implementation starting.
+**Status:** design reviewed and corrected, implementation starting.
 **Scope:** the reusable authoring/construction core, plus Creature Creator as its
 first client. Not an editor UI.
 
 This document is the synthesis of six independent investigations plus a direct
-census of the real data. Every structural claim below is either measured here or
-cited to a report in `docs/analysis/creator/`. Where the corpus is silent, the
-document says so and the data model preserves the silence.
+census of the real data, **reviewed adversarially** in
+`docs/analysis/creator/07-architecture-review.md` (30 spot checks, 22 reproduced,
+8 wrong — including a table in §0 whose hex ids matched no record in the tree;
+all corrected in place and marked). Every structural claim below is either
+measured here or cited to a report in `docs/analysis/creator/`. Where the corpus
+is silent, the document says so and the data model preserves the silence.
 
 ---
 
@@ -16,17 +19,22 @@ document says so and the data model preserves the silence.
 **Spore's creator document is not hypothetical. It is in the game data, and it
 is text.**
 
-`Spore_Game.package` holds **68 creator documents** — verified by direct census
-of the DBPF index, not inferred:
+`Spore_Game.package` holds **68 creator documents** (and `PatchData.package`
+carries the same 68 again, so **134 records in the install**) — verified by
+direct census of the DBPF index, not inferred:
 
 | type id | name | count | group | what it is |
 |---|---|---|---|---|
-| `0x02B92A46` | `crt` | 47 | `0x40626200` | creature |
-| `0x0AC5D2DC` | `cll` | 13 | `0x40616200` | cell |
-| `0x246C29D4` | `vcl` | 4 | `0x40646200` | vehicle |
-| `0x47764BB7` | `ufo` | 2 | `0x40656200` | UFO (a vehicle-family document) |
-| `0x238BC675` | `bld` | 1 | `0x40636200` | building |
-| `0x43854287` | `flr` | 1 | `0x40666200` | flora |
+| `0x2B978C46` | `crt` | 47 | `0x40626200` | creature |
+| `0x3D97A8E4` | `cll` | 13 | `0x40616200` | cell |
+| `0x24682294` | `vcl` | 4 | `0x40646200` | vehicle |
+| `0x476A98C7` | `ufo` | 2 | `0x40656200` | UFO (a vehicle-family document) |
+| `0x2399BE55` | `bld` | 1 | `0x40636200` | building |
+| `0x438F6347` | `flr` | 1 | `0x40666200` | flora |
+
+> Corrected after review: the first draft of this table carried hand-converted
+> hex that matched **no record in the tree**. The ids above are the ones the
+> index actually holds (`docs/analysis/creator/07-architecture-review.md` §1).
 
 All 68 are XML with root `<sporemodel>`, and **all 68 parse cleanly** with a
 stock XML parser. They carry **680 `<blockref>` part instances** in total.
@@ -86,13 +94,19 @@ Censused over all 68 documents. Counts are element occurrences, not documents.
 
 | element | occurrences | notes |
 |---|---|---|
-| `formatversion` | 68 | `11` ×1, `15` ×19, `16` ×58. **A version gate, not a schema.** |
+| `formatversion` | 68 | `11` ×1, `15` ×8, `16` ×59. **A label, not a schema** — see below. |
 | `properties` | 68 | see below |
 | `blocks@count` | 68 | attribute equals the real child count in all 68 |
 
 `properties` children: `modeltype` 68, `requiredpack` 66, `skineffect1..3` 61,
 `skineffectseed1..3` 61, `skincolor1..3` 61, `zcorpscore` 59, `name` 9,
 `description` 9, `hasthumbnail` 1, `cacheid` 1.
+
+**`formatversion` does not gate fields.** It was the obvious candidate for a
+version gate and the corpus refutes it: `v16` spans two presence classes
+(`handles` present in some blocks and not others) and `v15` spans two. Every
+field is therefore `Option`, keyed on its own presence and nothing else. Do not
+write `if version >= 16 { … }`.
 
 > **Trap, already live.** `modeltype` is written **both ways in the same
 > corpus**: `<modeltype>0x9ea3031a</modeltype>` and
@@ -115,6 +129,16 @@ Censused over all 68 documents. Counts are element occurrences, not documents.
 | `handles` | 119 | `weight@channel` entries, 252 total |
 | `userorientation` | 11 | `vcl` only, inside `transform` |
 | `blockbbox` | 10 | the `formatversion 11` document only, inside `transform` |
+| `limbtype` | 5 | inside `<transform>`, `crt` + `flr` only — see below |
+| `musclescale` | 5 | inside `<transform>`, `crt` + `flr` only |
+| `basemusclescale` | 8 | inside `<transform>`, `crt` + `flr` only |
+
+The last three were **missed by the first census** and by two of the six
+reports: they are in the corpus, they are `crt`+`flr` only, and a model that
+omits them silently drops 18 facts. A parent→child census over all 68 documents
+also places them inside `<transform>`, **not** inside `<blockref>` — the first
+draft of this table had them one level too high. Semantics UNKNOWN (a
+limb/socket classification and two scalars); preserved as opaque values.
 
 **The graph is measured, not assumed.** `childid` is an index into the same
 document's block list. 601 edges, 0 dangling, 0 self-edges, 0 cycles, max
@@ -123,13 +147,21 @@ in-degree 1 → a **forest**: 79 roots over 68 documents (62 single-root, 4×2,
 
 - There is **no single root field.** A `root: BlockIndex` would be wrong for 9%
   of the corpus. Roots are derived: *a block no other block lists as a child*.
-- `childlist` order in the corpus is **descending** (`8,7,6,4,3,2,1`). Order is
-  presentation, not topology; we preserve it as written and never sort it.
+  This is a **method, not a struct field** — storing it would be a second source
+  of truth by construction.
+- `<childlist>` order is **not** meaningfully descending: 507 of the 520 lists
+  hold exactly one entry, so the apparent descending order in the samples is an
+  artefact of the few multi-entry lists. We preserve written order and never
+  sort it, and we make no claim about it.
 - **160 leaves carry no `<childlist>` element at all.** `Option<Vec<BlockIndex>>`
   where `None` = "not written" and `Some(vec![])` = "written empty". Collapsing
   them destroys 160 facts. (`05-serialization.md` makes the same point
   independently and calls the test
   `a_leaf_writes_no_children_key_and_an_empty_list_writes_an_empty_array`.)
+- **`<symmetric>` is reciprocal in 84 of 84 relations**, and 76 of the 84 sit on
+  leaves. It is a partner index, and it is stored on *both* sides — so a
+  document that recorded it on one side only would be a different, unobserved
+  state. Preserve both and validate reciprocity as a check, not a rewrite.
 
 ### 1.3 Transform
 
@@ -150,6 +182,14 @@ blocks of the one `formatversion 11` document — a version-linked absence, so
   *runtime* orientation is a quaternion; the save format is a matrix. We store
   the matrix and never a second representation (quaternion→matrix is lossy at
   1.131e-06, i.e. exactly at this repo's existing 1e-6 differential tolerance).
+- How many blocks carry a *general* orientation is **tolerance-dependent and
+  must not be quoted as a single number**: 92 at the tolerance
+  `03-transforms.md` used, **140 at this repo's 1e-6**, 188 comparing the text
+  as written. The first draft of this document quoted 92 flatly; that was
+  wrong. What survives every tolerance is the qualitative fact: a general
+  rotation is **not** expressible in the engine's current `rotation_y_degrees`,
+  and all *roots* are identity-or-pure-Y (though that too fails at 1e-6 on one
+  root, by 1.0e-06 — so treat "roots are simple" as a tendency, not a law).
 - `triangledirection` / `trianglepickorigin` — picking aids. `triangledirection`
   is present in all 680. **They disagree with `orientation` in 102 of 680
   blocks**, so they are three separate facts and must stay three separate
@@ -158,6 +198,28 @@ blocks of the one `formatversion 11` document — a version-linked absence, so
   (`0xd02751de` ×85, `0x2e6521f4` ×56, `0x7cc96c02` ×46, …). A named-channel
   weight vector, addressed by an opaque word. **What the channels mean is
   UNKNOWN**; the channel word is an opaque key, not an enum we may name.
+
+> **Integration point, in flight elsewhere — and a collision.** Two things landed
+> in `spore-assets` while this document was written, commit `5449fe3`
+> "assets: where a Spore creature's colour actually is":
+>
+> * `crates/spore-assets/src/color.rs` **decodes the colour-bearing fields of
+>   the same `<sporemodel>` grammar this crate decodes in full**. That is two
+>   implementations of one record, which is the failure mode
+>   `docs/ASSET-PATH.md`'s cross-cutting rule exists to prevent. It is not a
+>   merge conflict; it is a design duplication, and it is worse because both
+>   sides are correct today and will diverge on the next grammar change.
+>   **Recommended resolution:** `spore-creator-core` becomes the single owner of
+>   the document grammar, and `spore-assets::color` is re-expressed as a
+>   projection over [`crate::document`] types (the dependency direction is
+>   acyclic: `spore-assets` → `spore-creator-core` → `spore-core`). Not done
+>   unilaterally — the other workstream owns that file and the decision is the
+>   maintainer's.
+> * `docs/COLOUR-SOURCES.md` and the shipped creature skin shader raise the
+>   evidence on §1.4 from INFERRED to OBSERVED for the *mechanism*, and settle
+>   the record count at **134** rather than 68: `Spore_Game.package` and
+>   `PatchData.package` both carry the 68 documents (67 shared by identity, with
+>   `cll`/`ufo`/`vcl` instances differing under the patch).
 
 ### 1.4 Paint — real, in-document, and creature-free
 
@@ -179,16 +241,25 @@ the corpus rather than out of a design:
   material id per record, `ModelDefinition.materials` hanging off the record)
   is real but it is a *projection* problem, not a reason to keep paint out of
   the document. Paint belongs in the document because the game puts it there.
-- `paintregion` — small hex words, ~15 distinct values across the corpus
-  (`0x01`, `0x04`…`0x09`, `0x10`, `0x11`, `0x13`, `0x20`, `0x21`). A region
+- **195 `<paint>` entries** corpus-wide: `bld` 20, `ufo` 35, `vcl` 140.
+- `paintregion` — small hex words, **23 distinct values** across the corpus
+  (`0x01`, `0x04`…`0x09`, `0x10`, `0x11`, `0x13`, `0x20`, `0x21`, …). A region
   index or mask. **Meaning UNKNOWN.**
 - `paintid` — an opaque word; only **6 distinct values** corpus-wide
   (`0xf5967f30` ×175 dominant). Looks like a swatch/pattern id.
-  **Meaning UNKNOWN**, and `plt` records number **0 in all 7 packages**, so
-  there is no palette record to join against.
-- `color1`/`color2` are **two** RGB triples per region. Two colours per region
-  is consistent with a two-layer skin (`skineffect1..3` in `properties`), but
-  that is **INFERRED**; we store both, named by position, and claim nothing.
+  **Meaning UNKNOWN**, and `plt` records number **0 in all 14 packages** scanned,
+  so there is no palette record to join against.
+- `color1`/`color2` are **two** RGB triples per region. **OBSERVED, and the
+  mechanism is settled**: the creature skin shader ships as readable source in
+  the `smt` record type (`0x0469A3F7`) and consumes
+  `struct { float4 mColor1; float4 mColor2; float4 mParams; } editorColors`,
+  lerping `mColor1.rgb` over the diffuse by `mColor1.a` and `mColor2.rgb` by
+  `mColor2.a * diffuseTexture.a`. So **the raster supplies WHERE each colour
+  goes and the record supplies WHAT the colours are** — which is why the texture
+  path alone renders every creature uniform grey, and it is not a texture bug.
+  Two open pieces survive: the shader's **fourth** component has no XML field
+  (the document writes three), and `docs/COLOUR-SOURCES.md` keeps
+  `paintregion` bits and `paintid` resolution as `Fact::unavailable`.
 - **`crt` documents contain zero `paintlist`.** Creature appearance lives in
   `skincolor1..3` + `skineffect1..3` + `skineffectseed1..3` at document level,
   and per-part variation is therefore **UNKNOWN** for creatures. This is a real
@@ -196,43 +267,83 @@ the corpus rather than out of a design:
   the clearest example on the corpus of why the shared core must model
   *absences* rather than assume one shape.
 
-### 1.5 Part identity, and the resolver that does not resolve yet
+### 1.5 Part identity, and the resolver — **SOLVED after review**
 
-`blockid` is `group, instance` — no type. Measured across the corpus, those
-pairs name records of exactly one type, **`0x5CAA5E28`**, in `Spore_Game`:
+`blockid` is `group, instance` — no type. Those pairs name records of exactly
+one type, **`0x5CAA5E28`**, in `Spore_Game`: 1549 records in 8 distinct sizes
+(`36` ×212, `48` ×330, `84` ×465, `228` ×369, `804` ×128, `3108` ×37, `12324`
+×7, `49188` ×1) across group families `0x40616000` cell 58, `0x40626000`
+creature 482, `0x40636000` building 224, `0x40646000` vehicle 540, `0x40666000`
+flora 107, `0x40686000` unknown 138.
 
-- 1549 such records; group families `0x40616000` cell 58, `0x40626000` creature
-  482, `0x40636000` building 224, `0x40646000` vehicle 540, `0x40666000` flora
-  107, `0x40686000` unknown 138.
-- The `blockid` groups actually used by the 68 documents: `0x40626000` ×487,
-  `0x40646000` ×104, `0x40616000` ×79, `0x40636000` ×8, `0x40666000` ×2.
-- **0 of 60 distinct `blockid`s name a `gmdl`.** The chain is
-  `blockid → 0x5CAA5E28 record → (encoded tail) → gmdl`, and the tail is not
-  decoded.
+**The record is not a model reference, and my first reading of it was wrong.**
+`08-rigblock-tail.md` resolved it: the layout is `size = 36 + 12·4^k`,
+`k ∈ 0..7`, verified on 1549/1549. It is a **quantised spatial subdivision of a
+bounding box** —
 
-I sampled that record myself. It is **not** a fixed 36 bytes: sizes range 36 →
-8631, with a distinct shape per part kind. The 36-byte minimum is
-`6 floats + 12 zero bytes` — a plausible AABB plus an empty tail. Larger records
-carry what is plainly a **compact encoding**: repeated `0x10`/`0x20`…`0xf0`
-high-nibble rows crossed with `0x11`…`0x55` low-nibble columns, then sparse
-`15 00 00 1a 00 00 1f 00 00` triples. That is nibble-packed structured data, not
-a plain field table. **Decoding it is a research project of its own and this
-document does not pretend otherwise.**
+- `float[0..2]` = component-wise **MAX** of the per-cell low corners,
+- `float[3..5]` = component-wise **MIN** of the per-cell high corners,
+- `float[6]` = the quantisation step `s`,
+- `u8[0x1c..0x24]` = `4` for `i < k` else `0`,
+- then `4^k` cells × 3 bytes, `byte_j = (qLow[j] << 4) | qHigh[j]`,
+  distances to the record's global extremes **in units of `s`**;
+  `cellLow = f32[j] − qLow·s`, `cellHigh = f32[3+j] + qHigh·s`.
 
-**Therefore:** `blockid → geometry` is modelled as a **failable resolver**, not a
-conversion:
+Field order was proved by falsification: the wrong axis order yields **234 428**
+violations over 444 264 axis tests, the writer's own mapping yields **0**, and
+`min(qLow) == 0` and `min(qHigh) == 0` on all three axes in **1337/1337**
+records. The writers are `FUN_0041aaa0` (write) and `FUN_0041c1d0` (bake into
+`Editors_BlockData.package` as `BlockData/0x%08x!0x%08x.blockdata`), with
+`param_1[i+5] = 4` the hardcoded source of both the `4^k` scaling and the `0x04`
+header bytes. **Caution:** Ghidra inverted two of the four leaf helpers —
+`FUN_0041bfb0` is MAX and `FUN_0041c0c0` is MIN; the wrong version is
+self-consistent and yields a negative scale.
+
+So the mesh link is **not** in this record. Four hypotheses were tested and the
+answer is elsewhere:
+
+| hypothesis | verdict |
+|---|---|
+| (a) bbox pairing, sorted-order correspondence | **REFUTED** — 0 matches over 1 169 644 family-matched pairs; nearest residuals 0.24–4.3, no cluster |
+| (b) arithmetic relation between rigblock and gmdl ids | **REFUTED** — best modular agreement 234/482 and 264/540, both *below* chance; instance-id intersection 0 |
+| (c) the `prop` (`0x00B1B104`) at the rigblock's own key | **not a gmdl map** — it exists for 1531 of the ids and 0/1531 contain a gmdl type word |
+| (d) a record that carries both a family group word and a gmdl type word | **HIT — and it is the link** |
+
+**The real chain, SUPPORTED:**
+
+```text
+blockid (group, instance)
+  → prop 0x00B1B104 @ the SAME (group, instance)     1531/1549 present
+    → { instance = self, type = 0x2F4E681B, group = 0x40606000 }
+      → group 0x40606000 holds 1824 × 0x01C135DA (skinned mesh: float3 vertex
+        stream + bone block) and 1824 × 0x2F4E681B, identical id sets
+        → 1316 / 1549 rigblock ids have a mesh counterpart
+```
+
+Method note worth keeping: the extraction form
+`{instance, type, group, 0x00A00CE4}` was **validated first** against
+`prop` @ `0x40626200`, where 97 records yielded 388 gmdl keys and **388/388
+resolved** against the real `Spore_Content.package` index — a positive control
+before trusting it anywhere else.
+
+Open on this chain: level→parameter semantics, `0x01C135DA`'s vertex layout,
+`0x2F4E681B`'s identity, the **233 rigblocks with no mesh counterpart**, and
+flora as a category (107 flora rigblocks, **0** `0x40606000` counterparts). A
+single Wine trace of one known `blockid` would settle the whole chain.
+
+So the resolver stays a **failable** value, not a conversion — but it is now a
+resolver with a measured mechanism and a measured coverage:
 
 ```text
 Resolved(ResourceKey) | Ambiguous(Vec<ResourceKey>) | Unavailable { reason }
 ```
 
-`Unavailable` carries a reason from a closed vocabulary. It is never a zero, an
-empty list, or `false`. A block that does not resolve is **reported next to**
-the composed result, never dropped — the same policy `spore_assets::graph`
-already applies to a dangling edge.
-
-This is the one hard blocker on "assemble creature → render", and it is named
-rather than papered over. See §6.
+`Unavailable` carries a reason from a closed vocabulary, is never a zero, an
+empty list, or `false`, and a block that does not resolve is **reported next to**
+the composed result, never dropped — the policy `spore_assets::graph` already
+applies to a dangling edge. **Not invented binary formats, no fabricated
+attachment rules**: the two remaining decode targets (`0x01C135DA` skinned mesh,
+`0x2F4E681B`) are *existing* record types to be read, not formats to be made up.
 
 ---
 
@@ -244,7 +355,7 @@ rather than papered over. See §6.
 | block transform `(Vec3, Matrix3, f32)` | **SHARED, CONFIRMED** | present in all 680 blocks of all 6 families |
 | parent/child forest | **SHARED, CONFIRMED** | `childid` index in all 6 families |
 | symmetry as a *partner index* | **SHARED, OBSERVED** | `<symmetric>` 84 (cll/crt/ufo/vcl); `mpSymmetricRigblock`/`mpAsymmetricRigblock` + `isAsymmetric` in the binary |
-| paint regions + colours | **PARTIAL** | `bld`/`ufo`/`vcl` yes; `crt` **no**. Creature appearance is document-level `skincolor*` instead. |
+| paint regions + colours | **PARTIAL** | `bld`/`ufo`/`vcl` yes (195 `<paint>` entries); `crt` **no**. Creature appearance is document-level `skincolor1..3` instead — and the shipped skin shader reads both through one `editorColors` struct, so the *mechanism* is shared even though the *placement* is not. |
 | handles / named weight channels | **SHARED, OBSERVED** | 119 blocks, 14 opaque channel words |
 | snapping, sockets, magnet rules | **NOT IN ANY DOCUMENT** | nine `fixed_vector<ResourceKey,8>` snap/align/interact lists exist in `Editors::EditorRigblock` in **code only**; **zero bytes** in the corpus. UNKNOWN. |
 | editor *behaviour*, undo policy, UI | **NOT DEMONSTRABLE** | 469 `/Spore/Editors/*` types, zero mention of vehicle/building/UFO |
@@ -253,6 +364,13 @@ rather than papered over. See §6.
 
 The rule that follows: **the core models what all six families do, and gives
 every family-specific fact a place to live without pretending it is shared.**
+
+The correct framing of the shared/separate verdict — the review's wording, which
+is better than the first draft's "data vs behaviour" — is **"what the corpus can
+read"**: the document grammar is legible and identical across all six families,
+while editor *behaviour* is compiled into code that no symbol in the binary
+connects to more than one domain. That is the boundary the Creator Core sits on,
+and it survived four separate attempts to refute it.
 
 ---
 
@@ -300,15 +418,28 @@ Options considered:
   `domain/scene.rs:223-229`, `loader.rs:99-102/598-602`) with all of them
   passing unchanged.
 - *a sibling `BlockPlacement` type* — also viable; `01-domain-model.md`
-  prefers it because `Placement { … }` struct literals exist and a new field
-  would touch four call sites.
+  prefers it because `Placement { … }` literals exist.
 
-**Chosen: additive optional fields on `Placement`** (`rotation: Option<Row3> →
-matrix`, `pivot`, `mirror: Option<Symmetry>`), because one placement type
-means the engine's scene path and the creator's compose path cannot drift, and
-because `Default` stays identity so every existing literal keeps compiling.
-`rotation_y_degrees` is retained and stays authoritative when `rotation` is
-`None` — the engine's own convention, not a second answer.
+**Chosen: additive optional fields on `Placement`** (`rotation: Option<Row3>`,
+`pivot`, `mirror: Option<Symmetry>`), because one placement type means the
+engine's scene path and the creator's compose path cannot drift. The review
+found the decisive fact that settles it: **all four `Placement { … }` literals
+use `..Placement::default()`**, so adding a field touches **zero** call sites,
+`Default` stays identity, and every existing read compiles.
+
+**And it must not become a second answer inside `Placement`.** `loader.rs` reads
+`rotation_y_degrees` unconditionally, so `rotation: Some(m)` alongside a
+non-zero legacy value would silently render the legacy value. Two guards are
+mandatory, both from `03-transforms.md`, and the first draft of this document
+dropped them:
+
+- an `is_legacy_expressible()` predicate — false when a general `rotation` is
+  present;
+- an `effective_rotation_y_degrees()` accessor — so exactly **one** field is
+  authoritative for any given placement and the other is provably unused.
+
+`rotation_y_degrees` is retained for the engine's own convention; `rotation` is
+additive and wins whenever present. Never both.
 
 ---
 
@@ -323,7 +454,7 @@ CreatorDocument
   properties:     DocumentProperties     model_type, name, description, skin effects/colours/seeds,
                                             required_pack, zcorp_score, has_thumbnail, cache_id
   blocks:         Vec<Block>             ORDER IS the childid index space
-  roots:          Vec<BlockIndex>        derived, never stored
+  // roots is a METHOD over `blocks`, never a field
 
 Block
   block_id:  BlockId                     (group, instance) of the rigblock record
@@ -333,6 +464,7 @@ Block
   symmetric: Option<BlockIndex>          mirror partner index
   paint:     Option<Vec<PaintRegion>>    absent in all 47 crt documents
   handles:   Option<Vec<ChannelWeight>>  opaque channel word + f32
+  limb:      Option<Limb>                limbtype/musclescale/basemusclescale, crt+flr only
   user_orientation: Option<Row3>          vcl only
   bbox:      Option<(Vec3, Vec3)>        formatversion 11 only
 
@@ -341,7 +473,15 @@ BlockTransform
   triangle_direction: Option<Vec3>, triangle_pick_origin: Option<Vec3>
 ```
 
-Two decisions worth defending:
+Every value that carries an evidence grade in the corpus is stored with its
+grade, so a later finding raises the grade instead of changing the bytes:
+
+```text
+Claim<T>  = { value: T, evidence: EvidenceLevel }      // VERIFIED … UNKNOWN
+Claim<Unset> = absent                                   // "not written"
+```
+
+Three decisions worth defending:
 
 - **`blocks: Vec<Block>` and "block order IS the index space."** The corpus
   addresses blocks positionally. A `BTreeMap<BlockId, Block>` would be a second
@@ -392,59 +532,65 @@ Adopted from `05-serialization.md`, which corrected two of my premises:
 
 ---
 
-## 6. The one real blocker, named
-
-`assemble → render` needs a mesh per block. Today:
+## 6. Status of the vertical slice
 
 ```text
-blockid (group, instance)
-  → 0x5CAA5E28 record            RESOLVED, 1549 records, 6 families
-    → encoded tail               UNKNOWN — nibble-packed, sizes 36…8631
-      → gmdl ResourceKey         UNREACHED
+blockid → rigblock 0x5CAA5E28                     RESOLVED (bounding subdivision)
+       → prop 0x00B1B104 @ same key                RESOLVED (1531/1549)
+       → 0x2F4E681B / 0x01C135DA @ 0x40606000      RESOLVED as a reference (1316/1549)
+       → skinned mesh vertices + bones              NOT DECODED  ← the remaining work
 ```
 
-Consequences for the first vertical slice, stated plainly:
+So the authoring loop is buildable now and the render path is one decode away:
 
-1. **The authoring loop is buildable now.** Catalog the 68 real documents, parse
-   them, compose the forest, compute world transforms, save, load, verify
-   equality. All of that is corpus-verified and needs no rigblock decode.
-2. **Rendering a block needs the resolver.** Until the tail is decoded, a
+1. **Buildable now.** Catalog the 68 real documents, parse them, compose the
+   forest, compute world transforms, save, load, verify equality. All
+   corpus-verified, no rigblock decode required.
+2. **One decode away.** Rendering a block needs `0x01C135DA` (skinned mesh:
+   float3 vertex stream + bone block) and `0x2F4E681B`. Both are **existing
+   record types to be read**, in the spirit of the 77 promoted `pkg_*` model
+   tests — graded against the 1824 real records, not invented. Until then a
    composed creature renders as *resolved blocks + an explicit unresolved
    report*, never as a silently missing part and never as a placeholder mesh
    pretending to be a body part.
-3. **The rigblock tail is the next research target**, and it is worth a dedicated
-   package in the existing `src/reconstruction/pkg_*` style: a bounded,
-   test-fixtured decoder for `0x5CAA5E28`, graded against the 1549 real records,
-   in the spirit of the 77 promoted model tests. It is deliberately *not* part
-   of the Creator Core — the core must be correct while this is unknown.
+3. **Known coverage gaps to report, not hide:** 233 rigblocks with no mesh
+   counterpart, and flora at 0/107.
 
-Note for the reviewer: `target/release/osptool` predates the uncommitted
+Note for the reader: `target/release/osptool` predates the uncommitted
 `spore-tools` source and has no `stats`/`graph`/`texture` subcommands. Figures
-above come from the committed Python oracle
-(`tools/spore/dbpf/dbpf.py`) and from my own XML/DBPF census, not from that
-stale binary.
+above come from the committed Python oracle (`tools/spore/dbpf/dbpf.py`), from
+my own XML/DBPF census, and from the cited reports — not from that stale binary.
+One further correction from the review: `AGENTS.md`'s `~/apps/Spore-ModAPI` path
+does not exist on this machine.
 
 ---
 
 ## 7. Build order
 
+Reordered by the review: the **resolver precedes the engine projection**,
+because projecting two empty scenes into each other proves nothing.
+
 | # | Deliverable | Gate |
 |---|---|---|
+| 0 | `spore-json`: the in-tree JSON writer + strict reader **lifted** out of `spore-tools` / `spore-semantic-bridge` | one extraction, not a fourth implementation; the two existing users keep their byte output |
 | 1 | `spore-creator-core`: domain types + `claims` + hermetic tests | `cargo test -p spore-creator-core` green, no Bevy in the tree |
 | 2 | `<sporemodel>` decoder for the verified grammar | 68/68 real documents parse; `#[ignore]`d corpus test, clean skip without `SPORE/` |
-| 3 | structural validation (index range, cycles, in-degree, version-gated fields) | hermetic, synthetic fixtures only |
-| 4 | `spore-creator-doc/1` writer + fail-closed reader | `save→load == doc` by `to_bits()` |
-| 5 | snapshot undo/redo | invertibility + no-op-undo tests |
-| 6 | `spore-engine`: additive `Placement` fields + projection into `Scene`/`Creature` | existing engine tests unchanged |
-| 7 | the failable resolver, returning `Unavailable { reason }` | reports 0/60 today and says so |
-| 8 | Bevy preview of a *composed* document | headless via `MinimalPlugins` only |
-| 9 | rigblock tail research package (separate workstream) | graded against 1549 records |
-| 10 | interactive editing (selection, gizmo, snapping) | **not started, by design** |
+| 3 | structural validation: index range, cycles, in-degree, symmetry reciprocity, per-field presence | hermetic, synthetic fixtures; **no version gate** (§1.1) |
+| 4 | the failable resolver, `Unavailable { reason }` closed vocabulary | reports coverage honestly: 1316/1549 have a mesh counterpart, 233 do not, flora 0/107 |
+| 5 | `spore-creator-doc/1` writer + fail-closed reader | `save→load == doc` by `to_bits()` |
+| 6 | snapshot undo/redo | invertibility + no-op-undo tests |
+| 7 | `spore-engine`: additive `Placement` fields + guards + projection into `Scene`/`Creature` | existing engine tests unchanged; `effective_rotation_y_degrees` is the only reader |
+| 8 | `spore-differential`: Rust creator document vs the Python oracle over all 68 records | 68/68 identical documents |
+| 9 | decode `0x01C135DA` skinned mesh + `0x2F4E681B` (separate workstream, own package) | graded against the 1824 records |
+| 10 | Bevy preview of a *composed* document | headless via `MinimalPlugins` only |
+| 11 | interactive editing (selection, gizmo, snapping) | **not started, by design** |
 
-Steps 1–5 are pure data work, fully hermetic, and are the deliverable this
-milestone. Step 6 is the invariant the brief demands: creator output and runtime
+Steps 1–6 are pure data work, fully hermetic, and are the deliverable this
+milestone. Step 7 is the invariant the brief demands: creator output and runtime
 input share one semantic representation, because the projection target is the
-*same* `domain::Placement` the engine already consumes.
+*same* `domain::Placement` the engine already consumes — and by then it is
+projecting a non-empty document, which is the whole point of doing the resolver
+first.
 
 ---
 
@@ -466,22 +612,35 @@ editor UI, gizmo or selection model.
 
 | claim | grade | source |
 |---|---|---|
-| 68 creator documents, 6 types, 680 blocks, all parse | **VERIFIED** | my DBPF+XML census over `Spore_Game.package`; independently `01`, `02` |
-| 601 edges, 0 dangling/cyclic, max in-degree 1, 79 roots | **VERIFIED** | `01-domain-model.md` (two independent methods) |
+| 68 creator documents, 6 types, 680 blocks, all parse | **VERIFIED** | my DBPF+XML census over `Spore_Game.package`; `01`, `02` |
+| the 68 documents are **corpus-complete** | **VERIFIED** | `07` §10 — this closes `01` §8 Q7 |
+| 601 edges, 0 dangling/cyclic, max in-degree 1, 79 roots | **VERIFIED** | `01` (two independent methods) |
 | 160 blocks have no `childlist` element | **VERIFIED** | my census; `01`, `05` |
-| grammar census (§1 tables) | **VERIFIED** | my census |
+| grammar census (§1 tables) | **VERIFIED** | my census; `07` spot-checked 30 items |
+| `formatversion` does **not** gate field presence | **VERIFIED** | `07` §9.3 — v16 and v15 each span two presence classes |
+| `<symmetric>` reciprocal 84/84; 76/84 on leaves | **VERIFIED** | `07` §6 |
+| `limbtype` 5, `musclescale` 5, `basemusclescale` 8 | **VERIFIED** | `07` §5 — missed by the first census and by `02` |
 | paint is in-document, per block, `crt`-free | **VERIFIED** | my census; `04` |
+| all 60 `blockid`s also name a `prop` with UTF-16 text | **OBSERVED** | `07` §7 — refutes "there is no name anywhere" |
 | `cEditorResourceBlock` 472 B, `cEditorResource` 172 B | **CONFIRMED** | `06-semantic-evidence.md` |
 | authored part transform is `(Vec3, Matrix3, f32)` | **CONFIRMED** | `06` + my grammar |
-| symmetry is a partner index, not a transform | **OBSERVED** | `03`, `06`, my census |
+| symmetry is a partner index, not a transform | **OBSERVED** | `03`, `06`, my census, `07` |
 | one material id per record; 4208/4208 single-id | **VERIFIED** | `04` |
 | `RegisterShaderData` has 72 sites, `0x218` in none | **VERIFIED** | `04` — `spore-gmdl`'s refusal is faithful |
-| 1549 rigblock records; `blockid` names only `0x5CAA5E28` | **VERIFIED** | my census; `02` |
-| rigblock tail encoding | **UNKNOWN** | my sampling: nibble-packed, sizes 36…8631 |
+| 1549 rigblock records, 8 sizes, `size = 36 + 12·4^k` | **VERIFIED** | `08` on 1549/1549 |
+| rigblock = quantised bounding subdivision, field order proved | **VERIFIED** | `08`: 234 428 violations for the wrong order, 0 for the right one |
+| `blockid → prop → 0x40606000 mesh`, 1316/1549 | **SUPPORTED** | `08` §5, with a 388/388 positive control |
+| bbox-pairing and arithmetic-relation hypotheses | **REFUTED** | `08`: 0/1 169 644; 234/482 below chance |
+| `0x01C135DA` skinned-mesh vertex layout, `0x2F4E681B` identity | **UNKNOWN** | `08` §6 — the remaining decode |
+| 233 rigblocks with no mesh counterpart; flora 0/107 | **OBSERVED** | `08` |
+| type `0x1A99B06B` (`bem`) carries the confirmed `cEditorResource` magic at v5 | **OBSERVED** | `07` §7 — 1709/1709, but 0/1709 fit the body layout. Cheapest unexplored lead. |
 | snap/align/interact lists | **UNKNOWN (code only)** | `02`, `06` — zero bytes in the corpus |
-| `paintregion` / `paintid` / weight-channel meaning | **UNKNOWN** | `04`, my census |
-| shared editor base class | **NOT DEMONSTRABLE** | `06`: 469 types, zero cross-domain mentions |
+| `paintregion` / `paintid` / weight-channel meaning | **UNKNOWN** | `04`, `docs/COLOUR-SOURCES.md`, my census (195 `<paint>` entries) |
+| the shader's 4th colour component has no XML field | **UNKNOWN** | `docs/COLOUR-SOURCES.md`, `smt` shader source |
+| a Spore creature renders uniform grey from its textures alone | **CONFIRMED** | `5449fe3`: colour lives in the record, not the raster |
+| shared editor base class | **NOT DEMONSTRABLE** | `06`: 469 types, zero cross-domain mentions; survived 4 refutation attempts (`07`) |
 | local-vs-absolute frame | **UNKNOWN** | `03` (G-04) |
 | quaternion↔matrix loss 1.131e-06 | measured | `03` |
 | f32 `{:?}` round-trip, all finite patterns | measured | `05` |
 | `serde_json` emits `null` for NaN | measured | `05`, `serde_json-1.0.150/src/ser.rs:169-179` |
+| no UI is a **scope** decision, not a knowledge ceiling | **VERIFIED** | `07` §11 — type `0xCF6C21B8` ships the game's own UI-definition XML |

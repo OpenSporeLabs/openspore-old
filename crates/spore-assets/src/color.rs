@@ -106,108 +106,6 @@ pub const ROOT_OPEN: &str = "<sporemodel>";
 /// The root element's closing tag.
 pub const ROOT_CLOSE: &str = "</sporemodel>";
 
-/// A colour in the unit range `[0, 1]`, exactly as Spore writes it.
-///
-/// Three components and no more: the corpus writes `r,g,b` and nothing else
-/// (see [`claims::COLOR_ALPHA_SOURCE`] for the missing fourth).
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct UnitRgb {
-    /// Red, `0.0 ..= 1.0`.
-    pub red: f32,
-    /// Green, `0.0 ..= 1.0`.
-    pub green: f32,
-    /// Blue, `0.0 ..= 1.0`.
-    pub blue: f32,
-}
-
-impl UnitRgb {
-    /// Builds a triple, rejecting a component outside `0.0 ..= 1.0`.
-    ///
-    /// Returns `None` rather than clamping. Clamping would turn a record this
-    /// build has never seen into a colour it can draw, which is exactly the
-    /// kind of quiet repair the repository forbids.
-    pub const fn new(red: f32, green: f32, blue: f32) -> Option<Self> {
-        if red < 0.0 || red > 1.0 || green < 0.0 || green > 1.0 || blue < 0.0 || blue > 1.0 {
-            return None;
-        }
-        Some(Self { red, green, blue })
-    }
-
-    /// The three components in `red, green, blue` order.
-    pub const fn components(self) -> [f32; 3] {
-        [self.red, self.green, self.blue]
-    }
-
-    /// Parses `r,g,b` in the corpus's spelling.
-    ///
-    /// Deliberately stricter than a general float parse. Measured over all 390
-    /// colour occurrences in the install, every component is either a bare
-    /// integer (`0` or `1`) or a plain decimal with a `.`; the canonical width
-    /// is six fractional digits. So this accepts exactly
-    /// `digits [ '.' digits ]` per component and refuses everything else:
-    /// `1e-3`, `inf`, `NaN`, a leading `+`, a trailing `.`, and surrounding
-    /// whitespace are all refused rather than tolerated, because none of them
-    /// occurs and a permissive parser here would be a guess about data nobody
-    /// has seen. Each component must also be finite and within
-    /// `0.0 ..= 1.0`.
-    pub fn parse(text: &str) -> Result<Self, ColorError> {
-        let mut parts = text.split(',');
-        let (Some(r), Some(g), Some(b), None) =
-            (parts.next(), parts.next(), parts.next(), parts.next())
-        else {
-            return Err(ColorError::ComponentCount {
-                tag: "colour".to_owned(),
-                text: text.to_owned(),
-                found: text.split(',').count(),
-            });
-        };
-        let mut out = [0.0f32; 3];
-        for (slot, raw) in out.iter_mut().zip([r, g, b]) {
-            *slot = component(raw).ok_or_else(|| ColorError::MalformedComponent {
-                tag: "colour".to_owned(),
-                text: text.to_owned(),
-                component: (*raw).to_owned(),
-            })?;
-        }
-        Self::new(out[0], out[1], out[2]).ok_or(ColorError::OutOfRange {
-            tag: "colour".to_owned(),
-            text: text.to_owned(),
-        })
-    }
-
-    /// The components in the corpus's canonical spelling.
-    ///
-    /// Six fractional digits, and a bare integer for a whole value — which is
-    /// what the install writes: `0.341176,0.360784,0.576470`, `1,1,1`, `0,0,0`.
-    /// Measured over all 390 colour occurrences, 1 453 components carry six
-    /// fractional digits, 251 are bare integers, and 6 carry seven. So this is
-    /// a *canonical* form, not a byte-identical one: a seven-digit component
-    /// parses to the same `f32` to within one unit in the last decimal place
-    /// and prints back at six.
-    pub fn to_corpus_text(self) -> String {
-        fn one(v: f32) -> String {
-            if v == v.trunc() {
-                return format!("{}", v as u32);
-            }
-            format!("{v:.6}")
-        }
-        format!("{},{},{}", one(self.red), one(self.green), one(self.blue))
-    }
-}
-
-/// One corpus colour component: `digits`, or `digits '.' digits`.
-fn component(raw: &str) -> Option<f32> {
-    let (whole, frac) = match raw.split_once('.') {
-        Some((whole, frac)) => (whole, Some(frac)),
-        None => (raw, None),
-    };
-    let digits_only = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
-    if !digits_only(whole) || frac.is_some_and(|f| !digits_only(f)) {
-        return None;
-    }
-    raw.parse::<f32>().ok().filter(|v| v.is_finite())
-}
-
 /// A `<paintregion>` mask, carried verbatim.
 ///
 /// The corpus uses 23 distinct values across 390 `<paint>` elements and nothing
@@ -304,6 +202,51 @@ impl ModelColors {
             }
         }
         out
+    }
+}
+
+/// The canonical colour type and grammar — **owned by `spore-creator-core`**.
+///
+/// # This module is a projection, not an owner
+///
+/// A second implementation of the `sporemodel` colour grammar used to live
+/// here. It is gone: [`UnitRgb`] and its component grammar are defined once, in
+/// `spore_creator_core::color`, and re-exported below. What remains in this
+/// module is the part that is genuinely `spore-assets`' business — reading the
+/// colour-bearing fields out of raw record bytes — plus the UTF-8, declaration
+/// and integer-id errors that a byte-level reader has and a document-level one
+/// does not.
+///
+/// The dependency direction is the documented one:
+///
+/// ```text
+/// Spore XML -> spore-creator-core -> canonical representation -> spore-assets
+/// ```
+///
+/// so `spore-creator-core` knows nothing about this crate and the graph stays
+/// acyclic. See `docs/CREATOR-CORE.md` §3.
+pub use spore_creator_core::color::UnitRgb;
+
+/// Translate a canonical colour failure into this module's error shape.
+///
+/// The *grammar* decision has already been made by `spore-creator-core`; this
+/// only re-labels it with the element name the byte-level reader knows about,
+/// so an error surfaced through [`extract`] still points at a record field.
+fn colour_error(error: spore_creator_core::color::ColorError, tag: &str) -> ColorError {
+    use spore_creator_core::color::ColorError as Canonical;
+    let tag = tag.to_owned();
+    match error {
+        Canonical::ComponentCount { text, found, .. } => {
+            ColorError::ComponentCount { tag, text, found }
+        }
+        Canonical::MalformedComponent {
+            text, component, ..
+        } => ColorError::MalformedComponent {
+            tag,
+            text,
+            component,
+        },
+        Canonical::OutOfRange { text, .. } => ColorError::OutOfRange { tag, text },
     }
 }
 
@@ -419,7 +362,7 @@ pub fn extract(record: &[u8]) -> Result<ModelColors, ColorError> {
         .enumerate()
     {
         out.skin_colors[slot] = element(text, tag)
-            .map(|v| UnitRgb::parse(v).map_err(|e| retag(e, tag)))
+            .map(|v| UnitRgb::parse(v, tag).map_err(|e| colour_error(e, tag)))
             .transpose()?;
     }
     for (slot, tag) in ["skineffect1", "skineffect2", "skineffect3"]
@@ -492,10 +435,10 @@ fn paint_lists(text: &str) -> Result<Vec<PaintList>, ColorError> {
             paints.push(Paint {
                 region: PaintRegion::new(hex32(required(paint, "paintregion")?, "paintregion")?),
                 paint_id: hex32(required(paint, "paintid")?, "paintid")?,
-                color1: UnitRgb::parse(required(paint, "color1")?)
-                    .map_err(|e| retag(e, "color1"))?,
-                color2: UnitRgb::parse(required(paint, "color2")?)
-                    .map_err(|e| retag(e, "color2"))?,
+                color1: UnitRgb::parse(required(paint, "color1")?, "color1")
+                    .map_err(|e| colour_error(e, "color1"))?,
+                color2: UnitRgb::parse(required(paint, "color2")?, "color2")
+                    .map_err(|e| colour_error(e, "color2"))?,
             });
             inner = end + "</paint>".len();
         }
@@ -567,28 +510,6 @@ fn hex32(text: &str, tag: &str) -> Result<u32, ColorError> {
         tag: tag.to_owned(),
         text: text.to_owned(),
     })
-}
-
-/// Re-labels a colour error with the element it came from, so the message names
-/// `skincolor1` rather than the generic "colour".
-fn retag(error: ColorError, tag: &str) -> ColorError {
-    let owned = tag.to_owned();
-    match error {
-        ColorError::ComponentCount { text, found, .. } => ColorError::ComponentCount {
-            tag: owned,
-            text,
-            found,
-        },
-        ColorError::MalformedComponent {
-            text, component, ..
-        } => ColorError::MalformedComponent {
-            tag: owned,
-            text,
-            component,
-        },
-        ColorError::OutOfRange { text, .. } => ColorError::OutOfRange { tag: owned, text },
-        other => other,
-    }
 }
 
 /// Every claim this module makes that is **not** verified, with its grade.
@@ -835,59 +756,22 @@ mod tests {
         );
     }
 
+    /// The colour **grammar** is no longer tested here, because it is no longer
+    /// implemented here. Its canonical tests live in
+    /// `spore_creator_core::color`, and they are the ones that count: this
+    /// module only projects.
+    ///
+    /// What is tested *here* is the part `spore-assets` alone owns — that a
+    /// byte-level read of a real record reaches the same colour the canonical
+    /// parser reaches. Duplicating the grammar assertions would have recreated
+    /// the second implementation this migration removed, just as tests.
     #[test]
-    fn a_colour_outside_the_unit_range_is_refused_not_clamped() {
-        assert!(UnitRgb::parse("1.5,0,0").is_err());
-        assert!(UnitRgb::parse("-0.1,0,0").is_err());
-        assert_eq!(UnitRgb::new(2.0, 0.0, 0.0), None);
-    }
-
-    #[test]
-    fn a_colour_with_the_wrong_component_count_is_named() {
-        assert_eq!(
-            UnitRgb::parse("0.5,0.5"),
-            Err(ColorError::ComponentCount {
-                tag: "colour".to_owned(),
-                text: "0.5,0.5".to_owned(),
-                found: 2,
-            })
-        );
-        assert!(matches!(
-            UnitRgb::parse("0.5,0.5,0.5,0.5"),
-            Err(ColorError::ComponentCount { found: 4, .. })
-        ));
-    }
-
-    #[test]
-    fn float_spellings_the_corpus_never_writes_are_refused() {
-        // Measured over all 390 colour occurrences in the install, every
-        // component is `digits` or `digits '.' digits`. None of these appears.
-        for bad in [
-            "1e-3,0,0",
-            "inf,0,0",
-            "NaN,0,0",
-            "+0.5,0,0",
-            " 0.5,0,0",
-            ".5,0,0",
-            "0.,0,0",
-            ",0,0",
-            "0,,0",
-            "0.5.5,0,0",
-        ] {
-            assert!(
-                UnitRgb::parse(bad).is_err(),
-                "{bad:?} should not parse as a corpus colour"
-            );
-        }
-        // ...but bare integers do, as in `1,1,1` and `0,0,0`.
-        assert_eq!(
-            UnitRgb::parse("0,0,0").unwrap(),
-            UnitRgb::new(0.0, 0.0, 0.0).unwrap()
-        );
-        assert_eq!(
-            UnitRgb::parse("1,1,1").unwrap(),
-            UnitRgb::new(1.0, 1.0, 1.0).unwrap()
-        );
+    fn the_colour_grammar_is_owned_by_creator_core_not_reimplemented_here() {
+        // If this ever stops compiling because a grammar rule changed, the change
+        // belongs in `spore_creator_core::color`, not in a copy over here.
+        let via_owner = spore_creator_core::UnitRgb::parse("0.5,0.5,0.5", "color1");
+        assert!(via_owner.is_ok());
+        assert!(spore_creator_core::UnitRgb::parse("1e-3,0,0", "color1").is_err());
     }
 
     #[test]
@@ -947,7 +831,7 @@ mod tests {
             "0.937255,0.964706,0.925490",
             "0.949020,0.541176,0.301961",
         ] {
-            let colour = UnitRgb::parse(text).expect("corpus text parses");
+            let colour = UnitRgb::parse(text, "color1").expect("corpus text parses");
             assert_eq!(colour.to_corpus_text(), text);
         }
     }
@@ -958,8 +842,8 @@ mod tests {
         // fractional digits. The canonical writer is six, so it cannot be a
         // bit-exact round trip for those six; it is within 1e-6, and this pins
         // that bound rather than pretending the precision is free.
-        let seven = UnitRgb::parse("0.1234567,0,0").unwrap();
-        let back = UnitRgb::parse(&seven.to_corpus_text()).unwrap();
+        let seven = UnitRgb::parse("0.1234567,0,0", "color1").unwrap();
+        let back = UnitRgb::parse(&seven.to_corpus_text(), "color1").unwrap();
         assert!(
             (back.red - seven.red).abs() <= 1e-6,
             "{back:?} vs {seven:?}"
@@ -1102,5 +986,110 @@ mod corpus {
                 "channel {channel} spans only {lo}..{hi}; Spore creature colour is not greyscale"
             );
         }
+    }
+
+    /// Bit-for-bit comparison of two RGB triples.
+    ///
+    /// `f32` equality would accept `-0.0 == 0.0`, which is exactly the kind of
+    /// silent difference this test exists to catch.
+    fn same_bits(a: [f32; 3], b: [f32; 3]) -> bool {
+        a.iter()
+            .zip(b.iter())
+            .all(|(x, y)| x.to_bits() == y.to_bits())
+    }
+
+    /// **The equivalence test this migration had to earn.**
+    ///
+    /// Two readers of the same colour fields must never disagree: the canonical
+    /// one (`spore_creator_core::parse_sporemodel`, which parses the whole
+    /// document) and this crate's byte-level projection (`extract`, which reads
+    /// only the colour-bearing fields out of raw bytes). Before the migration
+    /// they were two implementations; nothing asserted they agreed.
+    ///
+    /// Over every `<sporemodel>` record in the install, every skin colour and
+    /// every paint colour must come out **bit-identical** from both paths.
+    #[test]
+    #[ignore = "needs SPORE/"]
+    fn the_projection_and_the_canonical_parser_agree_on_every_colour() {
+        let records = corpus_records();
+        if records.is_empty() {
+            eprintln!("SKIP: no SPORE/Data packages present");
+            return;
+        }
+
+        let mut compared_skin = 0usize;
+        let mut compared_paint = 0usize;
+
+        for bytes in &records {
+            let projected = extract(bytes).expect("the projection decodes");
+            let text = std::str::from_utf8(bytes).expect("a sporemodel record is utf-8");
+            // The family only labels the document; colour reading is
+            // family-independent, and every family is exercised by the loop.
+            let canonical =
+                spore_creator_core::parse_sporemodel(spore_creator_core::Family::Creature, text)
+                    .expect("the canonical parser decodes the same record");
+
+            // Skin colours: `<skincolor1..3>`, compared **slot by slot**.
+            //
+            // Flattening both sides and zipping them would also pass when one
+            // reader thinks slot 2 is absent and the other thinks slot 3 is —
+            // the vectors would still line up. Presence is part of the claim,
+            // so presence is compared.
+            let canonical_skin = canonical
+                .properties
+                .skin_colors
+                .unwrap_or([None, None, None]);
+            let projected_skin = projected.skin_colors;
+            for slot in 0..3 {
+                match (canonical_skin[slot], projected_skin[slot]) {
+                    (None, None) => {}
+                    (Some(mine), Some(theirs)) => {
+                        assert!(
+                            same_bits(mine.components(), theirs.components()),
+                            "skincolor{} disagrees: canonical {mine} vs projection {theirs}",
+                            slot + 1
+                        );
+                        compared_skin += 1;
+                    }
+                    (mine, theirs) => panic!(
+                        "skincolor{} presence disagrees: canonical {mine:?} vs projection {theirs:?}",
+                        slot + 1
+                    ),
+                }
+            }
+
+            // Paint colours: every `<paint>` in document order, per block.
+            let canonical_paint: Vec<_> = canonical
+                .blocks
+                .iter()
+                .filter_map(|block| block.paint.as_ref())
+                .flatten()
+                .flat_map(|paint| [paint.color1, paint.color2])
+                .collect();
+            let projected_paint: Vec<_> = projected
+                .paint_lists
+                .iter()
+                .flat_map(|list| &list.paints)
+                .flat_map(|paint| [paint.color1, paint.color2])
+                .collect();
+            assert_eq!(
+                canonical_paint.len(),
+                projected_paint.len(),
+                "the two readers found a different number of paint colours"
+            );
+            for (mine, theirs) in canonical_paint.iter().zip(&projected_paint) {
+                assert!(
+                    same_bits(mine.components(), theirs.components()),
+                    "paint colour {mine} vs {theirs} disagrees between the canonical parser and the projection"
+                );
+                compared_paint += 1;
+            }
+        }
+
+        // A zero here would mean the comparison proved nothing, which is the
+        // failure mode this repository treats as worse than a failing test.
+        assert!(compared_skin > 0, "compared no skin colours at all");
+        assert!(compared_paint > 0, "compared no paint colours at all");
+        eprintln!("agreed on {compared_skin} skin and {compared_paint} paint colours");
     }
 }

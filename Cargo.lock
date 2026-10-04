@@ -3465,6 +3465,7 @@ version = "0.1.0"
 dependencies = [
  "memmap2",
  "spore-core",
+ "spore-creator-core",
  "spore-dbpf",
  "spore-gmdl",
  "spore-rw4",
@@ -3486,6 +3487,15 @@ dependencies = [
 name = "spore-core"
 version = "0.1.0"
 dependencies = [
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "spore-creator-core"
+version = "0.1.0"
+dependencies = [
+ "spore-core",
+ "spore-dbpf",
  "thiserror 2.0.21",
 ]
 

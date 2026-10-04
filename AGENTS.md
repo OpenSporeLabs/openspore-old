@@ -47,15 +47,17 @@ crates/spore-material    material + texture binding resolution
 crates/spore-differential  Rust parsers vs the Python oracles, over real data
 crates/spore-cellcontent    the 12 Cell Stage gameplay record layouts
 crates/spore-semantic-bridge  read-only consumer of the spore-semantic passport
+crates/spore-creator-core  the authoring core: <sporemodel> creator documents
 crates/spore-engine      the Bevy runtime
 crates/spore-tools       `osptool`, the inspection CLI
 ```
 
 **The load-bearing invariant: everything above `loader` is renderer-agnostic
-and Bevy-free.** `spore-core` … `spore-material` and `spore-differential` must
-never gain a `bevy` dependency, and `spore-assets` must never touch a GPU. That
-is what makes the asset layer testable with no window and no game install, and
-it is why `--info` decodes a real record in ~140 ms. Keep it.
+and Bevy-free.** `spore-core` … `spore-material`, `spore-creator-core` and
+`spore-differential` must never gain a `bevy` dependency, and `spore-assets`
+must never touch a GPU. That is what makes the asset layer testable with no
+window and no game install, and it is why `--info` decodes a real record in
+~140 ms. Keep it.
 
 ### Build / test (Rust)
 
@@ -108,6 +110,14 @@ cargo test -p spore-differential --release -- --ignored --nocapture
   no safe constructor). Do not add a second.
 - **GMDL `refCount` is BIG-ENDIAN.** Every other word is little-endian. A
   little-endian read gives `N * 0x01000000` and walks off the end of the record.
+- **Spore's creator documents are XML, and they spell numbers both ways.**
+  68 `<sporemodel>` records live in `Spore_Game.package` (`crt` 47, `cll` 13,
+  `vcl` 4, `ufo` 2, `bld` 1, `flr` 1). The same `u32` field appears as
+  `0x9ea3031a` in 67 of them and `2661483290` in the one `formatversion 11`
+  document, and floats appear as both `0.450979` and `7.26504e-9`. Parse both
+  radices and both float spellings, and never gate a field on `formatversion` —
+  `v16` documents both write and omit `<handles>`, and so do `v15` documents.
+  See `docs/CREATOR-CORE.md`.
 
 ### Evidence discipline (unchanged by the migration, now enforced in code)
 

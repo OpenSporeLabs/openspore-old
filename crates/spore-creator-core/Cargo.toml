@@ -1,0 +1,15 @@
+[package]
+name = "spore-creator-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The reusable Spore authoring core: creator documents, part blocks, transforms, paint, and the validation the three creators share."
+
+[dependencies]
+spore-core = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+spore-dbpf = { workspace = true }

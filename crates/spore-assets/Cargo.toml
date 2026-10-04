@@ -9,6 +9,7 @@ description = "Content store, resource resolution and typed record decoding over
 
 [dependencies]
 spore-core = { workspace = true }
+spore-creator-core = { workspace = true }
 spore-dbpf = { workspace = true }
 spore-gmdl = { workspace = true }
 spore-rw4 = { workspace = true }
