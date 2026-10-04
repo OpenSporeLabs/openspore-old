@@ -3,6 +3,15 @@
 //! Kept apart from the asset bridge so the "is the renderer alive" question and
 //! the "can it read a Spore record" question have separate answers. Swapping the
 //! contents of the world must not require touching the camera.
+//!
+//! # One owner per entity kind
+//!
+//! This plugin owns the **camera, the lights and the ground**. It never spawns
+//! Spore content, and [`crate::loader::SporeAssetPlugin`] never spawns a camera.
+//! The split is not tidiness: when both plugins spawned a camera, Bevy warned
+//! "Camera order ambiguities detected", the model rendered from whichever camera
+//! it picked, and the framing query found "multiple entities" — a duplicate
+//! spawn wearing a framing bug's clothes.
 
 use bevy::app::Plugin;
 use bevy::pbr::StandardMaterial;
@@ -15,7 +24,12 @@ pub const BACKDROP: Color = Color::srgb(0.05, 0.06, 0.09);
 pub const GROUND: Color = Color::srgb(0.16, 0.17, 0.20);
 
 /// The colour used for a loaded asset that has no usable texture.
-pub const ASSET_TINT: Color = Color::srgb(0.86, 0.62, 0.32);
+///
+/// A neutral grey, deliberately: no raster record in this corpus decodes as a
+/// base-colour map, so any hue would be an invention. See
+/// [`crate::texture::UNTEXURED_TINT`], which is the same decision expressed at
+/// the material layer.
+pub const ASSET_TINT: Color = Color::srgb(0.62, 0.62, 0.62);
 
 /// The colour used for the placeholder mesh.
 pub const PLACEHOLDER_TINT: Color = Color::srgb(0.30, 0.68, 0.86);
@@ -24,7 +38,7 @@ pub const PLACEHOLDER_TINT: Color = Color::srgb(0.30, 0.68, 0.86);
 #[derive(Debug, Clone, Copy, Component, Default)]
 pub struct MainCamera;
 
-/// Marker for the asset entity currently on show.
+/// Marker for an asset entity currently on show.
 #[derive(Debug, Clone, Copy, Component, Default)]
 pub struct OnStage;
 
@@ -40,10 +54,10 @@ pub struct OnStage;
 /// content -- and each can be tested with the other absent.
 ///
 /// It is deliberately the *smallest* plugin that is still a real boundary. There
-/// is one world; there is no scene graph, no scene file and no level format yet,
-/// because none of those have a proven need. `src/apps/scene.json` in the C++
-/// tree is the closest prior art and it stays there until a Rust equivalent is
-/// actually load-bearing.
+/// is one world and no scene graph; the scene description lives in
+/// [`crate::domain::scene`] and is turned into entities by
+/// [`crate::loader::SporeAssetPlugin`], which is where the content ownership
+/// already was.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ScenePlugin;
 
@@ -71,9 +85,9 @@ pub fn spawn_stage(
     commands.insert_resource(ClearColor(Color::BLACK));
 
     // A 3D camera framed so a model of roughly unit-to-10-unit size lands in
-    // view. Spore geometry is authored in its own units (the documented asset's
-    // file bounding radius is 13.77), so the distance is a starting point that
-    // the camera fit system then corrects per asset.
+    // view. Spore geometry is authored in its own units, so the distance is a
+    // starting point that `crate::loader::frame_camera_on_the_scene` then
+    // corrects in `PostStartup` from the scene's measured extent.
     commands.spawn((
         Camera3d::default(),
         MainCamera,
@@ -143,5 +157,82 @@ pub fn spawn_placeholder(
 pub fn clear_stage(commands: &mut Commands, existing: &mut Query<Entity, With<OnStage>>) {
     for entity in existing.iter() {
         commands.entity(entity).despawn();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn world_with_stage() -> App {
+        let mut app = App::new();
+        // `MinimalPlugins` deliberately has no `AssetPlugin`, so the asset
+        // collections this world writes into have to be initialised by hand.
+        // That is also the point: the world spawn needs no asset *server*, no
+        // file loader and no window.
+        app.add_plugins((MinimalPlugins, bevy::asset::AssetPlugin::default()));
+        app.init_asset::<Mesh>();
+        app.init_asset::<StandardMaterial>();
+        app.add_systems(Startup, spawn_world);
+        app.finish();
+        app.cleanup();
+        app
+    }
+
+    #[test]
+    fn the_world_owns_exactly_one_camera() {
+        // The regression this split exists for: two plugins spawning a camera
+        // produced "Camera order ambiguities detected" and a framing query that
+        // found "multiple entities".
+        let mut app = world_with_stage();
+        app.update();
+        let mut cameras = bevy::ecs::query::QueryState::<&Camera3d>::new(&mut *app.world_mut());
+        assert_eq!(cameras.iter(app.world()).count(), 1);
+        drop(cameras);
+        let mut markers =
+            bevy::ecs::query::QueryState::<Entity, With<MainCamera>>::new(&mut *app.world_mut());
+        markers.update_archetypes(app.world());
+        assert_eq!(markers.iter(app.world()).count(), 1);
+    }
+
+    #[test]
+    fn the_world_owns_exactly_two_lights() {
+        let mut app = world_with_stage();
+        app.update();
+        let mut lights =
+            bevy::ecs::query::QueryState::<&DirectionalLight>::new(&mut *app.world_mut());
+        assert_eq!(lights.iter(app.world()).count(), 2);
+    }
+
+    #[test]
+    fn the_world_owns_a_ground_but_no_asset() {
+        let mut app = world_with_stage();
+        app.update();
+        let mut staged =
+            bevy::ecs::query::QueryState::<Entity, With<OnStage>>::new(&mut *app.world_mut());
+        assert_eq!(
+            staged.iter(app.world()).count(),
+            0,
+            "ScenePlugin must never spawn Spore content"
+        );
+        drop(staged);
+        let mut ground =
+            bevy::ecs::query::QueryState::<Entity, With<Mesh3d>>::new(&mut *app.world_mut());
+        assert_eq!(ground.iter(app.world()).count(), 1, "the ground plane");
+    }
+
+    #[test]
+    fn the_untinted_colours_are_neutral_grey_not_a_hue() {
+        // No raster record in this corpus decodes as base colour, so a hue here
+        // would be an invention.
+        let linear = ASSET_TINT.to_linear();
+        assert!(
+            (linear.red - linear.green).abs() < 0.01 && (linear.green - linear.blue).abs() < 0.01,
+            "not neutral: {ASSET_TINT:?}"
+        );
+        assert!(
+            linear.red > 0.2 && linear.red < 0.9,
+            "and not black: {ASSET_TINT:?}"
+        );
     }
 }

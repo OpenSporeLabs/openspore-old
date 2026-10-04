@@ -6,6 +6,13 @@
 //! `&[String]` to [`LaunchRequest`], so the whole CLI is unit-testable without
 //! spawning a process.
 //!
+//! # Many objects, not one preset
+//!
+//! `--record` and `--preset` are **repeatable**. Each one adds an object to the
+//! scene, and `--creature` starts a new object that `--part` can add to. That is
+//! the difference between a preset demo and an engine: a scene is a list, and
+//! the list is what the command line builds.
+//!
 //! # Exit behaviour
 //!
 //! A malformed command line is a *user error*, so it prints usage to stderr and
@@ -17,6 +24,11 @@
 use std::path::PathBuf;
 
 use spore_core::ResourceKey;
+
+use crate::domain::creature::Creature;
+use crate::domain::model::{ModelInstance, Placement};
+use crate::domain::scene::{Scene, SceneObject, DEFAULT_GAP};
+use crate::domain::Layout;
 
 /// Exit code for a malformed command line (matches the `argparse` convention
 /// the repository's Python tools already use).
@@ -66,22 +78,71 @@ impl Default for WindowOptions {
     }
 }
 
+/// One thing the command line asked to be shown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObjectRequest {
+    /// A single model record.
+    Model {
+        /// The identity.
+        key: ResourceKey,
+        /// How the identity was chosen, for the on-screen banner and the log.
+        origin: RecordOrigin,
+    },
+    /// A creature: one or more model records presented together.
+    Creature {
+        /// The identity of the first part.
+        key: ResourceKey,
+        /// Extra part identities, in the order given.
+        parts: Vec<ResourceKey>,
+        /// How the first identity was chosen.
+        origin: RecordOrigin,
+    },
+}
+
+impl ObjectRequest {
+    /// The record identities this object needs decoded.
+    pub fn keys(&self) -> Vec<ResourceKey> {
+        match self {
+            Self::Model { key, .. } => vec![*key],
+            Self::Creature { key, parts, .. } => {
+                let mut keys = vec![*key];
+                keys.extend(parts.iter().copied());
+                keys
+            }
+        }
+    }
+
+    /// How the identity was chosen.
+    pub fn origin(&self) -> RecordOrigin {
+        match self {
+            Self::Model { origin, .. } | Self::Creature { origin, .. } => *origin,
+        }
+    }
+
+    /// `"model"` or `"creature"`, for a log.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Model { .. } => "model",
+            Self::Creature { .. } => "creature",
+        }
+    }
+}
+
 /// A request to show real Spore content.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SceneRequest {
     /// Packages in resolution order. Earlier wins.
     pub packages: Vec<PathBuf>,
-    /// The record to show.
-    pub record: ResourceKey,
-    /// How the identity was chosen, for the on-screen banner.
-    pub record_origin: RecordOrigin,
-    /// World-space uniform scale applied to the loaded mesh.
+    /// What to show. **Repeatable**: one entry per object on stage.
+    pub objects: Vec<ObjectRequest>,
+    /// World-space uniform scale applied to every loaded mesh.
     pub scale: f32,
     /// Window sizing and title.
     pub window: WindowOptions,
     /// Print what was loaded and exit without opening a window.
     pub info_only: bool,
-    /// Resolve the model's texture references and apply the first that decodes.
+    /// Resolve the model's texture references and bind each one by its content
+    /// role.
     pub textured: bool,
     /// The record type assumed for a texture reference.
     ///
@@ -91,17 +152,72 @@ pub struct SceneRequest {
     /// because a wrong assumption produces a confidently wrong texture instead
     /// of an error.
     pub assumed_texture_type: u32,
+    /// How objects are spread.
+    pub layout: Layout,
+    /// Space between objects, in world units.
+    pub spacing: f32,
+    /// Whether to swap the normal map's green channel.
+    ///
+    /// **UNKNOWN** which convention Spore authored in; the default is the only
+    /// one the corpus supports evidence for.
+    pub flip_normal_y: bool,
 }
 
-/// How the record identity was chosen.
+impl SceneRequest {
+    /// Every record the scene needs, in declaration order.
+    pub fn records(&self) -> Vec<ResourceKey> {
+        self.objects
+            .iter()
+            .flat_map(|object| object.keys())
+            .collect()
+    }
+
+    /// The domain scene this request describes, with no extents applied.
+    pub fn to_scene(&self) -> Scene {
+        let mut scene = Scene::new();
+        for object in &self.objects {
+            match object {
+                ObjectRequest::Model { key, .. } => {
+                    scene.push(SceneObject::Model(ModelInstance::new(
+                        *key,
+                        Placement {
+                            scale: self.scale,
+                            ..Placement::default()
+                        },
+                    )));
+                }
+                ObjectRequest::Creature { key, parts, .. } => {
+                    let mut creature = Creature::single(ModelInstance::new(
+                        *key,
+                        Placement {
+                            scale: self.scale,
+                            ..Placement::default()
+                        },
+                    ));
+                    for part in parts {
+                        creature = creature.with(ModelInstance::new(
+                            *part,
+                            Placement {
+                                scale: self.scale,
+                                ..Placement::default()
+                            },
+                        ));
+                    }
+                    scene.push(SceneObject::Creature(creature));
+                }
+            }
+        }
+        scene
+    }
+}
+
+/// How a record identity was chosen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordOrigin {
     /// Given explicitly on the command line.
     Explicit,
     /// Chosen by a named, documented preset.
     Preset(&'static str),
-    /// No packages were given, so nothing can be loaded.
-    None,
 }
 
 /// The identity of the smallest geometry-bearing `gmdl` in the base content
@@ -109,6 +225,10 @@ pub enum RecordOrigin {
 ///
 /// 1156 bytes decompressed, 32 vertices, 20 triangles. Chosen because it is
 /// the smallest record that still yields geometry; see `docs/ASSET-PATH.md`.
+///
+/// Measured 2026-10-04: one mesh, three texture references resolving to
+/// `(layered-alpha-mask, layered-alpha-mask, tangent-space-normal)`, all
+/// ordinals agreeing, so this is the asset the normal-map path is checked on.
 pub const PRESET_DOCUMENTED_ASSET: (u32, u32, u32) = (0x00E6_BCE5, 0x4063_7E03, 0x067A_07F0);
 
 /// The largest creature model in the base content package: 2 meshes, 47 016
@@ -124,6 +244,10 @@ pub const PRESET_DOCUMENTED_ASSET: (u32, u32, u32) = (0x00E6_BCE5, 0x4063_7E03, 
 /// unknown, so it decodes COMPLETELY through the mesh table and stops there.
 /// Its geometry is fully validated; the report line says `decode=material-info`.
 /// It is the milestone asset: the first real creature on screen.
+///
+/// Measured 2026-10-04: it carries **two** texture references, which the even
+/// per-mesh cut splits one per mesh. `0x40622900` is a 512² `DXT5` mask (two
+/// alpha planes) and `0x40622901` is a 256² `tangent-space-normal`.
 pub const PRESET_CREATURE: (u32, u32, u32) = (0x00E6_BCE5, 0x4062_7100, 0x067C_79D2);
 
 /// The named presets this build knows.
@@ -137,11 +261,6 @@ pub const PRESETS: &[(&str, (u32, u32, u32))] = &[
 pub enum CliError {
     /// A flag that needs a value was given none.
     MissingValue {
-        /// The flag as the user typed it.
-        flag: String,
-    },
-    /// A flag was repeated with incompatible values.
-    Repeated {
         /// The flag as the user typed it.
         flag: String,
     },
@@ -160,20 +279,27 @@ pub enum CliError {
     UnknownPreset(String),
     /// `--preset` or `--record` was required but absent.
     NoRecordRequested,
+    /// `--part` was given with no `--creature` to attach it to.
+    OrphanPart,
 }
 
 impl std::fmt::Display for CliError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::MissingValue { flag } => write!(f, "`{flag}` needs a value"),
-            Self::Repeated { flag } => write!(f, "`{flag}` was given more than once"),
-            Self::BadValue { flag, value, expected } => write!(f, "`{flag}` got `{value}`, expected {expected}"),
+            Self::BadValue { flag, value, expected } => {
+                write!(f, "`{flag}` got `{value}`, expected {expected}")
+            }
             Self::UnknownFlag(flag) => write!(f, "unknown flag `{flag}`"),
             Self::UnknownPreset(name) => write!(f, "unknown preset `{name}`"),
             Self::NoRecordRequested => write!(
                 f,
                 "nothing to load: pass `--record T:G:I`, `--preset {}`, or `--placeholder` for the no-data mode",
                 PRESETS.iter().map(|(n, _)| *n).collect::<Vec<_>>().join("|")
+            ),
+            Self::OrphanPart => write!(
+                f,
+                "`--part` needs a `--creature` before it: a part is attached to the creature it follows"
             ),
         }
     }
@@ -197,27 +323,42 @@ pub fn usage() -> String {
          With --placeholder, opens a window showing a built-in mesh, so the\n\
          engine can be proven alive before any game data is involved.\n\
          \n\
+         --record and --preset are REPEATABLE: each one adds an object to the\n\
+         scene, and objects are laid out side by side from their own bounds.\n\
+         \n\
          OPTIONS:\n\
          \x20   --package <PATH>     A Spore .package file. Repeatable. Earlier\n\
          \x20                       packages win when an identity appears in more\n\
          \x20                       than one, so list base content before patches.\n\
-         \x20   --record <T:G:I>     The record to show, e.g. 0x00e6bce5:0x40637e03:0x067a07f0\n\
-         \x20   --preset <NAME>      A named record. Known: {presets}\n\
+         \x20   --record <T:G:I>     A record to show, e.g.\n\
+         \x20                       0x00e6bce5:0x40637e03:0x067a07f0. Repeatable.\n\
+         \x20   --preset <NAME>      A named record. Known: {presets}. Repeatable.\n\
+         \x20   --creature <T:G:I>   Start a creature object at this record.\n\
+         \x20   --part <T:G:I>       Add a model to the creature that follows it.\n\
+         \x20   --layout <row|grid>  How to spread objects (default row)\n\
+         \x20   --spacing <F>        Space between objects (default {gap})\n\
          \x20   --scale <F>          Uniform scale applied to the mesh (default 1.0)\n\
          \x20   --width <PX>         Window width (default 1280)\n\
          \x20   --height <PX>        Window height (default 720)\n\
          \x20   --title <TEXT>       Window title\n\
          \x20   --info               Load, report, and exit without a window\n\
-         \x20   --texture            Resolve the model's texture references and apply\n\
-         \x20                       the first that decodes as the diffuse colour\n\
+         \x20   --texture            Resolve the model's texture references and bind\n\
+         \x20                       each one to the material slot its CONTENT role\n\
+         \x20                       implies. No raster record in this corpus decodes\n\
+         \x20                       as base colour, so none is bound as diffuse.\n\
          \x20   --assumed-texture-type <ID>\n\
          \x20                       The record type assumed for a texture reference,\n\
          \x20                       which carries no type word (default 0x2f4e681c)\n\
+         \x20   --flip-normal-y      Swap the normal map's green channel. UNKNOWN\n\
+         \x20                       which convention Spore authored in, so off by\n\
+         \x20                       default: as-stored is the only reading the corpus\n\
+         \x20                       supports evidence for.\n\
          \x20   --placeholder        Show the built-in mesh with no game data at all\n\
          \x20   -h, --help           Print this text\n\
          \n\
          EXIT CODES:\n\
-         \x20   0  ok            2  bad command line ({EXIT_USAGE})   3  asset unavailable ({EXIT_ASSET})\n"
+         \x20   0  ok            2  bad command line ({EXIT_USAGE})   3  asset unavailable ({EXIT_ASSET})\n",
+        gap = DEFAULT_GAP,
     )
 }
 
@@ -233,14 +374,16 @@ where
 
 fn parse_vec(args: &[String]) -> Result<LaunchRequest, CliError> {
     let mut packages: Vec<PathBuf> = Vec::new();
-    let mut record: Option<ResourceKey> = None;
-    let mut origin = RecordOrigin::None;
+    let mut objects: Vec<ObjectRequest> = Vec::new();
     let mut scale = 1.0f32;
     let mut window = WindowOptions::default();
     let mut info_only = false;
     let mut placeholder = false;
     let mut textured = false;
     let mut assumed_texture_type = spore_core::record::type_id::RASTER;
+    let mut layout = Layout::Row;
+    let mut spacing = DEFAULT_GAP;
+    let mut flip_normal_y = false;
 
     let mut index = 0usize;
     while index < args.len() {
@@ -257,18 +400,16 @@ fn parse_vec(args: &[String]) -> Result<LaunchRequest, CliError> {
             "-h" | "--help" => return Ok(LaunchRequest::Help),
             "--placeholder" => {
                 // Explicitly asks for the no-data mode. Reached below via the
-                // `record == None` arm, so it must not fall through.
+                // `objects.is_empty()` arm, so it must not fall through.
                 placeholder = true;
             }
             "--package" => packages.push(PathBuf::from(value_for("--package")?)),
             "--record" => {
                 let raw = value_for("--record")?;
-                record = Some(raw.parse::<ResourceKey>().map_err(|_| CliError::BadValue {
-                    flag: "--record".into(),
-                    value: raw,
-                    expected: "a T:G:I triple",
-                })?);
-                origin = RecordOrigin::Explicit;
+                objects.push(ObjectRequest::Model {
+                    key: parse_key("--record", &raw)?,
+                    origin: RecordOrigin::Explicit,
+                });
             }
             "--preset" => {
                 let raw = value_for("--preset")?;
@@ -276,8 +417,26 @@ fn parse_vec(args: &[String]) -> Result<LaunchRequest, CliError> {
                     .iter()
                     .find(|(name, _)| *name == raw)
                     .ok_or_else(|| CliError::UnknownPreset(raw.clone()))?;
-                record = Some(ResourceKey::new(triple.0, triple.1, triple.2));
-                origin = RecordOrigin::Preset(name);
+                objects.push(ObjectRequest::Model {
+                    key: ResourceKey::new(triple.0, triple.1, triple.2),
+                    origin: RecordOrigin::Preset(name),
+                });
+            }
+            "--creature" => {
+                let raw = value_for("--creature")?;
+                objects.push(ObjectRequest::Creature {
+                    key: parse_key("--creature", &raw)?,
+                    parts: Vec::new(),
+                    origin: RecordOrigin::Explicit,
+                });
+            }
+            "--part" => {
+                let raw = value_for("--part")?;
+                let key = parse_key("--part", &raw)?;
+                match objects.last_mut() {
+                    Some(ObjectRequest::Creature { parts, .. }) => parts.push(key),
+                    _ => return Err(CliError::OrphanPart),
+                }
             }
             "--scale" => {
                 let raw = value_for("--scale")?;
@@ -294,6 +453,30 @@ fn parse_vec(args: &[String]) -> Result<LaunchRequest, CliError> {
                     });
                 }
                 scale = parsed;
+            }
+            "--layout" => {
+                let raw = value_for("--layout")?;
+                layout = Layout::parse(&raw).ok_or_else(|| CliError::BadValue {
+                    flag: "--layout".into(),
+                    value: raw.clone(),
+                    expected: "`row` or `grid`",
+                })?;
+            }
+            "--spacing" => {
+                let raw = value_for("--spacing")?;
+                let parsed: f32 = raw.parse().map_err(|_| CliError::BadValue {
+                    flag: "--spacing".into(),
+                    value: raw.clone(),
+                    expected: "a number",
+                })?;
+                if !(parsed.is_finite() && parsed >= 0.0) {
+                    return Err(CliError::BadValue {
+                        flag: "--spacing".into(),
+                        value: raw,
+                        expected: "a finite number not below zero",
+                    });
+                }
+                spacing = parsed;
             }
             "--width" => {
                 let raw = value_for("--width")?;
@@ -316,6 +499,7 @@ fn parse_vec(args: &[String]) -> Result<LaunchRequest, CliError> {
             }
             "--info" => info_only = true,
             "--texture" => textured = true,
+            "--flip-normal-y" => flip_normal_y = true,
             "--assumed-texture-type" => {
                 let raw = value_for("--assumed-texture-type")?;
                 // `spore_core::parse_id`, not `u32::from_str`: the latter rejects
@@ -332,33 +516,50 @@ fn parse_vec(args: &[String]) -> Result<LaunchRequest, CliError> {
         index += 1;
     }
 
-    match record {
-        Some(record) => {
-            if window.title == WindowOptions::default().title {
-                window.title = format!("OpenSpore - {}", record);
-            }
-            Ok(LaunchRequest::Scene(SceneRequest {
-                packages,
-                record,
-                record_origin: origin,
-                scale,
-                window,
-                info_only,
-                textured,
-                assumed_texture_type,
-            }))
+    if !objects.is_empty() {
+        if window.title == WindowOptions::default().title {
+            window.title = format!("OpenSpore - {} object(s)", objects.len());
         }
-        // Packages with no record is the ambiguous case: the caller named
-        // game data but not what to show. Guessing a "nice" record here would
-        // hide a typo behind a plausible picture, so it is a usage error.
-        None if placeholder => Ok(LaunchRequest::Placeholder(window)),
-        None => Err(CliError::NoRecordRequested),
+        return Ok(LaunchRequest::Scene(SceneRequest {
+            packages,
+            objects,
+            scale,
+            window,
+            info_only,
+            textured,
+            assumed_texture_type,
+            layout,
+            spacing,
+            flip_normal_y,
+        }));
     }
+    // Packages with no record is the ambiguous case: the caller named game data
+    // but not what to show. Guessing a "nice" record here would hide a typo
+    // behind a plausible picture, so it is a usage error.
+    if placeholder {
+        return Ok(LaunchRequest::Placeholder(window));
+    }
+    Err(CliError::NoRecordRequested)
+}
+
+fn parse_key(flag: &str, raw: &str) -> Result<ResourceKey, CliError> {
+    raw.parse::<ResourceKey>().map_err(|_| CliError::BadValue {
+        flag: flag.into(),
+        value: raw.to_owned(),
+        expected: "a T:G:I triple",
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scene(args: &[&str]) -> SceneRequest {
+        let LaunchRequest::Scene(request) = parse(args).unwrap() else {
+            panic!("expected a scene request from {args:?}")
+        };
+        request
+    }
 
     #[test]
     fn no_arguments_is_a_usage_error_not_a_silent_default() {
@@ -385,50 +586,108 @@ mod tests {
     }
 
     #[test]
-    fn a_record_alone_produces_a_scene_request() {
-        let LaunchRequest::Scene(req) =
-            parse(["--record", "0x00e6bce5:0x40637e03:0x067a07f0"]).unwrap()
-        else {
-            panic!("expected a scene request");
-        };
+    fn a_record_alone_produces_a_scene_request_with_one_object() {
+        let request = scene(&["--record", "0x00e6bce5:0x40637e03:0x067a07f0"]);
         assert_eq!(
-            req.record,
-            ResourceKey::new(0x00E6_BCE5, 0x4063_7E03, 0x067A_07F0)
+            request.records(),
+            vec![ResourceKey::new(0x00E6_BCE5, 0x4063_7E03, 0x067A_07F0)]
         );
-        assert_eq!(req.record_origin, RecordOrigin::Explicit);
-        assert!(req.packages.is_empty());
-        assert_eq!(req.scale, 1.0);
+        assert!(request.packages.is_empty());
+        assert_eq!(request.scale, 1.0);
+        assert_eq!(request.layout, Layout::Row);
+        assert_eq!(request.spacing, DEFAULT_GAP);
+        assert!(!request.flip_normal_y);
+    }
+
+    #[test]
+    fn records_and_presets_accumulate_into_several_objects() {
+        // The difference between a preset demo and an engine.
+        let request = scene(&[
+            "--preset",
+            "creature",
+            "--preset",
+            "documented-asset",
+            "--record",
+            "0x01:0x02:0x03",
+        ]);
+        assert_eq!(request.objects.len(), 3);
+        assert_eq!(request.records().len(), 3);
+        assert!(request.window.title.contains("3 object"));
+        let domain = request.to_scene();
+        assert_eq!(domain.len(), 3);
+        assert_eq!(domain.records().len(), 3);
+    }
+
+    #[test]
+    fn the_same_record_twice_is_two_objects_and_one_decode() {
+        let request = scene(&["--record", "1:2:3", "--record", "1:2:3"]);
+        let domain = request.to_scene();
+        assert_eq!(domain.len(), 2, "two objects on stage");
+        assert_eq!(domain.records().len(), 1, "but one record to decode");
+        assert_eq!(request.records().len(), 2);
+    }
+
+    #[test]
+    fn a_creature_collects_the_parts_that_follow_it() {
+        let request = scene(&[
+            "--creature",
+            "1:2:3",
+            "--part",
+            "4:5:6",
+            "--part",
+            "7:8:9",
+            "--record",
+            "10:11:12",
+        ]);
+        assert_eq!(request.objects.len(), 2, "the creature and the lone model");
+        assert_eq!(request.objects[0].keys().len(), 3);
+        assert_eq!(request.objects[0].kind(), "creature");
+        assert_eq!(request.objects[1].kind(), "model");
+        let domain = request.to_scene();
+        assert_eq!(
+            domain.records().len(),
+            4,
+            "three creature parts plus the lone model"
+        );
+        let creature = match &domain.objects[0] {
+            SceneObject::Creature(creature) => creature,
+            other => panic!("expected a creature, got {other:?}"),
+        };
+        assert_eq!(creature.len(), 3);
+        assert_eq!(creature.distinct_records(), 3);
+    }
+
+    #[test]
+    fn a_part_before_any_creature_is_refused_rather_than_attached_to_nothing() {
+        assert_eq!(
+            parse(["--part", "1:2:3"]).unwrap_err(),
+            CliError::OrphanPart
+        );
+        assert_eq!(
+            parse(["--record", "1:2:3", "--part", "4:5:6"]).unwrap_err(),
+            CliError::OrphanPart
+        );
     }
 
     #[test]
     fn the_creature_preset_is_distinct_from_the_documented_asset() {
-        let LaunchRequest::Scene(creature) = parse(["--preset", "creature"]).unwrap() else {
-            panic!("expected a scene request");
-        };
+        let creature = scene(&["--preset", "creature"]);
         assert_eq!(
-            creature.record,
-            ResourceKey::new(0x00E6_BCE5, 0x4062_7100, 0x067C_79D2)
+            creature.records(),
+            vec![ResourceKey::new(0x00E6_BCE5, 0x4062_7100, 0x067C_79D2)]
         );
         assert_ne!(
-            creature.record,
+            creature.records()[0],
             ResourceKey::new(
                 PRESET_DOCUMENTED_ASSET.0,
                 PRESET_DOCUMENTED_ASSET.1,
                 PRESET_DOCUMENTED_ASSET.2
             )
         );
-    }
-
-    #[test]
-    fn a_preset_resolves_to_the_documented_identity() {
-        let LaunchRequest::Scene(req) = parse(["--preset", "documented-asset"]).unwrap() else {
-            panic!("expected a scene request");
-        };
         assert_eq!(
-            req.record,
-            ResourceKey::new(0x00E6_BCE5, 0x4063_7E03, 0x067A_07F0)
+            creature.objects[0].origin(),
+            RecordOrigin::Preset("creature")
         );
-        assert_eq!(req.record_origin, RecordOrigin::Preset("documented-asset"));
     }
 
     #[test]
@@ -441,19 +700,16 @@ mod tests {
 
     #[test]
     fn packages_accumulate_in_command_line_order() {
-        let LaunchRequest::Scene(req) = parse([
+        let request = scene(&[
             "--package",
             "/base.package",
             "--package",
             "/patch.package",
             "--record",
             "1:2:3",
-        ])
-        .unwrap() else {
-            panic!("expected a scene request");
-        };
+        ]);
         assert_eq!(
-            req.packages,
+            request.packages,
             vec![
                 PathBuf::from("/base.package"),
                 PathBuf::from("/patch.package")
@@ -462,30 +718,15 @@ mod tests {
     }
 
     #[test]
-    fn a_later_record_or_preset_wins_and_claims_the_origin() {
-        let LaunchRequest::Scene(req) =
-            parse(["--preset", "documented-asset", "--record", "0x01:0x02:0x03"]).unwrap()
-        else {
-            panic!("expected a scene request");
-        };
-        assert_eq!(req.record, ResourceKey::new(1, 2, 3));
-        assert_eq!(req.record_origin, RecordOrigin::Explicit);
-    }
-
-    #[test]
     fn a_flag_without_its_value_is_reported_by_name() {
-        assert_eq!(
-            parse(["--record"]).unwrap_err(),
-            CliError::MissingValue {
-                flag: "--record".into()
-            }
-        );
-        assert_eq!(
-            parse(["--package"]).unwrap_err(),
-            CliError::MissingValue {
-                flag: "--package".into()
-            }
-        );
+        for flag in ["--record", "--package", "--creature", "--part", "--spacing"] {
+            assert_eq!(
+                parse([flag]).unwrap_err(),
+                CliError::MissingValue {
+                    flag: flag.to_owned()
+                }
+            );
+        }
     }
 
     #[test]
@@ -502,60 +743,111 @@ mod tests {
             parse(["--record", "not-a-key"]).unwrap_err(),
             CliError::BadValue { flag, expected: "a T:G:I triple", .. } if flag == "--record"
         ));
+        for bad in ["0", "-1", "inf"] {
+            assert!(matches!(
+                parse(["--scale", bad]).unwrap_err(),
+                CliError::BadValue { flag, .. } if flag == "--scale"
+            ));
+        }
         assert!(matches!(
-            parse(["--scale", "0"]).unwrap_err(),
-            CliError::BadValue { flag, .. } if flag == "--scale"
+            parse(["--spacing", "-0.5"]).unwrap_err(),
+            CliError::BadValue { flag, .. } if flag == "--spacing"
         ));
         assert!(matches!(
-            parse(["--scale", "-1"]).unwrap_err(),
-            CliError::BadValue { flag, .. } if flag == "--scale"
-        ));
-        assert!(matches!(
-            parse(["--scale", "inf"]).unwrap_err(),
-            CliError::BadValue { flag, .. } if flag == "--scale"
+            parse(["--layout", "spiral"]).unwrap_err(),
+            CliError::BadValue { flag, .. } if flag == "--layout"
         ));
     }
 
     #[test]
     fn info_only_is_orthogonal_to_everything_else() {
-        let LaunchRequest::Scene(req) = parse(["--record", "1:2:3", "--info"]).unwrap() else {
-            panic!("expected a scene request");
-        };
-        assert!(req.info_only);
+        assert!(scene(&["--record", "1:2:3", "--info"]).info_only);
     }
 
     #[test]
-    fn the_window_title_names_the_record_unless_it_was_set() {
-        let LaunchRequest::Scene(default_title) = parse(["--record", "1:2:3"]).unwrap() else {
-            panic!()
-        };
-        assert!(default_title.window.title.contains("0x00000001"));
-
-        let LaunchRequest::Scene(custom) = parse(["--record", "1:2:3", "--title", "mine"]).unwrap()
-        else {
-            panic!()
-        };
-        assert_eq!(custom.window.title, "mine");
+    fn the_window_title_names_the_scene_unless_it_was_set() {
+        assert!(scene(&["--record", "1:2:3"])
+            .window
+            .title
+            .contains("1 object"));
+        assert_eq!(
+            scene(&["--record", "1:2:3", "--title", "mine"])
+                .window
+                .title,
+            "mine"
+        );
     }
 
     #[test]
-    fn usage_mentions_every_flag_and_preset() {
+    fn the_assumed_texture_type_defaults_to_raster_and_is_visible() {
+        let request = scene(&["--record", "1:2:3", "--texture"]);
+        assert_eq!(
+            request.assumed_texture_type,
+            spore_core::record::type_id::RASTER
+        );
+        let overridden = scene(&[
+            "--record",
+            "1:2:3",
+            "--texture",
+            "--assumed-texture-type",
+            "0x2F4E681B",
+        ]);
+        assert_eq!(overridden.assumed_texture_type, 0x2F4E_681B);
+        assert!(overridden.textured);
+        assert!(matches!(
+            parse(["--record", "1:2:3", "--assumed-texture-type", "nope"]).unwrap_err(),
+            CliError::BadValue { flag, .. } if flag == "--assumed-texture-type"
+        ));
+    }
+
+    #[test]
+    fn textures_are_off_unless_requested() {
+        assert!(!scene(&["--record", "1:2:3"]).textured);
+        assert!(scene(&["--record", "1:2:3", "--texture"]).textured);
+    }
+
+    #[test]
+    fn the_normal_y_flip_is_opt_in_because_the_convention_is_unknown() {
+        assert!(!scene(&["--record", "1:2:3"]).flip_normal_y);
+        assert!(scene(&["--record", "1:2:3", "--flip-normal-y"]).flip_normal_y);
+    }
+
+    #[test]
+    fn usage_documents_every_flag_and_preset() {
         let text = usage();
         for flag in [
             "--package",
             "--record",
             "--preset",
+            "--creature",
+            "--part",
+            "--layout",
+            "--spacing",
             "--scale",
             "--width",
             "--height",
             "--title",
             "--info",
+            "--texture",
+            "--flip-normal-y",
             "--placeholder",
         ] {
-            assert!(text.contains(flag), "usage must document {flag}");
+            assert!(text.contains(flag), "usage must document {flag}: {text}");
         }
         for (name, _) in PRESETS {
             assert!(text.contains(name), "usage must document preset {name}");
         }
+        assert!(
+            text.contains("no type word"),
+            "the assumption must be explained, not just offered: {text}"
+        );
+        assert!(
+            text.contains("UNKNOWN"),
+            "the normal-map convention must be stated as unknown: {text}"
+        );
+        assert!(
+            text.contains("REPEATABLE"),
+            "multi-object loading must be documented: {text}"
+        );
     }
 }

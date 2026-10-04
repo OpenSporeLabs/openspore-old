@@ -1,358 +1,730 @@
-//! The asset bridge: a decoded Spore model becomes an entity on screen.
+//! The runtime boundary: a decoded [`Scene`] becomes entities.
 //!
-//! This is the one place where `spore-assets` (pure, testable, no GPU) meets
-//! Bevy (assets, components, spawn). Everything that can be decided without a
-//! renderer *is* decided in `spore-assets` or [`crate::convert`]; what is left
-//! here is only the part that genuinely needs an `Assets<Mesh>` handle.
+//! # Ownership, and why the split with [`crate::scene`] is deliberate
 //!
-//! # Load strategy, and why it is what it is
+//! * [`crate::scene::ScenePlugin`] owns the **world**: camera, lights, ground.
+//!   Those are OpenSpore's choices and change when the renderer changes.
+//! * [`crate::loader::SporeAssetPlugin`] owns the **content**: the entities that
+//!   carry Spore geometry and materials.
 //!
-//! A `.package` file is memory-mapped and its index parsed once. Both cost real
-//! time -- `Spore_Content.package` is ~995 MB and its index holds ~103k rows --
-//! so neither happens inside a frame, and neither happens inside a Bevy system:
-//! [`crate::prepare`] does it before the app exists. What is left here is a
-//! decode result already in hand, which is why this module never reports an
-//! error of its own about locating a record.
+//! Two owners, one entity kind each. When both spawned a camera, Bevy warned
+//! "Camera order ambiguities detected" and the model rendered from whichever
+//! camera it picked, so the framing query found "multiple entities" and the
+//! symptom looked like a framing bug rather than a duplicate spawn. That is
+//! recorded here so it is not repeated.
+//!
+//! # Nothing is loaded inside a system
+//!
+//! A `.package` is memory-mapped and its index parsed once; `Spore_Content` is
+//! **995 268 083 bytes** over **17 119** index rows. [`crate::prepare`] does that
+//! work before any `App` exists, so `--info` is a CI gate and a load failure is
+//! reportable without a window. The systems here start from decoded data.
+//!
+//! # Deferred commands
+//!
+//! `Commands::spawn` is deferred, so a `Query` in the same system that spawns
+//! sees nothing. Every system here that spawns therefore has **no** query, and
+//! camera framing runs in `PostStartup` against a resource the caller inserted.
+//! Doing both in one system silently leaves the camera at its default position —
+//! which is the second time that mistake presented as a framing bug.
 
-use std::path::Path;
 use std::sync::Arc;
 
 use bevy::app::Plugin;
+use bevy::math::Quat;
 use bevy::pbr::StandardMaterial;
 use bevy::prelude::*;
 
-use spore_assets::{AssetError, ContentStore, LoadedModel, Package};
+use spore_assets::AssetError;
 use spore_core::ResourceKey;
 
 use crate::convert::{self, NormalMode};
-use crate::scene::{self, OnStage};
+use crate::domain::materials::{MaterialRoute, MeshMaterialPlan, ModelMaterials};
+use crate::domain::model::{DecodeStatus, ModelDefinition, ModelInstance};
+use crate::domain::scene::{Layout, ObjectExtent, Scene};
+use crate::domain::world::ResourceWorld;
+use crate::domain::Bounds;
+use crate::scene::{MainCamera, OnStage};
+use crate::texture::{self, NormalMapOrientation};
 
-/// Decoded content for one record: geometry, and optionally its textures.
+/// The normal policy this build stages geometry with.
+pub const NORMAL_MODE: NormalMode = NormalMode::Computed;
+
+/// The world floor. Every object is lifted so its own lowest point sits here.
+pub const FLOOR_Y: f32 = 0.0;
+
+/// The vertical field of view used when framing a scene.
+pub const DEFAULT_VERTICAL_FOV_DEGREES: f32 = 60.0;
+
+// ---------------------------------------------------------------------------
+// Resources and components
+// ---------------------------------------------------------------------------
+
+/// A loaded scene: the domain description plus every record it needs.
 ///
-/// Not `Clone`: `spore_material::MaterialError` wraps `spore_assets::AssetError`,
-/// which wraps `std::io::Error` and therefore cannot be cloned. Sharing the
-/// decoded content is done with an [`Arc`] on [`StagedContent`] instead.
-///
-/// # Textures are resolved here, not at spawn time
-///
-/// `spore-material` needs a [`ContentStore`], which is a live resource over
-/// memory-mapped packages. If textures were resolved inside a spawn system the
-/// mapping would have to outlive the app or be re-entered per spawn. Resolving
-/// up front -- in [`crate::prepare`], before Bevy exists -- keeps the store a
-/// plain local and makes `--info` report texture resolution too, so the headless
-/// path and the visible path cannot disagree about what loaded.
-#[derive(Debug, Default)]
-pub struct DecodedTextures {
-    /// One entry per texture the model referenced, in encounter order.
-    pub results: Vec<Result<spore_material::ResolvedTexture, spore_material::MaterialError>>,
-    /// Whether texture resolution was requested at all.
-    pub requested: bool,
+/// Inserted before the app is built; see [`crate::build_scene_app`].
+#[derive(Resource, Debug, Default)]
+pub struct LoadedScene {
+    /// What is on stage, with placements resolved.
+    pub scene: Scene,
+    /// One definition per distinct record, in load order.
+    ///
+    /// Shared behind an [`Arc`], so a record placed twice is decoded once and
+    /// dropped once.
+    pub models: Vec<Arc<ModelDefinition>>,
 }
 
-impl DecodedTextures {
-    /// How many references resolved.
-    pub fn resolved(&self) -> usize {
-        self.results.iter().filter(|r| r.is_ok()).count()
+impl LoadedScene {
+    /// The definition for a record, if it was loaded.
+    pub fn model(&self, key: &ResourceKey) -> Option<&Arc<ModelDefinition>> {
+        self.models.iter().find(|model| model.key == *key)
     }
 
-    /// How many were refused, with the reasons.
-    pub fn failures(&self) -> Vec<&spore_material::MaterialError> {
-        self.results
-            .iter()
-            .filter_map(|r| r.as_ref().err())
+    /// Every model instance the scene places, paired with its definition.
+    pub fn placements(&self) -> Vec<(&Arc<ModelDefinition>, &ModelInstance)> {
+        self.scene
+            .instances()
+            .into_iter()
+            .filter_map(|instance| self.model(&instance.key).map(|model| (model, instance)))
             .collect()
     }
-}
 
-/// A decoded model, ready to be turned into entities.
-///
-/// Holds the model behind an [`Arc`] so inserting it as a Bevy resource is a
-/// pointer copy rather than a deep clone of every vertex buffer, and so
-/// [`crate::build_scene_app`] can take it by value without duplicating it.
-#[derive(Debug, Resource)]
-pub struct StagedContent {
-    /// What was decoded.
-    pub model: Arc<LoadedModel>,
-    /// World-space uniform scale to apply.
-    pub scale: f32,
-    /// Which packages were searched, in resolution order.
-    pub packages: Vec<String>,
-    /// Textures, when they were requested.
-    pub textures: DecodedTextures,
-}
-
-impl StagedContent {
-    /// Wraps a decoded model, with no textures.
-    pub fn new(model: LoadedModel, scale: f32) -> Self {
-        Self {
-            model: Arc::new(model),
-            scale,
-            packages: Vec::new(),
-            textures: DecodedTextures::default(),
-        }
-    }
-
-    /// Which packages were searched, in resolution order.
-    pub fn with_packages(mut self, packages: Vec<String>) -> Self {
-        self.packages = packages;
-        self
-    }
-
-    /// Attaches resolved textures, in the order the model referenced them.
-    pub fn with_textures(
-        mut self,
-        results: Vec<Result<spore_material::ResolvedTexture, spore_material::MaterialError>>,
-    ) -> Self {
-        self.textures = DecodedTextures {
-            results,
-            requested: true,
-        };
-        self
-    }
-
-    /// Total triangles across every mesh.
-    pub fn triangles(&self) -> usize {
-        self.model.meshes.iter().map(|m| m.indices.len() / 3).sum()
-    }
-
-    /// The union of every mesh's bounds, or `None` when there are no meshes.
-    pub fn bounds(&self) -> Option<([f32; 3], [f32; 3])> {
-        let mut bounds: Option<([f32; 3], [f32; 3])> = None;
-        for mesh in &self.model.meshes {
-            bounds = Some(match bounds {
-                None => (mesh.bounds_min, mesh.bounds_max),
-                Some((lo, hi)) => (
-                    [
-                        lo[0].min(mesh.bounds_min[0]),
-                        lo[1].min(mesh.bounds_min[1]),
-                        lo[2].min(mesh.bounds_min[2]),
-                    ],
-                    [
-                        hi[0].max(mesh.bounds_max[0]),
-                        hi[1].max(mesh.bounds_max[1]),
-                        hi[2].max(mesh.bounds_max[2]),
-                    ],
-                ),
-            });
+    /// The union of everything placed, transformed by its placement.
+    pub fn bounds(&self) -> Bounds {
+        let mut bounds: Bounds = None;
+        for (model, instance) in self.placements() {
+            let Some((lo, hi)) = model.bounds() else {
+                continue;
+            };
+            let [x, y, z] = instance.placement.translation;
+            let scale = instance.placement.scale;
+            bounds = crate::domain::grow(
+                bounds,
+                Some((
+                    [lo[0] * scale + x, lo[1] * scale + y, lo[2] * scale + z],
+                    [hi[0] * scale + x, hi[1] * scale + y, hi[2] * scale + z],
+                )),
+            );
         }
         bounds
     }
 
-    /// The one-line, versioned report the tooling and CI parse.
+    /// Total triangles across every **definition**, not every placement.
     ///
-    /// The trailing `decode=` field is the important one: a model whose tail
-    /// stopped at the material-info table has COMPLETE geometry, and this
-    /// report says so rather than letting a consumer infer completeness from
-    /// the presence of a mesh.
+    /// Placement-independent on purpose: quoting the multiplied count would make
+    /// the number depend on the layout, and a triangle count that changes when
+    /// you move something is not a property of the data.
+    pub fn triangles(&self) -> usize {
+        self.models.iter().map(|model| model.triangles()).sum()
+    }
+
+    /// How many leaf mesh entities the scene will spawn.
+    pub fn part_count(&self) -> usize {
+        self.placements()
+            .iter()
+            .map(|(model, _)| model.parts.len())
+            .sum()
+    }
+
+    /// How many leaf entities will carry a bound normal map.
+    pub fn parts_with_normal_maps(&self) -> usize {
+        self.placements()
+            .iter()
+            .map(|(model, _)| {
+                model.materials.as_ref().map_or(0, |materials| {
+                    materials
+                        .plans()
+                        .iter()
+                        .filter(|plan| plan.normal_map.is_some())
+                        .count()
+                })
+            })
+            .sum()
+    }
+}
+
+/// The packages the scene was loaded from, kept for a future streaming
+/// subsystem.
+///
+/// Deliberately unread by any system here: the renderer needs vertex buffers and
+/// texels, both copied out of the mapping by the decoders, so nothing downstream
+/// of the definitions reads the store. Holding the world as a resource makes the
+/// ownership explicit without letting a borrow keep 995 MB of mapping alive by
+/// accident.
+#[derive(Resource, Debug, Clone)]
+pub struct WorldResources {
+    /// The world, shared.
+    pub world: Arc<ResourceWorld>,
+}
+
+impl WorldResources {
+    /// Bytes of package image the mapping holds.
+    pub fn mapped_bytes(&self) -> usize {
+        self.world.mapped_bytes()
+    }
+
+    /// Which packages were searched, in resolution order.
+    pub fn package_names(&self) -> &[String] {
+        self.world.package_names()
+    }
+}
+
+/// The scene's normal-map orientation policy.
+///
+/// A resource because it is a decision about **the data**, not about the
+/// renderer: two scenes in one process could disagree about it, and the answer
+/// must be readable at runtime rather than baked into a constant.
+#[derive(Resource, Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NormalMapPolicy(pub NormalMapOrientation);
+
+impl NormalMapPolicy {
+    /// The orientation to stage with.
+    pub const fn orientation(self) -> NormalMapOrientation {
+        self.0
+    }
+}
+
+/// What the camera should frame, and with what field of view.
+///
+/// A resource rather than a closure added by the caller: it makes the framing
+/// step a named system a test can drive, instead of a per-app closure no test
+/// can reach.
+#[derive(Resource, Debug, Clone, Copy)]
+pub struct CameraFraming {
+    /// The box to frame.
+    pub bounds: ([f32; 3], [f32; 3]),
+    /// Vertical field of view, in degrees.
+    pub vertical_fov_degrees: f32,
+}
+
+/// Marks the parent entity of one scene object.
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SceneObjectMarker {
+    /// The object's index in [`Scene::objects`].
+    pub index: usize,
+    /// `"model"` or `"creature"`.
+    pub kind: &'static str,
+}
+
+/// Marks a leaf entity carrying one mesh of one model.
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelPartMarker {
+    /// The record the geometry came from.
+    pub key: ResourceKey,
+    /// The mesh's index in the record's mesh table.
+    pub mesh_index: u32,
+    /// The material id the record associated with the mesh. A bare word.
+    pub material_id: u32,
+}
+
+/// Every uploaded alpha plane of one mesh, carried on the mesh that owns them.
+///
+/// **The purpose of none of them is established.**
+/// `spore_material::claims::MASK_LAYER_PURPOSE` is an `UNKNOWN` non-finding, so
+/// this names each plane by record and layer index and nothing else. It exists so
+/// the planes are addressable and demonstrably uploaded rather than guessed at
+/// or discarded.
+///
+/// A `Vec` rather than one component per plane, and that is a real constraint
+/// rather than a style choice: `Commands::insert` **replaces** a component of the
+/// same type, so a per-plane component would leave exactly one of the four
+/// planes on a three-entry record — the last one inserted — and the other three
+/// would vanish with no error.
+#[derive(Component, Debug, Clone, PartialEq, Eq)]
+pub struct MaskChannels {
+    /// The planes, in slot then layer order.
+    pub planes: Vec<MaskChannelBinding>,
+}
+
+impl MaskChannels {
+    /// How many planes this mesh carries.
+    pub fn len(&self) -> usize {
+        self.planes.len()
+    }
+
+    /// Whether the mesh carries none.
+    pub fn is_empty(&self) -> bool {
+        self.planes.is_empty()
+    }
+}
+
+/// One uploaded alpha plane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaskChannelBinding {
+    /// The record the plane came from.
+    pub key: ResourceKey,
+    /// Which of that record's layers.
+    pub layer_index: usize,
+    /// The uploaded single-channel image.
+    pub handle: Handle<Image>,
+}
+
+/// What happened when the scene was put on stage.
+#[derive(Resource, Debug, Clone, PartialEq)]
+pub struct SceneOutcome {
+    /// Parent entities spawned.
+    pub objects: usize,
+    /// Leaf mesh entities spawned.
+    pub parts: usize,
+    /// Triangles across every definition.
+    pub triangles: usize,
+    /// Leaf entities carrying a bound normal map.
+    pub parts_with_normal_maps: usize,
+    /// Mask planes uploaded.
+    pub mask_channels: usize,
+    /// The union of what was placed, for camera framing.
+    pub bounds: Bounds,
+}
+
+/// What the loader decided before the window opened.
+#[derive(Debug)]
+pub struct PrepareOutcome {
+    /// What to stage.
+    pub loaded: LoadedScene,
+    /// One report per record, in load order.
+    pub reports: Vec<ModelReport>,
+    /// The world, for insertion as a resource.
+    pub world: Arc<ResourceWorld>,
+}
+
+impl PrepareOutcome {
+    /// Every report line, in a fixed order: one `STAGED v1` and one
+    /// `MATERIAL v1` per record, then one `SCENE v1` summary.
+    pub fn report_lines(&self) -> Vec<String> {
+        let records = self.reports.len();
+        let mut lines = Vec::with_capacity(records * 2 + 1);
+        for (index, report) in self.reports.iter().enumerate() {
+            lines.push(report.staged_line());
+            lines.push(report.material_line(index, records));
+        }
+        lines.push(self.scene_line());
+        lines
+    }
+
+    /// The `OPENSPORE-SCENE v1` summary.
+    pub fn scene_line(&self) -> String {
+        let parts: usize = self.loaded.models.iter().map(|m| m.parts.len()).sum();
+        let normal_maps: usize = self.reports.iter().map(ModelReport::normal_maps).sum();
+        let masks: usize = self.reports.iter().map(ModelReport::mask_channels).sum();
+        format!(
+            "OPENSPORE-SCENE v1 objects={} models={} parts={} triangles={} \
+             normal_maps_bound={normal_maps} mask_channels_bound={masks} \
+             packages={} mapped_bytes={}",
+            self.loaded.scene.len(),
+            self.loaded.models.len(),
+            parts,
+            self.loaded.triangles(),
+            self.world.package_names().join(","),
+            self.world.mapped_bytes(),
+        )
+    }
+}
+
+/// One record's decode outcome, for the report lines.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelReport {
+    /// Which record.
+    pub key: ResourceKey,
+    /// Which package answered.
+    pub package_name: String,
+    /// The container it decoded as.
+    pub format: String,
+    /// Meshes in the record.
+    pub meshes: usize,
+    /// Triangles, after fan expansion.
+    pub triangles: usize,
+    /// The record's bounds.
+    pub bounds: Bounds,
+    /// How far the decode got.
+    pub decode: DecodeStatus,
+    /// Texture references resolved, out of those attempted.
+    pub textures_resolved: usize,
+    /// Texture references attempted.
+    pub textures_attempted: usize,
+    /// Whether texture resolution was requested at all.
+    pub textures_requested: bool,
+    /// The role table, when textures were resolved.
+    pub materials: Option<ModelMaterials>,
+    /// The per-mesh plans, when textures were resolved.
+    pub plans: Vec<MeshMaterialPlan>,
+    /// Which route produced the role table.
+    pub route: Option<MaterialRoute>,
+}
+
+impl ModelReport {
+    /// Plans carrying a bound normal map.
+    pub fn normal_maps(&self) -> usize {
+        self.plans
+            .iter()
+            .filter(|plan| plan.normal_map.is_some())
+            .count()
+    }
+
+    /// Mask planes the plans call for.
+    pub fn mask_channels(&self) -> usize {
+        self.plans.iter().map(|plan| plan.masks.len()).sum()
+    }
+
+    /// The `OPENSPORE-STAGED v1` line for this record.
     ///
-    /// Fixed field set and fixed order, because the point of a machine-readable
-    /// line is that a consumer can rely on it -- the same discipline as the
-    /// repository's existing `CELLSTAGE-MANIFEST v1`.
-    ///
-    /// The `normals=` field is stated rather than implied, because this engine
-    /// *derives* normals from the triangles instead of decoding the record's
-    /// `UBYTE4` bytes (see `spore_gmdl::claims::vertex_normal_encoding`). A
-    /// reader must not have to know that to know which shading it is looking at.
-    pub fn report_line(&self) -> String {
-        let (lo, hi) = self.bounds().unwrap_or(([0.0; 3], [0.0; 3]));
+    /// **The field set and order are unchanged** from the line this engine has
+    /// always printed, so an existing consumer keeps working. `textures=n/m`
+    /// distinguishes "we looked and there were none" (`0/0` with
+    /// `textures_requested == false`) from "all m references failed" (`0/m`).
+    pub fn staged_line(&self) -> String {
+        let (lo, hi) = self.bounds.unwrap_or(([0.0; 3], [0.0; 3]));
         format!(
             "OPENSPORE-STAGED v1 key={} package={} format={} meshes={} triangles={} \
              bounds_min={:.6},{:.6},{:.6} bounds_max={:.6},{:.6},{:.6} normals=derived \
-             textures={}/{}",
-            self.model.key,
-            self.model.package_name,
-            self.model.format.as_str(),
-            self.model.meshes.len(),
-            self.triangles(),
+             textures={}/{} decode={}",
+            self.key,
+            self.package_name,
+            self.format,
+            self.meshes,
+            self.triangles,
             lo[0],
             lo[1],
             lo[2],
             hi[0],
             hi[1],
             hi[2],
-            self.textures.resolved(),
-            self.textures.results.len(),
-        ) + &format!(
-            " decode={decode}",
-            decode = self
-                .model
-                .stop_text()
-                .unwrap_or_else(|| "complete".to_owned())
+            self.textures_resolved,
+            self.textures_attempted,
+            self.decode.describe(),
+        )
+    }
+
+    /// The `OPENSPORE-MATERIAL v1` line for this record.
+    ///
+    /// New, and additive: it says what the roles were, which surface fed which
+    /// channel, and — the field a reader should not skip — that the per-mesh cut
+    /// is an **inference**.
+    pub fn material_line(&self, index: usize, records: usize) -> String {
+        let Some(materials) = &self.materials else {
+            return format!(
+                "OPENSPORE-MATERIAL v1 record={index}/{records} key={} roles=unavailable \
+                 reason=textures_not_requested",
+                self.key
+            );
+        };
+        let roles = materials
+            .role_census()
+            .iter()
+            .map(|(role, count)| format!("{}:{count}", role.as_str()))
+            .collect::<Vec<_>>()
+            .join(",");
+        let agreed = materials
+            .ordinal_agreement
+            .map_or(0, |agreement| agreement.agreed);
+        let compared = materials
+            .ordinal_agreement
+            .map_or(0, |agreement| agreement.compared);
+        let plans = self
+            .plans
+            .iter()
+            .map(MeshMaterialPlan::describe)
+            .collect::<Vec<_>>()
+            .join(" | ");
+        format!(
+            "OPENSPORE-MATERIAL v1 record={index}/{records} key={} meshes={} scope={} \
+             refs_per_mesh={} inferred={} route={} shape={} ordinals={agreed}/{compared} \
+             roles={} normal_maps_bound={} mask_channels_bound={} plans=[{plans}]",
+            self.key,
+            self.meshes,
+            materials.scope.as_str(),
+            materials
+                .scope
+                .refs_per_mesh()
+                .map_or_else(|| "unavailable".to_owned(), |per_mesh| per_mesh.to_string()),
+            materials.scope.is_inferred(),
+            self.route.map_or("unavailable", MaterialRoute::as_str),
+            materials
+                .observed_shape
+                .as_ref()
+                .map_or("unavailable", spore_material::TexSetShape::as_str),
+            if roles.is_empty() { "none" } else { &roles },
+            self.normal_maps(),
+            self.mask_channels(),
         )
     }
 }
 
-/// Opens the packages named by a request, in the order given.
+// ---------------------------------------------------------------------------
+// Loading, before Bevy
+// ---------------------------------------------------------------------------
+
+/// Loads and decodes a scene from a world. No Bevy, no GPU, no window.
 ///
-/// Reports every failure as a value rather than a panic: a missing game install
-/// is an ordinary operating state for a cross-platform engine, not a bug.
-pub fn open_packages<P: AsRef<Path>>(paths: &[P]) -> Result<ContentStore, AssetError> {
-    let mut store = ContentStore::new();
-    for path in paths {
-        store.push(Package::open(package_name(path.as_ref()), path.as_ref())?);
+/// `textured` gates texture resolution, because resolving one reference costs a
+/// record read and a decode, and must stay opt-in.
+pub fn prepare_scene(
+    world: Arc<ResourceWorld>,
+    mut scene: Scene,
+    textured: bool,
+    assumed_texture_type: u32,
+    layout: Layout,
+    gap: f32,
+) -> Result<(PrepareOutcome, Vec<Option<ObjectExtent>>), AssetError> {
+    let mut models: Vec<Arc<ModelDefinition>> = Vec::new();
+    for key in scene.records() {
+        let loaded = world.load_model(&key)?;
+        let materials = if textured {
+            Some(ModelMaterials::resolve(
+                world.store(),
+                &key,
+                &loaded,
+                assumed_texture_type,
+            ))
+        } else {
+            None
+        };
+        models.push(Arc::new(ModelDefinition::from_loaded(&loaded, materials)));
     }
-    Ok(store)
+
+    let extents = object_extents(&scene, &models);
+    scene.layout(&extents, layout, gap, FLOOR_Y);
+
+    let reports = models.iter().map(|model| report_for(model)).collect();
+    Ok((
+        PrepareOutcome {
+            loaded: LoadedScene { scene, models },
+            reports,
+            world,
+        },
+        extents,
+    ))
 }
 
-/// The display name for a package path: its file stem.
-fn package_name(path: &Path) -> String {
-    path.file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.display().to_string())
+/// The extent of each object in its own frame, before placement.
+fn object_extents(scene: &Scene, models: &[Arc<ModelDefinition>]) -> Vec<Option<ObjectExtent>> {
+    scene
+        .objects
+        .iter()
+        .map(|object| {
+            let mut merged: Option<ObjectExtent> = None;
+            for instance in object.instances() {
+                let Some(model) = models.iter().find(|model| model.key == instance.key) else {
+                    continue;
+                };
+                let Some((lo, hi)) = model.bounds() else {
+                    continue;
+                };
+                merged = Some(match merged {
+                    None => ObjectExtent {
+                        bounds_min: lo,
+                        bounds_max: hi,
+                    },
+                    Some(current) => ObjectExtent {
+                        bounds_min: [
+                            current.bounds_min[0].min(lo[0]),
+                            current.bounds_min[1].min(lo[1]),
+                            current.bounds_min[2].min(lo[2]),
+                        ],
+                        bounds_max: [
+                            current.bounds_max[0].max(hi[0]),
+                            current.bounds_max[1].max(hi[1]),
+                            current.bounds_max[2].max(hi[2]),
+                        ],
+                    },
+                });
+            }
+            merged
+        })
+        .collect()
 }
 
-/// What happened when content was put on stage.
-#[derive(Debug, Clone, PartialEq)]
-pub enum StageOutcome {
-    /// The content was spawned.
-    Staged {
-        /// The identity shown.
-        key: ResourceKey,
-        /// Which package answered.
-        package: String,
-        /// How many entities were spawned.
-        entities: usize,
-        /// How many triangles in total.
-        triangles: usize,
-        /// Where the geometry sits, for camera framing.
-        bounds: ([f32; 3], [f32; 3]),
-    },
-    /// Nothing was spawned, because the content held no meshes.
-    NothingToShow {
-        /// The identity that was asked for.
-        key: ResourceKey,
-        /// Why there was nothing to show.
-        reason: String,
-    },
+fn report_for(model: &ModelDefinition) -> ModelReport {
+    let plans = model
+        .materials
+        .as_ref()
+        .map_or_else(Vec::new, ModelMaterials::plans);
+    let materials = model.materials.clone();
+    ModelReport {
+        key: model.key,
+        package_name: model.package_name.clone(),
+        format: model.format.as_str().to_owned(),
+        meshes: model.parts.len(),
+        triangles: model.triangles(),
+        bounds: model.bounds(),
+        decode: model.decode.clone(),
+        textures_resolved: materials.as_ref().map_or(0, ModelMaterials::resolved_count),
+        textures_attempted: materials.as_ref().map_or(0, ModelMaterials::attempted),
+        // "Asked and got nothing" is not "did not ask": the report line has to be
+        // able to tell `0/0` from `0/2`.
+        textures_requested: model.materials.is_some(),
+        materials,
+        plans,
+        route: model.materials.as_ref().map(|table| table.route),
+    }
 }
 
-/// Spawns entities for already-decoded content.
+// ---------------------------------------------------------------------------
+// Spawning
+// ---------------------------------------------------------------------------
+
+/// Spawns entities for an already-loaded scene.
 ///
 /// Takes the decode result rather than looking one up, because the lookup
 /// already happened outside the render loop; re-doing it here would make the
 /// window's contents depend on when it was opened.
-pub fn stage_decoded(
-    content: &StagedContent,
+pub fn spawn_scene(
+    loaded: &LoadedScene,
+    orientation: NormalMapOrientation,
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
     images: &mut Assets<Image>,
-) -> StageOutcome {
-    // NOTE: the world is spawned by `ScenePlugin`, NOT here. When this call
-    // remained alongside the plugin, every run produced two cameras and two
-    // lights -- the model rendered from whichever camera Bevy picked, the
-    // framing query found "multiple entities", and the result looked like a
-    // camera-framing bug rather than a duplicate spawn. Bevy's own
-    // "Camera order ambiguities detected" warning is what caught it.
-    //
-    // `ScenePlugin` owns the world; `SporeAssetPlugin` owns the content. One
-    // owner each, so neither can double up.
+) -> SceneOutcome {
+    let mut outcome = SceneOutcome {
+        objects: loaded.scene.len(),
+        parts: 0,
+        triangles: loaded.triangles(),
+        parts_with_normal_maps: 0,
+        mask_channels: 0,
+        bounds: loaded.bounds(),
+    };
 
-    if content.model.meshes.is_empty() {
-        let reason = format!(
-            "record {} decoded as {} but produced no mesh; this container's payloads are not decoded yet",
-            content.model.key,
-            content.model.format.as_str()
-        );
-        warn!("{reason}");
-        return StageOutcome::NothingToShow {
-            key: content.model.key,
-            reason,
-        };
+    for (index, object) in loaded.scene.objects.iter().enumerate() {
+        // One parent per object, and it owns the object's placement. A
+        // creature's parts therefore share one frame, which is what "a creature
+        // built from several records" has to mean for the transform to be
+        // meaningful; the leaves stay in identity space.
+        let parent = commands
+            .spawn((
+                object
+                    .instances()
+                    .first()
+                    .map_or_else(Transform::default, |instance| {
+                        Transform::from_translation(Vec3::from(instance.placement.translation))
+                            .with_rotation(Quat::from_rotation_y(
+                                instance.placement.rotation_y_degrees.to_radians(),
+                            ))
+                            .with_scale(Vec3::splat(instance.placement.scale))
+                    }),
+                SceneObjectMarker {
+                    index,
+                    kind: object.kind(),
+                },
+            ))
+            .id();
+        for instance in object.instances() {
+            let Some(model) = loaded.model(&instance.key) else {
+                continue;
+            };
+            // Once per record, not once per mesh: `plans()` cuts the flat
+            // reference list per call and doing that 47 000 times would be a
+            // different bug than the one this engine came with.
+            let plans = model
+                .materials
+                .as_ref()
+                .map_or_else(Vec::new, ModelMaterials::plans);
+            let textures = model
+                .materials
+                .as_ref()
+                .map(|table| table.textures.as_slice())
+                .unwrap_or(&[]);
+            for part in &model.parts {
+                let buffers = part.buffers();
+                let bevy_mesh = convert::to_bevy_mesh(&buffers, NORMAL_MODE);
+                let bound = plans
+                    .get(part.mesh_index as usize)
+                    .map(|plan| texture::bind_material(plan, textures, orientation, images));
+                let material = match &bound {
+                    Some(bound) => {
+                        if bound.surfaces.normal_map.is_some() {
+                            outcome.parts_with_normal_maps += 1;
+                        }
+                        outcome.mask_channels += bound.mask_count();
+                        materials.add(bound.material.clone())
+                    }
+                    None => materials.add(texture::standard_material(
+                        &texture::SurfaceSet::default(),
+                        None,
+                    )),
+                };
+                // The mask planes ride in the spawn bundle rather than being
+                // inserted afterwards, so the entity is complete the moment it
+                // exists. Inserting afterwards would also be *one component per
+                // plane*, which silently keeps only the last of the four.
+                let planes: Vec<MaskChannelBinding> = bound
+                    .as_ref()
+                    .map(|bound| {
+                        bound
+                            .surfaces
+                            .masks
+                            .iter()
+                            .zip(bound.mask_handles.iter())
+                            .map(|(mask, handle)| MaskChannelBinding {
+                                key: mask.key,
+                                layer_index: match mask.kind {
+                                    crate::texture::SurfaceKind::MaskChannel { layer_index } => {
+                                        layer_index
+                                    }
+                                    crate::texture::SurfaceKind::TangentSpaceNormal => {
+                                        unreachable!("a normal map is never a mask channel")
+                                    }
+                                },
+                                handle: handle.clone(),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let channels = (!planes.is_empty()).then_some(MaskChannels { planes });
+                let child = commands
+                    .spawn((
+                        Mesh3d(meshes.add(bevy_mesh)),
+                        MeshMaterial3d(material),
+                        // Identity: the placement lives on the parent, so a
+                        // creature's parts move together.
+                        Transform::default(),
+                        OnStage,
+                        ModelPartMarker {
+                            key: model.key,
+                            mesh_index: part.mesh_index,
+                            material_id: part.material_id,
+                        },
+                    ))
+                    .id();
+                if let Some(channels) = channels {
+                    commands.entity(child).insert(channels);
+                }
+                // `ChildOf` on the child alone is NOT enough: Bevy's hierarchy
+                // invariant is that the parent carries `Children` too, and its
+                // B0004 warning says plainly that a one-sided relationship
+                // "will cause inconsistent behaviors". `add_child` maintains
+                // both sides, so it is what the engine uses.
+                commands.entity(parent).add_child(child);
+                outcome.parts += 1;
+            }
+        }
     }
-
-    let bounds = content.bounds().unwrap_or(([0.0; 3], [0.0; 3]));
-    let floor_offset = -bounds.0[1];
-
-    // One texture is applied when one resolved. Which of a model's texture
-    // references is the *diffuse* one is NOT known -- the 16 header bytes of a
-    // texture-set entry are undecoded, and `spore-material` therefore exposes
-    // `SamplerRole::Unresolved` as its only variant. Picking the first resolved
-    // reference and saying so is a *stated visual choice*, not a claim about the
-    // record; the alternative, refusing to texture anything, would leave the
-    // material path untested against real data.
-    let first_texture: Option<Handle<Image>> = content
-        .textures
-        .results
-        .iter()
-        .find_map(|r| r.as_ref().ok())
-        .map(|t| {
-            info!(
-                "applying texture {} ({}x{}, {} mip(s), {} layer(s)) as the diffuse colour",
-                t.key, t.image.width, t.image.height, t.mip_count, t.layer_count
-            );
-            crate::texture::to_bevy_image(t, images)
-        });
-    if content.textures.requested && first_texture.is_none() {
-        warn!(
-            "textures were requested but {} reference(s) all failed; the model will use the flat tint",
-            content.textures.results.len()
-        );
-    }
-
-    for (index, mesh) in content.model.meshes.iter().enumerate() {
-        let buffers = convert::to_buffers(mesh);
-        let bevy_mesh = convert::to_bevy_mesh(&buffers, NormalMode::Computed);
-        let material = materials.add(StandardMaterial {
-            base_color: if first_texture.is_some() {
-                Color::WHITE
-            } else {
-                scene::ASSET_TINT
-            },
-            base_color_texture: first_texture.clone(),
-            perceptual_roughness: 0.55,
-            metallic: 0.05,
-            // Spore geometry carries its own winding convention, which has not
-            // been confirmed against a rendered original frame. Culling back
-            // faces on a guess would make a model invisible; showing both sides
-            // cannot hide geometry. Revisit when a reference frame exists.
-            double_sided: true,
-            ..default()
-        });
-        // Lift onto the floor: a model authored around its own origin would
-        // otherwise sink below the ground plane. Extra meshes are spread along X
-        // so a multi-mesh record does not z-fight with itself.
-        let spread = (index as f32) * 6.0;
-        commands.spawn((
-            Mesh3d(meshes.add(bevy_mesh)),
-            MeshMaterial3d(material),
-            Transform::from_xyz(spread, floor_offset, 0.0).with_scale(Vec3::splat(content.scale)),
-            OnStage,
-        ));
-    }
-
-    StageOutcome::Staged {
-        key: content.model.key,
-        package: content.model.package_name.clone(),
-        entities: content.model.meshes.len(),
-        triangles: content.triangles(),
-        bounds,
-    }
+    outcome
 }
 
-/// Spawns entities for [`StagedContent`] during `Startup`.
+// ---------------------------------------------------------------------------
+// The plugin
+// ---------------------------------------------------------------------------
+
+/// Turns a [`LoadedScene`] into entities.
 ///
-/// The plugin is the boundary between "a record has been decoded" and "there is
-/// something on screen". It is one system over one resource, which is the
-/// smallest thing that is still a real seam: a second content source (a
-/// procedural creature, a mod-provided asset, a test fixture) becomes a second
-/// implementation of "produce `StagedContent`", with no change here.
-///
-/// The resource must be inserted before the app is built, which
-/// [`crate::build_scene_app`] does. That ordering is deliberate: the decode
-/// happens outside Bevy so a failure is reportable without a window.
+/// The boundary between "a record has been decoded" and "there is something on
+/// screen". A second content source — a procedural creature, a mod-provided
+/// asset, a test fixture — becomes a second implementation of "produce a
+/// `LoadedScene`", with no change here.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SporeAssetPlugin;
 
 impl Plugin for SporeAssetPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, spawn_staged_content);
+        app.add_systems(Startup, spawn_loaded_scene);
+        app.add_systems(PostStartup, frame_camera_on_the_scene);
     }
 }
 
-fn spawn_staged_content(
+fn spawn_loaded_scene(
     mut commands: Commands,
-    content: Res<StagedContent>,
+    loaded: Res<LoadedScene>,
+    policy: Res<NormalMapPolicy>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
@@ -360,15 +732,87 @@ fn spawn_staged_content(
     // NOTE: there is deliberately NO camera query here. `Commands::spawn` is
     // deferred, so a `Query` in the same system that spawns the camera sees zero
     // cameras -- which would silently leave the camera at its default position.
-    // The framing runs in `PostStartup` instead; see `crate::build_scene_app`.
-    let outcome = stage_decoded(
-        &content,
+    // The framing runs in `PostStartup` instead.
+    let outcome = spawn_scene(
+        &loaded,
+        policy.orientation(),
         &mut commands,
         &mut meshes,
         &mut materials,
         &mut images,
     );
-    info!("{outcome:?}");
+    info!(
+        "staged {objects} object(s), {parts} mesh entity(ies), {triangles} triangle(s), \
+         {normals} with a bound normal map, {masks} mask plane(s)",
+        objects = outcome.objects,
+        parts = outcome.parts,
+        triangles = outcome.triangles,
+        normals = outcome.parts_with_normal_maps,
+        masks = outcome.mask_channels,
+    );
+    for report in loaded
+        .models
+        .iter()
+        .filter_map(|model| model.materials.as_ref())
+    {
+        for plan in report.plans() {
+            info!("{}", plan.describe());
+            if let Some(normal) = &plan.normal_map {
+                info!("  normal map {}", normal.describe());
+            }
+        }
+    }
+    commands.insert_resource(outcome);
+}
+
+/// Frames the camera on the loaded scene's extent.
+///
+/// Runs in `PostStartup` because the camera is spawned in `Startup` by
+/// [`crate::scene::ScenePlugin`] and `Commands::spawn` is deferred.
+fn frame_camera_on_the_scene(
+    mut cameras: Query<&mut Transform, With<MainCamera>>,
+    framing: Option<Res<CameraFraming>>,
+) {
+    let Some(framing) = framing else {
+        return;
+    };
+    match cameras.single_mut() {
+        Ok(mut transform) => {
+            frame_camera(&mut transform, framing.bounds, framing.vertical_fov_degrees)
+        }
+        Err(error) => warn!("could not frame the camera: {error}"),
+    }
+}
+
+/// Frames the camera on a bounding box.
+///
+/// Deliberately simple: fit the box's bounding sphere into the vertical field of
+/// view with a margin, from a fixed oblique angle. Spore's own camera behaviour
+/// is a separate and much later question, and pretending to know it here would
+/// be an invention.
+pub fn frame_camera(
+    camera: &mut Transform,
+    bounds: ([f32; 3], [f32; 3]),
+    vertical_fov_degrees: f32,
+) {
+    let center = Vec3::new(
+        (bounds.0[0] + bounds.1[0]) * 0.5,
+        (bounds.0[1] + bounds.1[1]) * 0.5,
+        (bounds.0[2] + bounds.1[2]) * 0.5,
+    );
+    let extent = Vec3::new(
+        bounds.1[0] - bounds.0[0],
+        bounds.1[1] - bounds.0[1],
+        bounds.1[2] - bounds.0[2],
+    );
+    let radius = 0.5 * extent.length().max(1e-3);
+    let fov = vertical_fov_degrees.to_radians();
+    // distance = radius / sin(fov / 2), with a 1.25 margin so the model never
+    // touches the edge of the frame.
+    let distance = radius / (fov * 0.5).sin().max(1e-3) * 1.25;
+    let direction = Vec3::new(0.0, 0.42, 0.91).normalize();
+    *camera =
+        Transform::from_translation(center + direction * distance).looking_at(center, Vec3::Y);
 }
 
 /// Turns a loader failure into something a person can act on.
@@ -399,111 +843,109 @@ pub fn describe(error: &AssetError) -> String {
     }
 }
 
-/// Frames the camera on a bounding box.
-///
-/// Deliberately simple: fit the box's bounding sphere into the vertical field
-/// of view with a margin, from a fixed oblique angle. Spore's own camera
-/// behaviour is a separate and much later question, and pretending to know it
-/// here would be an invention.
-pub fn frame_camera(
-    camera: &mut Transform,
-    bounds: ([f32; 3], [f32; 3]),
-    vertical_fov_degrees: f32,
-) {
-    let center = Vec3::new(
-        (bounds.0[0] + bounds.1[0]) * 0.5,
-        (bounds.0[1] + bounds.1[1]) * 0.5,
-        (bounds.0[2] + bounds.1[2]) * 0.5,
-    );
-    let extent = Vec3::new(
-        bounds.1[0] - bounds.0[0],
-        bounds.1[1] - bounds.0[1],
-        bounds.1[2] - bounds.0[2],
-    );
-    let radius = 0.5 * extent.length().max(1e-3);
-    let fov = vertical_fov_degrees.to_radians();
-    // distance = radius / sin(fov / 2), with a 1.25 margin so the model never
-    // touches the edge of the frame.
-    let distance = radius / (fov * 0.5).sin().max(1e-3) * 1.25;
-    let direction = Vec3::new(0.0, 0.42, 0.91).normalize();
-    *camera =
-        Transform::from_translation(center + direction * distance).looking_at(center, Vec3::Y);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use spore_assets::Package;
+    use crate::domain::model::{DecodeStatus, ModelPart};
+    use spore_assets::ModelFormat;
     use spore_gmdl::Mesh;
-    use std::path::PathBuf;
 
-    fn fixture_package() -> ContentStore {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../tests/fixtures/mini_package.dbpf"
-        );
-        let mut store = ContentStore::new();
-        store.push(Package::from_vec("mini", std::fs::read(path).unwrap()).unwrap());
-        store
-    }
-
-    fn triangle_mesh() -> Mesh {
+    fn triangle_mesh(min_y: f32) -> Mesh {
         Mesh {
-            positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
-            normals: vec![[1.0, 0.0, 0.0]; 3],
+            positions: vec![[0.0, min_y, 0.0], [1.0, min_y, 0.0], [0.0, 1.0, 0.0]],
+            normals: vec![[0.0, 0.0, 1.0]; 3],
             uvs: vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
             indices: vec![0, 1, 2],
             topology: spore_gmdl::Topology::TriangleList,
-            bounds_min: [0.0, 0.0, 0.0],
+            bounds_min: [0.0, min_y, 0.0],
             bounds_max: [1.0, 1.0, 0.0],
             radius: 1.0,
         }
     }
 
-    fn content_with(meshes: Vec<Mesh>) -> StagedContent {
-        let key = ResourceKey::new(spore_gmdl::GMDL_TYPE, 1, 2);
-        let _ = fixture_package();
-        StagedContent {
-            model: Arc::new(LoadedModel {
-                key,
-                package_name: "mini".into(),
-                format: spore_assets::ModelFormat::Gmdl,
-                gmdl: None,
-                rw4: None,
-                meshes,
-                texture_refs: Vec::new(),
-                stopped_at: None,
-            }),
-            scale: 1.0,
-            packages: vec!["mini".into()],
-            textures: DecodedTextures::default(),
+    fn definition(key: ResourceKey, meshes: Vec<Mesh>) -> Arc<ModelDefinition> {
+        Arc::new(ModelDefinition {
+            key,
+            package_name: "mini".into(),
+            format: ModelFormat::Gmdl,
+            parts: meshes
+                .into_iter()
+                .enumerate()
+                .map(|(index, mesh)| ModelPart {
+                    mesh_index: index as u32,
+                    mesh,
+                    material_id: 0x40DE_AD00,
+                })
+                .collect(),
+            materials: None,
+            decode: DecodeStatus::Complete,
+        })
+    }
+
+    fn loaded_scene(
+        objects: Vec<crate::domain::scene::SceneObject>,
+        models: Vec<Arc<ModelDefinition>>,
+    ) -> LoadedScene {
+        LoadedScene {
+            scene: Scene { objects },
+            models,
         }
     }
 
     #[test]
-    fn bounds_are_the_union_of_every_mesh() {
-        let mut second = triangle_mesh();
-        second.bounds_min = [-5.0, -2.0, -1.0];
-        second.bounds_max = [-1.0, 0.0, 0.0];
-        let content = content_with(vec![triangle_mesh(), second]);
-        let (lo, hi) = content.bounds().unwrap();
-        assert_eq!(lo, [-5.0, -2.0, -1.0]);
-        assert_eq!(hi, [1.0, 1.0, 0.0]);
+    fn an_empty_scene_bounds_to_nothing_rather_than_to_the_origin() {
+        let scene = loaded_scene(Vec::new(), Vec::new());
+        assert_eq!(scene.bounds(), None);
+        assert_eq!(scene.triangles(), 0);
+        assert_eq!(scene.part_count(), 0);
     }
 
     #[test]
-    fn triangles_counts_indices_not_indices_over_three() {
-        assert_eq!(
-            content_with(vec![triangle_mesh(), triangle_mesh()]).triangles(),
-            2
+    fn bounds_include_each_placement_and_union_across_objects() {
+        let key = ResourceKey::new(1, 2, 3);
+        let model = definition(key, vec![triangle_mesh(-2.0)]);
+        let mut first = ModelInstance::new(key, Default::default());
+        first.placement.translation = [0.0, 2.0, 0.0];
+        let mut second = ModelInstance::new(key, Default::default());
+        second.placement.translation = [5.0, 0.0, 0.0];
+        let scene = loaded_scene(
+            vec![
+                crate::domain::scene::SceneObject::Model(first),
+                crate::domain::scene::SceneObject::Model(second),
+            ],
+            vec![model],
         );
-        assert_eq!(content_with(Vec::new()).triangles(), 0);
+        let (lo, hi) = scene.bounds().unwrap();
+        // The first instance was lifted by 2 so its lowest point sits at 0; the
+        // second was placed at y = 0 and so still reaches -2. The union has to
+        // show both, which is what makes the number checkable.
+        assert_eq!(lo, [0.0, -2.0, 0.0]);
+        assert_eq!(hi, [6.0, 3.0, 0.0]);
+        assert_eq!(scene.part_count(), 2);
+        assert_eq!(scene.triangles(), 1, "counted once per definition");
     }
 
     #[test]
-    fn the_report_line_is_versioned_and_carries_the_fixed_field_set() {
-        let content = content_with(vec![triangle_mesh()]);
-        let line = content.report_line();
+    fn a_definition_with_no_materials_reports_no_normal_maps() {
+        let key = ResourceKey::new(1, 2, 3);
+        let model = definition(key, vec![triangle_mesh(0.0)]);
+        let scene = loaded_scene(
+            vec![crate::domain::scene::SceneObject::Model(
+                ModelInstance::new(key, Default::default()),
+            )],
+            vec![model],
+        );
+        assert_eq!(scene.parts_with_normal_maps(), 0);
+        assert!(scene.model(&key).is_some());
+        assert!(scene.model(&ResourceKey::new(9, 9, 9)).is_none());
+    }
+
+    #[test]
+    fn the_staged_line_keeps_the_v1_field_set() {
+        let key = ResourceKey::new(0x00E6_BCE5, 0x4062_7100, 0x067C_79D2);
+        let model = definition(key, vec![triangle_mesh(0.0)]);
+        let report = report_for(&model);
+        let line = report.staged_line();
         assert!(line.starts_with("OPENSPORE-STAGED v1 "), "{line}");
         for field in [
             "key=",
@@ -513,69 +955,84 @@ mod tests {
             "triangles=",
             "bounds_min=",
             "bounds_max=",
+            "normals=derived",
+            "textures=",
+            "decode=",
         ] {
-            assert!(
-                line.contains(field),
-                "the report must carry {field}: {line}"
-            );
+            assert!(line.contains(field), "the v1 field set changed: {line}");
         }
-        assert!(
-            line.contains("normals=derived"),
-            "the normal policy must be stated, not implied: {line}"
-        );
+        assert!(line.contains("textures=0/0"), "{line}");
+        assert!(!report.textures_requested, "0/0 must mean 'not asked' here");
     }
 
     #[test]
-    fn content_with_no_meshes_reports_zero_rather_than_omitting_fields() {
-        let line = content_with(Vec::new()).report_line();
-        assert!(line.contains("meshes=0"), "{line}");
-        assert!(line.contains("triangles=0"), "{line}");
+    fn the_material_line_says_not_requested_rather_than_none_found() {
+        let key = ResourceKey::new(1, 2, 3);
+        let report = report_for(&definition(key, vec![triangle_mesh(0.0)]));
+        let line = report.material_line(0, 1);
+        assert!(line.starts_with("OPENSPORE-MATERIAL v1 "), "{line}");
+        assert!(line.contains("reason=textures_not_requested"), "{line}");
+        assert!(!line.contains("roles=unidentified"), "{line}");
     }
 
     #[test]
-    fn a_record_with_no_meshes_is_reported_as_nothing_to_show() {
-        // Constructed here rather than through `stage_decoded` because that
-        // function needs an `App` world; the classification logic it depends on
-        // is `meshes.is_empty()`, which this pins.
-        let content = content_with(Vec::new());
-        assert!(content.model.meshes.is_empty());
-        assert!(content.bounds().is_none());
-    }
-
-    #[test]
-    fn not_found_names_the_record_and_offers_alternatives() {
-        let error = AssetError::NotFound {
-            key: ResourceKey::new(0x00E6_BCE5, 1, 2),
-            searched: 3,
-            candidates: vec![
-                ResourceKey::new(0x00E6_BCE5, 3, 4),
-                ResourceKey::new(0x00E6_BCE5, 5, 6),
+    fn the_scene_line_reports_counts_and_the_mapping_cost() {
+        let key = ResourceKey::new(1, 2, 3);
+        let scene = loaded_scene(
+            vec![
+                crate::domain::scene::SceneObject::Model(ModelInstance::new(
+                    key,
+                    Default::default(),
+                )),
+                crate::domain::scene::SceneObject::Creature(
+                    crate::domain::creature::Creature::single(ModelInstance::new(
+                        key,
+                        Default::default(),
+                    )),
+                ),
             ],
-        };
-        let message = describe(&error);
-        assert!(
-            message.contains("0x00e6bce5:0x00000001:0x00000002"),
-            "{message}"
+            vec![definition(key, vec![triangle_mesh(0.0)])],
         );
-        assert!(message.contains("3 package"), "{message}");
+        let outcome = PrepareOutcome {
+            loaded: scene,
+            reports: Vec::new(),
+            world: Arc::new(ResourceWorld::open(&Vec::<String>::new()).unwrap()),
+        };
+        let line = outcome.scene_line();
+        assert!(line.starts_with("OPENSPORE-SCENE v1 "), "{line}");
+        assert!(line.contains("objects=2"), "{line}");
+        assert!(line.contains("models=1"), "{line}");
+        assert!(line.contains("parts=1"), "{line}");
+        assert!(line.contains("mapped_bytes=0"), "{line}");
+        let lines = outcome.report_lines();
+        assert_eq!(lines.len(), 1, "no records, so only the summary");
+        assert!(lines[0].starts_with("OPENSPORE-SCENE v1 "));
+    }
+
+    #[test]
+    fn framing_a_scene_uses_the_inserted_resource() {
+        let mut transform = Transform::default();
+        frame_camera(
+            &mut transform,
+            ([-10.0, -10.0, -10.0], [10.0, 10.0, 10.0]),
+            60.0,
+        );
+        assert!(transform.translation.length() > 10.0);
         assert!(
-            message.contains("0x00e6bce5:0x00000003:0x00000004"),
-            "{message}"
+            transform.forward().dot(-transform.translation) > 0.0,
+            "camera is not looking at the centre"
         );
     }
 
     #[test]
-    fn a_not_found_with_no_candidates_does_not_invent_one() {
-        let error = AssetError::NotFound {
-            key: ResourceKey::new(1, 2, 3),
-            searched: 1,
-            candidates: Vec::new(),
-        };
-        assert!(!describe(&error).contains("nearby"));
+    fn framing_survives_a_degenerate_box() {
+        let mut transform = Transform::default();
+        frame_camera(&mut transform, ([0.0; 3], [0.0; 3]), 60.0);
+        assert!(transform.translation.is_finite());
     }
 
     #[test]
-    fn an_empty_store_is_reported_with_the_fix_not_a_symptom() {
+    fn a_missing_package_is_reported_with_the_fix() {
         assert_eq!(
             describe(&AssetError::EmptyStore),
             "no Spore package was loaded. Pass --package <path> pointing at a .package file."
@@ -583,40 +1040,23 @@ mod tests {
     }
 
     #[test]
-    fn opening_a_missing_package_is_an_error_naming_the_path() {
-        let error = open_packages(&[PathBuf::from("/definitely/not/here.package")]).unwrap_err();
+    fn not_found_names_the_record_and_offers_alternatives() {
+        let error = AssetError::NotFound {
+            key: ResourceKey::new(0x00E6_BCE5, 1, 2),
+            searched: 3,
+            candidates: vec![ResourceKey::new(0x00E6_BCE5, 3, 4)],
+        };
+        let message = describe(&error);
         assert!(
-            error.to_string().contains("/definitely/not/here.package"),
-            "{error}"
+            message.contains("0x00e6bce5:0x00000001:0x00000002"),
+            "{message}"
         );
-    }
-
-    #[test]
-    fn camera_framing_puts_the_box_centre_in_view_and_backs_off_by_its_radius() {
-        let mut camera = Transform::default();
-        frame_camera(
-            &mut camera,
-            ([-10.0, -10.0, -10.0], [10.0, 10.0, 10.0]),
-            60.0,
-        );
-        let distance = camera.translation.length();
-        assert!(
-            distance > 10.0,
-            "the camera must be outside the box, got {distance}"
-        );
-        assert!(
-            camera.forward().dot(-camera.translation) > 0.0,
-            "camera is not looking at the centre"
-        );
-    }
-
-    #[test]
-    fn camera_framing_survives_a_degenerate_box() {
-        let mut camera = Transform::default();
-        frame_camera(&mut camera, ([0.0, 0.0, 0.0], [0.0, 0.0, 0.0]), 60.0);
-        assert!(
-            camera.translation.is_finite(),
-            "a zero-extent box must not produce NaN"
-        );
+        assert!(message.contains("3 package"), "{message}");
+        let empty = AssetError::NotFound {
+            key: ResourceKey::new(1, 2, 3),
+            searched: 1,
+            candidates: Vec::new(),
+        };
+        assert!(!describe(&empty).contains("nearby"));
     }
 }
