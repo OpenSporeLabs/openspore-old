@@ -44,6 +44,32 @@ fn documented_store() -> ContentStore {
     ])
 }
 
+/// The same three references, but the third is CORRUPT rather than merely
+/// unusual.
+///
+/// This exists because `documented_store` used to carry a `0x15` record as its
+/// "this one fails" case. That stopped being true when the corpus showed the
+/// whole `0x15` family decodes. Failure-path coverage needs a record that is
+/// actually broken, or the batch error handling is left untested while the test
+/// names still claim to cover it.
+fn documented_store_with_a_corrupt_third() -> ContentStore {
+    store_over(&[
+        (documented_model_key(), documented_gmdl()),
+        (
+            raster_key(0x4063_2900, DOCUMENTED_INSTANCE_ID),
+            raster_record(8, 8, 2, DXT5_FOURCC, 2),
+        ),
+        (
+            raster_key(0x4063_2901, DOCUMENTED_INSTANCE_ID),
+            raster_record(8, 8, 2, DXT5_FOURCC, 2),
+        ),
+        (
+            raster_key(0x4063_2902, DOCUMENTED_INSTANCE_ID),
+            malformed_luminance_raster(8, 8),
+        ),
+    ])
+}
+
 #[test]
 fn a_synthetic_raster_resolves_to_the_base_mip_of_layer_zero() {
     let store = store_over(&[(
@@ -136,18 +162,34 @@ fn the_resolution_records_what_it_assumed_and_what_it_does_not_know() {
     assert_eq!(absent.fact.level(), EvidenceLevel::Unknown);
     assert!(absent.fact.provenance().is_empty());
 
-    // The three unnamed envelope words and the luminance family stay unknown.
+    // The three unnamed envelope words stay unknown.
     for subject in [
         claims::ENVELOPE_FIELD_10_MEANING,
         claims::ENVELOPE_FIELD_18_MEANING,
         claims::ENVELOPE_FIELD_1C_MEANING,
-        claims::LUMINANCE_FOURCC_FAMILY,
     ] {
         let claim = resolved.claim(subject).expect(subject);
         assert!(claim.fact.is_unavailable(), "{subject}");
         assert_eq!(claim.fact.level(), EvidenceLevel::Unknown, "{subject}");
         assert!(claim.fact.provenance().is_empty(), "{subject}");
     }
+
+    // The luminance family used to be in that loop. It is not any more: the
+    // corpus refuted the refusal, `spore-texture` decoded all 901 records, and
+    // the claim moved to VERIFIED. Keeping it here would have been a fifth
+    // place asserting the decoder was wrong.
+    let luminance = resolved
+        .claim(claims::LUMINANCE_FOURCC_FAMILY)
+        .expect("subject");
+    assert!(
+        luminance.fact.is_available(),
+        "the 0x15 family is decoded, so its fact is a value now"
+    );
+    assert_eq!(luminance.fact.level(), EvidenceLevel::Verified);
+    assert!(
+        !luminance.fact.provenance().is_empty(),
+        "a verified claim must say where it was measured"
+    );
 
     // `raster` IS named by the canonical type table, so that one is a value.
     let named = resolved
@@ -168,7 +210,28 @@ fn the_resolution_records_what_it_assumed_and_what_it_does_not_know() {
         group.fact.reason(),
         Some(claims::NO_GROUP_NAME_IN_CANONICAL_TABLE)
     );
-    assert!(resolved.unknowns().count() >= 6, "unknowns() lists them");
+    // The unknown set is enumerated rather than floored. It used to be
+    // `>= 6`, which survived the luminance claim moving from non-finding to
+    // VERIFIED only by accident -- a floor cannot notice a fact being *lost*.
+    let unknowns: Vec<&str> = resolved
+        .unknowns()
+        .map(|claim| claim.subject.as_str())
+        .collect();
+    assert_eq!(
+        unknowns,
+        vec![
+            claims::TEXTURE_REFERENCE_TYPE_WORD,
+            claims::RESOLVED_GROUP_NAME,
+            claims::ENVELOPE_FIELD_10_MEANING,
+            claims::ENVELOPE_FIELD_18_MEANING,
+            claims::ENVELOPE_FIELD_1C_MEANING,
+        ],
+        "five facts are genuinely unknown, and this list is the whole of them"
+    );
+    assert!(
+        !unknowns.contains(&claims::LUMINANCE_FOURCC_FAMILY),
+        "the 0x15 family is no longer one of the unknowns"
+    );
 
     // The codec's departures from the BC3 specification are re-published, so a
     // caller reading only these claims learns that the pixels are not spec DXT5.
@@ -258,10 +321,12 @@ fn results_come_back_in_the_order_the_record_referenced_them() {
 
 #[test]
 fn one_failed_reference_does_not_abort_the_batch() {
-    // The documented asset's real shape: two DXT5 records and one luminance
-    // record. `osptool describe` on 0x2f4e681c:0x40632902:0x067a07f0 refuses the
-    // last one with `unsupported fourcc 0x00000015`.
-    let store = documented_store();
+    // The documented asset's real shape: two DXT5 records and one `0x15`
+    // luminance record. This test used to assert the third FAILED, because the
+    // `0x15` family was refused by name. The corpus refuted that -- all 901
+    // `0x15` records in `Spore_Content` decode -- so the batch-resilience
+    // property is now pinned against a record that is genuinely corrupt.
+    let store = documented_store_with_a_corrupt_third();
     let model = spore_gmdl::parse(&documented_gmdl()).unwrap();
     let results = resolve_model_textures(&store, &model, RASTER_TYPE);
 
@@ -269,16 +334,29 @@ fn one_failed_reference_does_not_abort_the_batch() {
     assert!(results[0].is_ok(), "first reference");
     assert!(results[1].is_ok(), "second reference");
     let third = results[2].as_ref().unwrap_err();
-    assert_eq!(
-        third,
-        &MaterialError::UnsupportedFourcc {
-            key: ResourceKey::new(RASTER_TYPE, 0x4063_2902, DOCUMENTED_INSTANCE_ID),
-            fourcc: LUMINANCE_FOURCC,
-        },
-        "the third reference is the luminance record, and it names its fourcc"
+    assert!(
+        matches!(third, MaterialError::Decode { .. }),
+        "the corrupt third reference is a decode error naming its arithmetic: {third:?}"
     );
     // Positional alignment with the reference list is what makes the vec usable.
     assert_eq!(results.iter().filter(|entry| entry.is_ok()).count(), 2);
+}
+
+/// The complement of the test above, and the reason the fixture had to change:
+/// with three VALID records the batch is three successes. This is what
+/// `textures=3/3` on the real asset is made of.
+#[test]
+fn a_fully_valid_model_resolves_every_reference() {
+    let store = documented_store();
+    let model = spore_gmdl::parse(&documented_gmdl()).unwrap();
+    let results = resolve_model_textures(&store, &model, RASTER_TYPE);
+
+    assert_eq!(results.len(), 3);
+    assert_eq!(
+        results.iter().filter(|entry| entry.is_ok()).count(),
+        3,
+        "the 0x15 family is no longer the odd one out"
+    );
 }
 
 #[test]
@@ -416,17 +494,51 @@ fn inspecting_an_envelope_answers_the_cheap_question_without_pixels() {
         .claim(claims::TEXTURE_REFERENCE_TYPE_WORD)
         .is_some());
 
-    // The luminance record's envelope IS inspectable even though its pixels are
-    // not decodable: reading a header is not decoding a format.
+    // The `0x15` record's envelope is inspectable, and `inspect_envelope`
+    // reports NO pixels: that is the entire point of the cheap entry point, and
+    // it is why "the header parsed" can never be mistaken for "the texture
+    // decoded".
     let luminance = inspect_envelope(&store, reference(0x4063_2902), RASTER_TYPE).unwrap();
     assert_eq!(luminance.envelope.fourcc, LUMINANCE_FOURCC);
-    // ...but decoding it is a typed refusal, not an empty image.
     assert_eq!(
-        resolve_texture(&store, reference(0x4063_2902), RASTER_TYPE).unwrap_err(),
-        MaterialError::UnsupportedFourcc {
-            key: ResourceKey::new(RASTER_TYPE, 0x4063_2902, DOCUMENTED_INSTANCE_ID),
-            fourcc: LUMINANCE_FOURCC,
-        }
+        luminance.layer_count, 0,
+        "inspect derives no layer count: it reads no payload, so it reports zero"
+    );
+
+    // It now decodes as well. That half of this assertion used to be a refusal,
+    // which is the change the corpus forced.
+    let decoded = resolve_texture(&store, reference(0x4063_2902), RASTER_TYPE)
+        .expect("the 0x15 family decodes");
+    assert_eq!(
+        decoded.layer_count, 1,
+        "the decode does derive a layer count"
+    );
+
+    // And the refusal path is still reachable, for a record that is actually
+    // broken rather than merely in a family that used to be unsupported.
+    let broken = store_over(&[
+        (documented_model_key(), documented_gmdl()),
+        (
+            raster_key(0x4063_2900, DOCUMENTED_INSTANCE_ID),
+            raster_record(8, 8, 2, DXT5_FOURCC, 2),
+        ),
+        (
+            raster_key(0x4063_2901, DOCUMENTED_INSTANCE_ID),
+            raster_record(8, 8, 2, DXT5_FOURCC, 2),
+        ),
+        (
+            raster_key(0x4063_2902, DOCUMENTED_INSTANCE_ID),
+            malformed_luminance_raster(8, 8),
+        ),
+    ]);
+    let refused = resolve_texture(&broken, reference(0x4063_2902), RASTER_TYPE).unwrap_err();
+    assert!(
+        matches!(refused, MaterialError::Decode { .. }),
+        "a corrupt payload is a typed refusal, not an empty image: {refused:?}"
+    );
+    assert!(
+        inspect_envelope(&broken, reference(0x4063_2902), RASTER_TYPE).is_ok(),
+        "reading a header is not decoding a format, so inspect still answers"
     );
 }
 
@@ -451,7 +563,11 @@ fn a_model_record_resolves_through_the_gmdl_layer() {
     let resolved = resolve_model_record(&store, &documented_model_key(), RASTER_TYPE).unwrap();
     assert_eq!(resolved.key, documented_model_key());
     assert_eq!(resolved.textures.len(), 3);
-    assert_eq!(resolved.resolved_count(), 2);
+    assert_eq!(
+        resolved.resolved_count(),
+        3,
+        "all three references now resolve"
+    );
 
     // One material, no name, four non-findings, and the whole model's bindings.
     assert_eq!(resolved.materials.len(), 1);
@@ -460,16 +576,22 @@ fn a_model_record_resolves_through_the_gmdl_layer() {
     assert_eq!(material.name, None);
     assert_eq!(material.bindings.len(), 3);
 
-    // The failure is paired with the reference it belongs to, in order.
-    let failures = resolved.failures();
+    // With a genuinely corrupt third record, the failure is still paired with
+    // the reference it belongs to, in order.
+    let corrupt = resolve_model_record(
+        &documented_store_with_a_corrupt_third(),
+        &documented_model_key(),
+        RASTER_TYPE,
+    )
+    .unwrap();
+    assert_eq!(corrupt.resolved_count(), 2);
+    let failures = corrupt.failures();
     assert_eq!(failures.len(), 1);
     assert_eq!(failures[0].0, reference(0x4063_2902));
-    assert_eq!(
-        failures[0].1,
-        &MaterialError::UnsupportedFourcc {
-            key: ResourceKey::new(RASTER_TYPE, 0x4063_2902, DOCUMENTED_INSTANCE_ID),
-            fourcc: LUMINANCE_FOURCC,
-        }
+    assert!(
+        matches!(failures[0].1, MaterialError::Decode { .. }),
+        "a corrupt record is a decode error: {:?}",
+        failures[0].1
     );
 }
 

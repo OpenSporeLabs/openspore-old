@@ -303,9 +303,18 @@ pub const ALL_CLAIMS: &[ClaimSpec] = &[
     },
     ClaimSpec {
         subject: LUMINANCE_FOURCC_FAMILY,
-        kind: ClaimKind::NonFinding(MEANING_NOT_ESTABLISHED),
-        basis: "re-published from spore_texture::claims; the 0x15 family is a different \
-                format this build refuses rather than decodes.",
+        // This was a NonFinding and is now VERIFIED. `spore-texture` established
+        // the framing over 901/901 records in Spore_Content, and this claim
+        // previously republished the old, refuted statement that the family is
+        // "a different format this build refuses rather than decodes". A
+        // downstream claim that contradicts the decoder is worse than no claim.
+        kind: ClaimKind::Graded(EvidenceLevel::Verified),
+        basis: "The 0x15 family is DECODED, not refused. `spore-texture` verified its \
+                framing over 901/901 records in Spore_Content: a 28-byte header, NO layer \
+                headers, a u32 byte-count prefix before every mip past the base, and \
+                uncompressed 4-bytes-per-texel -- so it is not the DXT5 layer walk at all. \
+                Lanes 0-2 are a tangent-space normal map stored Z FIRST. See \
+                docs/LUMINANCE-RASTER.md.",
     },
     ClaimSpec {
         subject: MATERIAL_NAME,

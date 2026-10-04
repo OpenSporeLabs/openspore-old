@@ -232,18 +232,48 @@ fn a_model_record_with_no_materials_resolves_to_no_materials() {
     assert!(resolved.failures().is_empty());
 }
 
+/// This test asserted that a `0x15` record answers `inspect_envelope` but is
+/// refused by `resolve_texture`. The corpus refuted the second half: the whole
+/// `0x15` family decodes (901/901 records in `Spore_Content`), under its own
+/// framing. Rewritten rather than deleted, because the refutation must stay
+/// visible and because the inspect/decode split it protected is still real.
 #[test]
-fn a_luminance_record_still_answers_inspect_but_not_decode() {
+fn a_luminance_record_answers_inspect_and_decodes_now() {
     let store = store_over(&[(
         raster_key(0x4063_2900, DOCUMENTED_INSTANCE_ID),
         luminance_raster(8, 8),
     )]);
     let envelope = inspect_envelope(&store, target(), RASTER_TYPE).unwrap();
     assert_eq!(envelope.envelope.fourcc, LUMINANCE_FOURCC);
-    assert!(matches!(
-        resolve_texture(&store, target(), RASTER_TYPE),
-        Err(MaterialError::UnsupportedFourcc { .. })
-    ));
+
+    let resolved = resolve_texture(&store, target(), RASTER_TYPE)
+        .expect("the 0x15 family is decodable, not refused");
+    assert_eq!(resolved.image.width, 8);
+    assert_eq!(resolved.image.height, 8);
+    // `inspect_envelope` derives no layer count because it reads no payload;
+    // the decode does derive one. The two entry points therefore still cannot
+    // be confused for one another, which was the property worth protecting.
+    assert_eq!(resolved.layer_count, 1);
+}
+
+/// The inspect/decode split, on the case that can still fail: a CORRUPT `0x15`
+/// record must be inspectable -- reading a header is not decoding a format --
+/// while refusing to produce pixels.
+#[test]
+fn a_corrupt_luminance_record_still_answers_inspect_but_not_decode() {
+    let store = store_over(&[(
+        raster_key(0x4063_2900, DOCUMENTED_INSTANCE_ID),
+        malformed_luminance_raster(8, 8),
+    )]);
+    let envelope = inspect_envelope(&store, target(), RASTER_TYPE).unwrap();
+    assert_eq!(
+        envelope.envelope.fourcc, LUMINANCE_FOURCC,
+        "the cheap question is still answerable"
+    );
+    assert!(
+        resolve_texture(&store, target(), RASTER_TYPE).is_err(),
+        "but a broken payload must not yield pixels"
+    );
 }
 
 #[test]

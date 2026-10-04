@@ -353,9 +353,78 @@ pub fn two_layer_raster() -> Vec<u8> {
     raster_record(8, 8, 2, DXT5_FOURCC, 2)
 }
 
-/// A raster record of the luminance family, which this build refuses.
+/// A **real** raster record of the `0x15` family.
+///
+/// This used to be built with the DXT5 framing so that the decoder's refusal
+/// could be asserted. That was wrong in a way the corpus corrected:
+/// `spore-texture` established (901/901 records in `Spore_Content`) that the
+/// `0x15` family has its own framing, and the tests were asserting a
+/// specification that the real data refutes.
+///
+/// ```text
+/// record_size == 28 + w*h*4 + sum_{m>=1}(4 + max(1,w>>m)*max(1,h>>m)*4)
+/// ```
+///
+/// A 28-byte header, **no** layer headers, a `u32` byte-count prefix before
+/// every mip past the base, and uncompressed 4-bytes-per-texel RGBA. So it is
+/// built here from that identity rather than from the DXT5 layer walk.
 pub fn luminance_raster(width: u32, height: u32) -> Vec<u8> {
-    raster_record(width, height, 2, LUMINANCE_FOURCC, 1)
+    luminance_raster_with_mips(width, height, 2)
+}
+
+/// As [`luminance_raster`], with an explicit mip count.
+pub fn luminance_raster_with_mips(width: u32, height: u32, mip_count: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&1u32.to_le_bytes()); // 0x00 version
+    out.extend_from_slice(&width.to_le_bytes()); // 0x04 width
+    out.extend_from_slice(&height.to_le_bytes()); // 0x08 height
+    out.extend_from_slice(&mip_count.to_le_bytes()); // 0x0c mip_count
+    out.extend_from_slice(&8u32.to_le_bytes()); // 0x10 field_10
+    out.extend_from_slice(&LUMINANCE_FOURCC.to_le_bytes()); // 0x14 fourcc = 0x15
+                                                            // 0x18 field_18 is the BASE level's byte count (w*h*4), format-specific.
+    out.extend_from_slice(&(width * height * 4).to_le_bytes());
+    // 0x1c onwards is payload, not constants: the first texel begins here.
+    for mip in 0..mip_count {
+        let w = (width >> mip).max(1);
+        let h = (height >> mip).max(1);
+        let bytes = w * h * 4;
+        if mip > 0 {
+            out.extend_from_slice(&bytes.to_le_bytes());
+        }
+        // A flat tangent-space normal, Z FIRST: lane 0 = 0xFF, 1 = 0x80, 2 = 0x80.
+        // Distinct per mip so a mis-offset decode is observable by value.
+        let (r, g, b) = match mip {
+            0 => (0xFFu8, 0x80, 0x80),
+            1 => (0xC0u8, 0x90, 0xA0),
+            _ => (0x11u8 * mip as u8, 0x22, 0x33),
+        };
+        for i in 0..(w * h) {
+            let t = (i % 7) as u8;
+            out.extend_from_slice(&[r.saturating_add(t), g, b, 0xFF]);
+        }
+    }
+    debug_assert_eq!(
+        out.len() as u64,
+        28 + (width * height * 4) as u64 + {
+            let mut acc = 0u64;
+            for m in 1..mip_count {
+                let w = (width >> m).max(1);
+                let h = (height >> m).max(1);
+                acc += 4 + (w * h * 4) as u64;
+            }
+            acc
+        },
+        "the fixture must satisfy the framing identity the decoder verifies"
+    );
+    out
+}
+
+/// A `0x15` record whose payload does NOT satisfy the framing identity, which
+/// the decoder must refuse rather than pad, round or truncate.
+pub fn malformed_luminance_raster(width: u32, height: u32) -> Vec<u8> {
+    let mut bytes = luminance_raster(width, height);
+    bytes.truncate(bytes.len() - 64); // drop a chunk of the last mip
+    bytes
 }
 
 // ---------------------------------------------------------------------------

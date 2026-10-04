@@ -460,11 +460,32 @@ fn header_claims(key: &ResourceKey, assumed_type: u32) -> Vec<TextureClaim> {
             claims::ENVELOPE_FIELD_1C_MEANING,
             claims::non_finding(claims::ENVELOPE_FIELD_1C_MEANING),
         ),
-        TextureClaim::new(
-            claims::LUMINANCE_FOURCC_FAMILY,
-            claims::non_finding(claims::LUMINANCE_FOURCC_FAMILY),
-        ),
+        // Republished from spore-texture's own claims rather than restated here,
+        // so this crate cannot drift from the decoder that established it. It
+        // used to be a hardcoded non-finding ("a format we refuse"); it is now a
+        // VERIFIED value, and restating it locally is exactly how it went stale.
+        TextureClaim::new(claims::LUMINANCE_FOURCC_FAMILY, luminance_family_claim()),
     ]
+}
+
+/// The `0x15` family's fact, taken from `spore-texture`'s own claim table.
+///
+/// Delegating is deliberate. When this was a local hardcoded non-finding, a
+/// change in the texture crate left the material crate asserting the opposite of
+/// its own decoder -- and FIVE tests failed rather than one, because the stale
+/// claim was load-bearing for the batch error handling. There is now exactly one
+/// place where this fact is stated, and it is the crate that measured it.
+fn luminance_family_claim() -> Fact<&'static str> {
+    use spore_texture::claims as tex;
+    debug_assert_eq!(
+        tex::LUMINANCE_FOURCC,
+        claims::LUMINANCE_FOURCC_FAMILY,
+        "the republished subject must be the one this claim is filed under"
+    );
+    tex::claim(tex::LUMINANCE_FOURCC)
+        .expect("spore-texture always declares the luminance family claim")
+        .meaning
+        .clone()
 }
 
 /// The canonical name of the assumed type, or a non-finding when the canonical
