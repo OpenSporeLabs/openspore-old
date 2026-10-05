@@ -293,7 +293,10 @@ pub fn prepare_creator(request: &CreatorRequest) -> CreatorDecoded {
         Ok(source) => source,
         Err(reason) => return CreatorDecoded::Failed(reason),
     };
-    match creator::load_creator(&source, &request.packages) {
+    // The replacement goes in here, before resolution, so the new part walks the
+    // same `blockref -> rigblock -> prop -> part` chain an authored part would and
+    // every number in the runtime state describes the part that is actually there.
+    match creator::load_creator_replacing(&source, &request.packages, request.replace) {
         Ok(stage) => CreatorDecoded::Ready(Box::new(stage)),
         Err(error) => CreatorDecoded::Failed(error.to_string()),
     }

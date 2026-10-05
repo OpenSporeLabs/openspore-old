@@ -142,3 +142,40 @@ readings by name rather than collapsing them into one number that reads as settl
 Lesson worth keeping next to the misdiagnosis above: a number produced by a script
 that was then deleted is not evidence, it is a memory. The worst-case ratio survived
 because a committed test prints it; the median did not, and turned out to be wrong.
+
+## Experiment 03 — replace a real block, save, reload, and get the same pixels back
+
+| id | hypothesis | result | evidence |
+|---|---|---|---|
+| 03 | a real block can be replaced with another real catalog part, and the replacement survives `spore-creator-doc/1` | **PROVEN** | 1896 → 1864 triangles, 1640 → 1622 vertices; block 3's part identity `0xd05c53a3` → `0x33fccc91`, its geometry record instance `0xd8f6_57c7` → `0xe371_5c37`; **5.40%** of subpixels change |
+| 03a | the reloaded document renders the same picture as the modified original | **PROVEN** | `--creator-doc` on the file from disk: identical runtime state (1864/1622, same block-3 identity and geometry record), and **0.0000%** of subpixels differ, max per-channel delta **0** |
+
+Subject: `crt 0x2b978c46:0x40626200:0xde727fa9`, the only creature document in
+`Spore_Game.package` with more than one distinct part (5 parts over 10 blocks).
+The other 46 place a single repeated part, so there is nothing to replace *with*.
+
+| stage | document source | triangles | vertices | block 3 part | block 3 geometry record |
+|---|---|---|---|---|---|
+| baseline | `record` | 1896 | 1640 | `0x40626000:0xd05c53a3` | `…:0x40606000:0x06b1_5c37` |
+| replaced | `record` | 1864 | 1622 | `0x40626000:0x33fccc91` | `…:0x40606000:0xe371_5c37` |
+| reloaded | **`saved-file`** | 1864 | 1622 | `0x40626000:0x33fccc91` | `…:0x40606000:0xe371_5c37` |
+
+Every stage reported `resolved=10, unresolved=0`, and the camera framing is
+`camera_framed: true` at distance 1.178 throughout.
+
+### A 2.47% difference that was a measurement artefact, not a defect
+
+The first reloaded screenshot came back 900x**699** where the replaced one was
+900x**700**, and a naive diff over the common 699 rows reported 2.47% of subpixels
+differing with a max per-channel delta of 108 — from a scene whose runtime state was
+byte-identical.
+
+The cause is that a **one-row height difference changes the projection matrix**, so
+every pixel shifts slightly; on the high-contrast edges of a creature against a
+gradient background a subpixel shift produces a large per-channel delta. Re-taking
+the capture at a settled 900x700 gives **0.0000%, max delta 0**.
+
+Recorded because the tempting conclusion is "the save/load round trip is lossy, 2.5%
+of the image". It was not: the image *size* differed. A screenshot comparison that
+does not first assert both captures have identical dimensions is measuring the
+window, not the scene.

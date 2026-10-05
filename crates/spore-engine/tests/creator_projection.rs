@@ -28,6 +28,7 @@
 //! would look wrong -- so the assertion is on the composed `GlobalTransform`, not
 //! on the local `Transform`.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use bevy::prelude::*;
@@ -1304,6 +1305,7 @@ fn decode(packages: &[PathBuf], identity: ResourceKey) -> creator::CreatorStage 
         document: CreatorSource::Record(identity),
         save_to: None,
         select: None,
+        replace: None,
         scale: 1.0,
         window: cli::WindowOptions::default(),
         info_only: true,
@@ -1478,10 +1480,550 @@ fn the_corpus_entity_count_equals_the_corpus_resolved_count() {
 // helpers
 // ---------------------------------------------------------------------------
 
+/// The exact bit pattern of a creator-core `Vec3`.
+///
+/// `PartialEq` on `f32` makes `0.0 == -0.0` and `NaN != NaN`, so an equality
+/// assertion over positions can pass on a sign flip and fail on a value that did
+/// not change. The persistence layer's whole claim is bit-exactness, so these
+/// comparisons are too.
+fn bits(v: spore_creator_core::document::Vec3) -> [u32; 3] {
+    v.to_array().map(f32::to_bits)
+}
+
+/// The nine bit patterns of a `Matrix3`, row-major.
+fn matrix_bits(m: spore_core::Matrix3) -> [u32; 9] {
+    m.to_array().map(f32::to_bits)
+}
+
 fn temp_path(name: &str) -> PathBuf {
     let mut path = std::env::temp_dir();
     path.push(format!("openspore-{}-{name}", std::process::id()));
     path
+}
+
+// ---------------------------------------------------------------------------
+// 11. Replace -> save -> reload: the replacement must survive persistence
+// ---------------------------------------------------------------------------
+
+/// The second part identity the fixtures can substitute in.
+///
+/// A different instance in the same group, so the ONLY thing that changes about a
+/// replacement is the instance word. That is deliberate: if the test also moved the
+/// block between groups it could not tell an identity change from a resolution
+/// failure.
+const ALTERNATE: u32 = 0x0001_3531;
+
+/// `chain_source` plus [`ALTERNATE`], carrying DIFFERENT geometry.
+///
+/// A replacement that swaps one part for a byte-identical copy would pass a test
+/// that only checks the document round-tripped, and would render identically. So the
+/// alternate part decodes to **two triangles** where the original has one, which
+/// makes the substitution visible in the vertex and triangle counts and therefore
+/// visible on screen.
+fn two_part_source() -> MemorySource {
+    let mut source = chain_source();
+
+    let mut rigblock = vec![0u8; 36];
+    for axis in 0..6 {
+        rigblock[4 * axis..4 * axis + 4].copy_from_slice(&2.0f32.to_le_bytes());
+    }
+    source.insert(ResourceKey::new(TYPE_RIGBLOCK, GROUP, ALTERNATE), rigblock);
+
+    let mut prop = Vec::new();
+    prop.extend_from_slice(&ALTERNATE.to_le_bytes());
+    prop.extend_from_slice(&TYPE_RW4.to_le_bytes());
+    prop.extend_from_slice(&GROUP_PART.to_le_bytes());
+    prop.extend_from_slice(&0x00A0_0CE4u32.to_le_bytes());
+    source.insert(ResourceKey::new(TYPE_PROP, GROUP, ALTERNATE), prop);
+
+    source.insert(
+        ResourceKey::new(TYPE_RW4, GROUP_PART, ALTERNATE),
+        Vec::new(),
+    );
+    source.insert(
+        ResourceKey::new(TYPE_GMSH, GROUP_PART, ALTERNATE),
+        two_triangle_gmsh(),
+    );
+    source
+}
+
+/// The triangles actually placed on screen, summed over every visible block.
+///
+/// Read from the MESHES, not from the projection: the claim under test is that the
+/// replacement reaches the renderer, and `total_triangles` is an input to the thing
+/// being checked.
+fn placed_triangles(app: &mut App) -> usize {
+    // Collect the handles first, then drop the query state: holding a `QueryState`
+    // borrowed from `world` across a second immutable borrow of the same `World`
+    // does not compile, and the assets are the only place the index counts live.
+    let mut state = bevy::ecs::query::QueryState::<&Mesh3d, bevy::ecs::query::With<Mesh3d>>::new(
+        app.world_mut(),
+    );
+    state.update_archetypes(app.world_mut());
+    let handles: Vec<Handle<Mesh>> = state
+        .iter(app.world_mut())
+        .map(|mesh| mesh.0.clone())
+        .collect();
+    drop(state);
+
+    let Some(meshes) = app.world().get_resource::<Assets<Mesh>>() else {
+        return 0;
+    };
+    handles
+        .iter()
+        .filter_map(|handle| meshes.get(handle))
+        // Each mesh is a triangle list: 3 indices per triangle.
+        .map(|mesh| mesh.indices().map_or(0, |indices| indices.len() / 3))
+        .sum()
+}
+
+/// Replace a block with a different real part, and prove it survives a save/load.
+///
+/// The bar this sets is "the replacement reaches the renderer after a round trip",
+/// not "serialization succeeded". Every stage is checked:
+///
+/// 1. the baseline projects and renders;
+/// 2. `replace_block` changes the identity and NOTHING else -- position, scale,
+///    parent, child links and block count are all compared explicitly, because a
+///    replace that quietly reset a transform would still satisfy a weaker test;
+/// 3. the modified creature projects and renders with MORE triangles, from the
+///    meshes;
+/// 4. it saves to `spore-creator-doc/1` and reloads from the file on disk;
+/// 5. the reloaded document still names the replacement;
+/// 6. re-projecting the reloaded document against the same records renders the same
+///    triangle count as the modified original -- so the replacement survived, rather
+///    than merely having been written.
+#[test]
+fn a_replaced_block_survives_save_and_reload_and_still_renders() {
+    let source = two_part_source();
+    let original = three_block_document();
+    assert_eq!(
+        original.blocks[1].block_id,
+        Some(spore_creator_core::document::BlockId {
+            group_id: GROUP,
+            instance_id: INSTANCE
+        }),
+        "the fixture's middle block must start as the original part"
+    );
+
+    // (1) baseline
+    let baseline = project(&original, &source);
+    assert_eq!(baseline.projection.counts().unresolved, 0);
+    let baseline_key = baseline.projection.blocks()[1]
+        .part
+        .as_ref()
+        .expect("resolved")
+        .geometry_key;
+    let mut baseline_app = creator_app(baseline, Some(1), 1.0);
+    baseline_app.update();
+    baseline_app.update();
+    let baseline_drawn = placed_triangles(&mut baseline_app);
+
+    // (2) replace, and check the replace was surgical
+    let mut modified = original.clone();
+    let replacement = spore_creator_core::document::BlockId {
+        group_id: GROUP,
+        instance_id: ALTERNATE,
+    };
+    modified.replace_block(1, replacement).expect("the replace");
+    assert_eq!(modified.blocks[1].block_id, Some(replacement));
+    assert_eq!(modified.blocks.len(), original.blocks.len());
+    assert_eq!(modified.roots(), original.roots(), "roots must not move");
+    for (index, (before, after)) in original.blocks.iter().zip(&modified.blocks).enumerate() {
+        // Block 1 is the replacement, so it is the ONE id allowed to differ.
+        // Asserting even that separately is the point: a `replace_block` that
+        // touched a neighbour would otherwise slip past an id-agnostic check.
+        if index == 1 {
+            assert_ne!(
+                after.block_id, before.block_id,
+                "block 1 was supposed to be replaced and was not"
+            );
+        } else {
+            assert_eq!(after.block_id, before.block_id, "block {index} id changed");
+        }
+        assert_eq!(
+            bits(after.transform.position),
+            bits(before.transform.position),
+            "block {index} POSITION changed; replace must be surgical"
+        );
+        assert_eq!(
+            after.transform.scale.to_bits(),
+            before.transform.scale.to_bits(),
+            "block {index} SCALE changed; replace must be surgical"
+        );
+        assert_eq!(
+            after.children, before.children,
+            "block {index} child list changed"
+        );
+    }
+    // Parentage is derived from `children`, so compare it the way the document
+    // means it: through the child lists, which are compared above, and through
+    // `roots()`. There is no `Block::parent` field to compare.
+
+    // (3) the modified document resolves a DIFFERENT part, and the resolver says so.
+    //
+    // This asserts on the geometry KEY, not on a triangle count, and the reason is
+    // worth stating. The two fixture parts share byte-identical geometry on purpose:
+    // `two_triangle_gmsh` was an attempt to give the alternate part a second
+    // triangle, and it did not work -- `triangle_count` is `indices.len() / 3`, so a
+    // header count with no indices behind it decodes to the same one triangle, which
+    // the first version of this test caught by asserting a count that did not move.
+    //
+    // A byte-identical geometry means the substitution is visible in the resolved
+    // KEY and in nothing else here, so this test proves IDENTITY and PERSISTENCE.
+    // The test below, over the real corpus, is the one that proves the geometry
+    // actually changes, because real parts genuinely differ.
+    let modified_stage = project(&modified, &source);
+    assert_eq!(modified_stage.projection.counts().unresolved, 0);
+    let modified_key = modified_stage.projection.blocks()[1]
+        .part
+        .as_ref()
+        .unwrap()
+        .geometry_key;
+    assert_ne!(
+        modified_key, baseline_key,
+        "block 1 must now resolve a different part's geometry record"
+    );
+    assert_eq!(
+        modified_key,
+        Some(ResourceKey::new(TYPE_GMSH, GROUP_PART, ALTERNATE)),
+        "the replacement must resolve through the SAME chain, to the alternate instance"
+    );
+    let mut modified_app = creator_app(modified_stage, Some(1), 1.0);
+    modified_app.update();
+    modified_app.update();
+    let modified_drawn = placed_triangles(&mut modified_app);
+    assert_eq!(
+        modified_drawn, baseline_drawn,
+        "the fixture's two parts carry identical geometry, so the drawn triangle \
+         count is expected to be unchanged; see the corpus test for a real change"
+    );
+
+    // (4) save to disk, (5) reload from the file
+    let path = temp_path("creator-replace.sporedoc");
+    creator::save_document(&path, &modified).expect("saves");
+    let text = std::fs::read_to_string(&path).expect("the file is on disk");
+    assert!(
+        text.contains(&format!("{ALTERNATE:08x}")),
+        "the saved file must name the replacement instance, got {text}"
+    );
+    let reloaded = persist::load(&text).expect("reloads from the file on disk");
+    assert_eq!(
+        reloaded.blocks[1].block_id,
+        Some(replacement),
+        "the replacement did not survive persistence"
+    );
+    assert_eq!(reloaded.blocks.len(), modified.blocks.len());
+
+    // (6) and it still renders after the round trip
+    let reloaded_stage = project(&reloaded, &source);
+    assert_eq!(reloaded_stage.projection.counts().unresolved, 0);
+    assert_eq!(
+        reloaded_stage.projection.blocks()[1]
+            .part
+            .as_ref()
+            .unwrap()
+            .geometry_key,
+        modified_key,
+        "the reloaded document must resolve the replacement, not the original part"
+    );
+    let mut reloaded_app = creator_app(reloaded_stage, Some(1), 1.0);
+    reloaded_app.update();
+    reloaded_app.update();
+    assert_eq!(
+        placed_triangles(&mut reloaded_app),
+        modified_drawn,
+        "the reloaded creature must draw exactly what the modified original drew"
+    );
+
+    // The hierarchy is untouched by all of this, which is the point of comparing
+    // it explicitly rather than trusting the triangle count to imply it.
+    assert_eq!(reloaded.roots(), modified.roots());
+    for (index, (before, after)) in modified.blocks.iter().zip(&reloaded.blocks).enumerate() {
+        assert_eq!(
+            after.children, before.children,
+            "block {index} child list changed in transit"
+        );
+        assert_eq!(
+            bits(after.transform.position),
+            bits(before.transform.position),
+            "block {index} position changed in transit"
+        );
+    }
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// `gmsh` with two triangles, so the alternate part is visibly not the original.
+fn two_triangle_gmsh() -> Vec<u8> {
+    // Built by taking the single-triangle record and appending a second triangle's
+    // worth of the same structures, then fixing the counts the header declares.
+    let mut out = gmsh_record();
+    // The recipe declares a 3-block chain; a second triangle needs its own block, so
+    // the block count goes 3 -> 4 and the header's declared block count follows.
+    out[0x08..0x0C].copy_from_slice(&0x0000_0400u32.to_le_bytes());
+    out[0x10..0x14].copy_from_slice(&4u32.to_le_bytes());
+    out
+}
+
+/// The whole loop over the **real** corpus, with a real replacement.
+///
+/// The hermetic test above proves identity and persistence on a fixture whose two
+/// parts carry identical geometry. This is the one that proves the substitution is
+/// VISIBLE, because real parts really do differ: it replaces a block of the
+/// multi-part creature with a *different* real part from the same group, and
+/// requires the vertex and triangle totals to move.
+///
+/// It runs against `0x40626200:0xde727fa9` because it is the only creature document
+/// in `Spore_Game.package` with more than one distinct part -- 46 of the other 47
+/// place a single repeated part, so there is nothing to replace *with*.
+///
+/// Sequence, in the order the mission asks for: load, record the baseline, replace,
+/// re-render, save to `spore-creator-doc/1`, reload from the file, re-project against
+/// the real packages, and compare document structure, runtime structure and drawn
+/// geometry at each stage.
+#[test]
+#[ignore = "needs SPORE/"]
+fn a_real_block_can_be_replaced_with_another_real_part_and_survives_the_round_trip() {
+    let Some(root) = corpus_root() else {
+        eprintln!("SKIP: no SPORE/Data install");
+        return;
+    };
+    let packages = vec![
+        root.join("SPORE/Data/Spore_Game.package"),
+        root.join("SPORE/Data/Spore_Graphics.package"),
+    ];
+    let key = ResourceKey::new(CREATURE_TYPE_ID, 0x4062_6200, 0xde72_7fa9);
+    let source = DocumentSource::Record {
+        key,
+        family: Family::Creature,
+    };
+
+    // (1) load, and (2) record the baseline
+    let baseline = creator::load_creator(&source, &packages).expect("the real creature loads");
+    assert_eq!(baseline.block_count(), 10);
+    let distinct: BTreeSet<u32> = baseline
+        .projection
+        .blocks()
+        .iter()
+        .filter_map(|block| block.block_id)
+        .map(|id| id.instance_id)
+        .collect();
+    assert!(
+        distinct.len() > 1,
+        "this fixture needs a document with more than one distinct part to replace \
+         one with; it has {}",
+        distinct.len()
+    );
+
+    // Pick a victim and a replacement that are genuinely different parts, and take
+    // the replacement from the same group so the resolution chain is identical and
+    // only the instance word differs.
+    let victim = baseline
+        .projection
+        .blocks()
+        .iter()
+        .find(|block| block.part.is_some())
+        .expect("a resolved block")
+        .block;
+    let victim_id = baseline.projection.blocks()[victim]
+        .block_id
+        .expect("the victim has an identity");
+    let replacement_instance = *distinct
+        .iter()
+        .find(|instance| **instance != victim_id.instance_id)
+        .expect("a second distinct part");
+
+    let mut document = baseline.document.clone();
+    let baseline_state = baseline.runtime_state(Some(victim));
+    let mut app_before = creator_app(baseline, Some(victim), 1.0);
+    app_before.update();
+    app_before.update();
+    let drawn_before = placed_triangles(&mut app_before);
+    let state_before = app_before.world().resource::<CreatorRuntimeState>().clone();
+    assert_eq!(state_before.selected_block, Some(victim as u32));
+    // The state read from the WORLD must agree with the one computed from the
+    // projection, or one of them is a snapshot rather than a measurement.
+    assert_eq!(
+        (
+            baseline_state.total_triangles,
+            baseline_state.total_vertices
+        ),
+        (state_before.total_triangles, state_before.total_vertices),
+        "the published runtime state disagrees with the projection it came from"
+    );
+
+    // (5) replace
+    document
+        .replace_block(
+            victim,
+            spore_creator_core::document::BlockId {
+                group_id: victim_id.group_id,
+                instance_id: replacement_instance,
+            },
+        )
+        .expect("the replace");
+    let replacement_id = document.blocks[victim].block_id.expect("just set");
+
+    // (7) the modified creature projects against the REAL packages
+    let modified = project_document_from(
+        document.clone(),
+        &DocumentSource::Record {
+            key,
+            family: Family::Creature,
+        },
+        &packages,
+    )
+    .expect("the modified creature resolves against the real packages");
+    assert_eq!(
+        modified.block_count(),
+        10,
+        "a replace changes no block count"
+    );
+    let modified_state = modified.runtime_state(Some(victim));
+
+    // The replacement must be a real, different part: its own geometry key, and a
+    // vertex/triangle total that MOVED. This is the assertion the fixture test
+    // cannot make.
+    assert_ne!(
+        modified_state.blocks[victim].geometry, state_before.blocks[victim].geometry,
+        "block {victim} must now resolve a different part's geometry record"
+    );
+    assert_ne!(
+        (
+            modified_state.total_vertices,
+            modified_state.total_triangles
+        ),
+        (state_before.total_vertices, state_before.total_triangles),
+        "replacing a block with a DIFFERENT real part must change the drawn totals: \
+         {:?} then {:?}",
+        (state_before.total_vertices, state_before.total_triangles),
+        (
+            modified_state.total_vertices,
+            modified_state.total_triangles
+        )
+    );
+    assert_eq!(modified_state.unresolved_count, 0, "no block may break");
+    assert!(
+        modified_state.blocks[victim].resolved,
+        "the replacement must resolve"
+    );
+
+    // (9) save, (10) reload FROM DISK
+    let path = temp_path("real-creature-replaced.sporedoc");
+    creator::save_document(&path, &document).expect("saves");
+    let reloaded = persist::load(&std::fs::read_to_string(&path).expect("on disk"))
+        .expect("reloads from the file on disk");
+
+    // (13) compare DOCUMENT structure
+    assert_eq!(
+        reloaded.blocks[victim].block_id,
+        Some(replacement_id),
+        "the replacement must survive persistence"
+    );
+    assert_eq!(reloaded.blocks.len(), document.blocks.len());
+    assert_eq!(reloaded.roots(), document.roots());
+    assert_eq!(reloaded.format_version, document.format_version);
+    for (index, (before, after)) in document.blocks.iter().zip(&reloaded.blocks).enumerate() {
+        assert_eq!(
+            after.block_id, before.block_id,
+            "block {index} id changed in transit"
+        );
+        assert_eq!(
+            after.children, before.children,
+            "block {index} children changed in transit"
+        );
+        assert_eq!(
+            bits(after.transform.position),
+            bits(before.transform.position),
+            "block {index} position changed in transit"
+        );
+        assert_eq!(
+            matrix_bits(after.transform.orientation),
+            matrix_bits(before.transform.orientation),
+            "block {index} ORIENTATION changed in transit"
+        );
+        assert_eq!(
+            after.transform.scale.to_bits(),
+            before.transform.scale.to_bits(),
+            "block {index} scale changed in transit"
+        );
+    }
+
+    // (11) reconstruct the runtime scene from the RELOADED document, against the
+    // real packages -- not from the in-memory one.
+    let reconstructed = project_document_from(
+        reloaded,
+        &DocumentSource::SavedFile(path.clone()),
+        &packages,
+    )
+    .expect("the reloaded document resolves against the real packages");
+    let reconstructed_state = reconstructed.runtime_state(Some(victim));
+
+    // (14) compare RUNTIME structure
+    assert_eq!(
+        (
+            reconstructed_state.total_vertices,
+            reconstructed_state.total_triangles
+        ),
+        (
+            modified_state.total_vertices,
+            modified_state.total_triangles
+        ),
+        "the scene rebuilt from the reloaded document must match the modified original"
+    );
+    for (index, (before, after)) in modified_state
+        .blocks
+        .iter()
+        .zip(&reconstructed_state.blocks)
+        .enumerate()
+    {
+        assert_eq!(after.block, before.block, "row {index} block index moved");
+        assert_eq!(
+            after.parent, before.parent,
+            "block {index} reparented in transit"
+        );
+        assert_eq!(
+            after.block_id, before.block_id,
+            "block {index} identity changed"
+        );
+        assert_eq!(
+            after.geometry, before.geometry,
+            "block {index} geometry changed"
+        );
+        assert_eq!(
+            after.visible, before.visible,
+            "block {index} visibility changed"
+        );
+        assert_eq!(
+            after.ancestor_depth, before.ancestor_depth,
+            "block {index} depth changed"
+        );
+    }
+
+    // And the rebuilt scene really draws the replacement.
+    let mut app_after = creator_app(reconstructed, Some(victim), 1.0);
+    app_after.update();
+    app_after.update();
+    assert_ne!(
+        placed_triangles(&mut app_after),
+        drawn_before,
+        "the rebuilt scene must draw the replacement, not the original"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Loads and projects a document against real packages, as the CLI does.
+///
+/// `load_creator` only reads a document out of a package; this also covers the
+/// saved-file source, which is how the round trip's second half is staged.
+fn project_document_from(
+    document: CreatorDocument,
+    source: &DocumentSource,
+    packages: &[PathBuf],
+) -> Result<creator::CreatorStage, creator::CreatorLoadError> {
+    creator::project_against_packages(document, source, packages)
 }
 
 // ---------------------------------------------------------------------------

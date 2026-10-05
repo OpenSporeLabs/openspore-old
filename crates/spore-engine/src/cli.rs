@@ -24,6 +24,7 @@
 use std::path::PathBuf;
 
 use spore_core::ResourceKey;
+use spore_creator_core::document::BlockId;
 
 use crate::domain::creature::Creature;
 use crate::domain::model::{ModelInstance, Placement};
@@ -83,6 +84,14 @@ pub struct CreatorRequest {
     pub save_to: Option<PathBuf>,
     /// The block to mark as selected, or `None`.
     pub select: Option<usize>,
+    /// Replace one block's part before anything is staged: `(block, part)`.
+    ///
+    /// This is the authoring operation that turns the loader into an editor. It is
+    /// applied to the document **before** resolution, so the replacement runs the
+    /// whole `blockref -> rigblock -> prop -> part` chain exactly as an authored
+    /// part would, and an instance that does not resolve shows up as an unresolved
+    /// block with its stop stage rather than as a silently missing entity.
+    pub replace: Option<(usize, BlockId)>,
     /// A world-space uniform scale applied to the whole creature.
     pub scale: f32,
     /// Window sizing and title.
@@ -381,6 +390,16 @@ pub enum CliError {
     OrphanPart,
     /// `--sporemodel` was given more than once.
     RepeatedSporemodel,
+    /// `--creator-replace` given twice.
+    ///
+    /// A separate variant rather than a generic duplicate because the two
+    /// occurrences name DIFFERENT blocks, so silently keeping the last one would
+    /// edit a block the caller did not ask to edit. The error carries the block the
+    /// first flag named, which is the one that would have been dropped.
+    RepeatedCreatorReplace {
+        /// The block index the first `--creator-replace` named.
+        first: usize,
+    },
     /// A creator flag was used with a mode that cannot honour it.
     CreatorModeConflict {
         /// The creator flag that was given.
@@ -414,6 +433,12 @@ impl std::fmt::Display for CliError {
             Self::OrphanPart => write!(
                 f,
                 "`--part` needs a `--creature` before it: a part is attached to the creature it follows"
+            ),
+            Self::RepeatedCreatorReplace { first } => write!(
+                f,
+                "`--creator-replace` may be given once: it edits one block, and a second \
+                 value would silently win by flag order. The first named block {first}, \
+                 which would have been left unedited"
             ),
             Self::RepeatedSporemodel => write!(
                 f,
@@ -511,6 +536,14 @@ pub fn usage() -> String {
          \x20   --creator-save <PATH>\n\
          \x20                       Write the document to PATH as\n\
          \x20                       spore-creator-doc/1. Written even with --info.\n\
+         \x20   --creator-replace <BLOCK>:<PART>\n\
+         \x20                       Swap block BLOCK's part for PART before anything is\n\
+         \x20                       resolved, e.g. 3:0x40626000,0x00013530. The block\n\
+         \x20                       keeps its index, parent, transform and children;\n\
+         \x20                       only the part changes. The new part walks the same\n\
+         \x20                       chain an authored one would, so a part that does not\n\
+         \x20                       resolve is reported as an unresolved block rather than\n\
+         \x20                       silently missing. May be given once.\n\
          \x20   --select-block <N>   Mark block N as selected; it is tinted, and the\n\
          \x20                       selection is readable in the runtime state.\n\
          \n\
@@ -555,6 +588,7 @@ fn parse_vec(args: &[String]) -> Result<LaunchRequest, CliError> {
     let mut creator: Option<CreatorSource> = None;
     let mut creator_save: Option<PathBuf> = None;
     let mut select_block: Option<usize> = None;
+    let mut replace: Option<(usize, BlockId)> = None;
 
     let mut index = 0usize;
     while index < args.len() {
@@ -710,6 +744,34 @@ fn parse_vec(args: &[String]) -> Result<LaunchRequest, CliError> {
             "--creator-save" => {
                 creator_save = Some(PathBuf::from(value_for("--creator-save")?));
             }
+            "--creator-replace" => {
+                // `<BLOCK>:<PART>`, e.g. `3:0x0001_3530`. Both halves are parsed by
+                // the crate that owns them: `usize` for an index and `BlockId` for a
+                // part identity. The alternative -- splitting on ':' here and reading
+                // the two words as u32 -- is a second id parser in the CLI, and this
+                // repo has already been bitten by exactly that twice.
+                let raw = value_for("--creator-replace")?;
+                let (block, part) = raw.split_once(':').ok_or_else(|| CliError::BadValue {
+                    flag: "--creator-replace".into(),
+                    value: raw.clone(),
+                    expected: "<BLOCK>:<PART>, e.g. 3:0x00013530",
+                })?;
+                let index: usize = block.trim().parse().map_err(|_| CliError::BadValue {
+                    flag: "--creator-replace".into(),
+                    value: block.to_owned(),
+                    expected: "a block index",
+                })?;
+                let identity =
+                    BlockId::parse(part.trim(), index).map_err(|_| CliError::BadValue {
+                        flag: "--creator-replace".into(),
+                        value: part.to_owned(),
+                        expected: "a part identity, e.g. 0x40626000,0x00013530",
+                    })?;
+                if let Some((existing, _)) = replace {
+                    return Err(CliError::RepeatedCreatorReplace { first: existing });
+                }
+                replace = Some((index, identity));
+            }
             "--select-block" => {
                 let raw = value_for("--select-block")?;
                 let parsed: usize = raw.parse().map_err(|_| CliError::BadValue {
@@ -781,6 +843,7 @@ fn parse_vec(args: &[String]) -> Result<LaunchRequest, CliError> {
             document,
             save_to: creator_save,
             select: select_block,
+            replace,
             scale,
             window,
             info_only,
@@ -788,11 +851,20 @@ fn parse_vec(args: &[String]) -> Result<LaunchRequest, CliError> {
     }
     // A creator-only flag with no creator document is a typo, not a default: the
     // block it names has no meaning without the document it belongs to.
-    if creator_save.is_some() {
-        return Err(CliError::OrphanCreatorFlag {
-            flag: "--creator-save".into(),
-            needs: "--creator <T:G:I> or --creator-doc <PATH>",
-        });
+    // `--creator-replace` belongs here too, and was missing: without this arm it was
+    // parsed, carried in the request, and then never read, because no creator
+    // document existed to apply it to. A flag that names a block in a document that
+    // was never loaded is a typo, and silently doing nothing is the worst answer.
+    for (given, flag) in [
+        (creator_save.is_some(), "--creator-save"),
+        (replace.is_some(), "--creator-replace"),
+    ] {
+        if given {
+            return Err(CliError::OrphanCreatorFlag {
+                flag: flag.into(),
+                needs: "--creator <T:G:I> or --creator-doc <PATH>",
+            });
+        }
     }
     if select_block.is_some() {
         return Err(CliError::OrphanCreatorFlag {
@@ -1203,5 +1275,77 @@ mod tests {
             text.contains("INFERRED"),
             "the model-to-colour link must be stated as inferred: {text}"
         );
+    }
+}
+
+#[cfg(test)]
+mod replace_flag_tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<LaunchRequest, CliError> {
+        super::parse(args.iter().map(|s| (*s).to_owned()))
+    }
+
+    fn base() -> Vec<&'static str> {
+        vec![
+            "--creator",
+            "0x2b978c46:0x40626200:0xde727fa9",
+            "--package",
+            "SPORE/Data/Spore_Game.package",
+        ]
+    }
+
+    #[test]
+    fn a_replace_names_the_block_and_the_part() {
+        let mut args = base();
+        args.extend(["--creator-replace", "3:0x40626000,0x00013530"]);
+        let Ok(LaunchRequest::Creator(request)) = parse(&args) else {
+            panic!("expected a creator request, got {:?}", parse(&args));
+        };
+        let (index, id) = request.replace.expect("the replace was parsed");
+        assert_eq!(index, 3);
+        assert_eq!(id.group_id, 0x4062_6000);
+        assert_eq!(id.instance_id, 0x0001_3530);
+    }
+
+    #[test]
+    fn no_replace_flag_means_no_replacement() {
+        let Ok(LaunchRequest::Creator(request)) = parse(&base()) else {
+            panic!("expected a creator request");
+        };
+        assert_eq!(request.replace, None, "an absent flag is not a zero block");
+    }
+
+    #[test]
+    fn two_replaces_are_refused_rather_than_one_silently_winning() {
+        // Flag order would decide the winner otherwise, and the loser would be a
+        // block the caller believed they had edited.
+        let mut args = base();
+        args.extend(["--creator-replace", "1:0x40626000,0x00013530"]);
+        args.extend(["--creator-replace", "2:0x40626000,0x00013531"]);
+        assert!(matches!(
+            parse(&args),
+            Err(CliError::RepeatedCreatorReplace { first: 1 })
+        ));
+    }
+
+    #[test]
+    fn a_malformed_replacement_is_refused_with_both_halves_named() {
+        for bad in ["3", "3:", ":0x40626000,0x00013530", "x:0x40626000,0x0001"] {
+            let mut args = base();
+            args.extend(["--creator-replace", bad]);
+            let Err(CliError::BadValue { flag, .. }) = parse(&args) else {
+                panic!("{bad:?} should not parse");
+            };
+            assert_eq!(flag, "--creator-replace");
+        }
+    }
+
+    #[test]
+    fn a_replace_needs_a_creator_document() {
+        assert!(matches!(
+            parse(&["--creator-replace", "0:0x40626000,0x00013530"]),
+            Err(CliError::OrphanCreatorFlag { .. })
+        ));
     }
 }

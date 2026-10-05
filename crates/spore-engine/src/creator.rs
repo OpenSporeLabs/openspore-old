@@ -659,6 +659,17 @@ pub enum CreatorLoadError {
     Packages(String),
     /// No package was named, so nothing could be resolved.
     NoPackages,
+    /// `--creator-replace` named a block the document does not have.
+    ///
+    /// Its own variant because the two numbers are the whole diagnostic: the index
+    /// asked for and how many blocks exist. Clamping to the last block would edit a
+    /// block nobody named.
+    NoSuchBlock {
+        /// The block index the caller asked for.
+        index: usize,
+        /// How many blocks the document has.
+        len: usize,
+    },
     /// The record is not in any package searched.
     RecordNotFound {
         /// The identity asked for.
@@ -699,6 +710,12 @@ impl core::fmt::Display for CreatorLoadError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Packages(reason) => write!(f, "{reason}"),
+            Self::NoSuchBlock { index, len } => write!(
+                f,
+                "--creator-replace named block {index}, but the document has {len} blocks \
+                 (indices 0..{len}). Nothing was edited: clamping to the last block would \
+                 change a block you did not name"
+            ),
             Self::NoPackages => write!(
                 f,
                 "no Spore package was named, so there is nothing to resolve the creator \
@@ -749,18 +766,80 @@ pub fn load_creator(
     source: &DocumentSource,
     packages: &[PathBuf],
 ) -> Result<CreatorStage, CreatorLoadError> {
+    load_creator_replacing(source, packages, None)
+}
+
+/// [`load_creator`], with one block's part swapped before anything is resolved.
+///
+/// # Why the replacement happens HERE and not after projection
+///
+/// The point of an edit is that the new part is resolved by the **same chain** an
+/// authored part would be: `blockref -> rigblock -> prop -> part pair`. Applying it
+/// after projection would leave every number in the runtime state describing the part
+/// that was replaced, and a replacement that does not resolve would look like a
+/// missing entity rather than like an unresolved block with a stop stage.
+///
+/// It is here rather than on [`CreatorStage`] because a stage deliberately does not
+/// keep the record source: a staged creature holds its decoded geometry and the
+/// document, not the packages it came from, so it cannot re-resolve anything. An
+/// `Arc<Source>` would be a live handle on a memory map for the lifetime of every
+/// stage, which is the wrong price for a second call path.
+///
+/// An index past the end is refused. Clamping to the last block would edit a block
+/// the caller did not name, and that looks exactly like success.
+pub fn load_creator_replacing(
+    source: &DocumentSource,
+    packages: &[PathBuf],
+    replace: Option<(usize, spore_creator_core::document::BlockId)>,
+) -> Result<CreatorStage, CreatorLoadError> {
     if packages.is_empty() {
         return Err(CreatorLoadError::NoPackages);
     }
     let world = ResourceWorld::open(packages)
         .map_err(|error| CreatorLoadError::Packages(crate::loader::describe(&error)))?;
-    let document = read_document(source, world.store())?;
+    let mut document = read_document(source, world.store())?;
+    if let Some((index, block_id)) = replace {
+        let len = document.blocks.len();
+        if index >= len {
+            return Err(CreatorLoadError::NoSuchBlock { index, len });
+        }
+        document
+            .replace_block(index, block_id)
+            .map_err(|error| CreatorLoadError::Document(error.to_string()))?;
+    }
     let records = StoreSource::new(world.store());
     let stage = project_document(document, source, &records, world.package_names().len())?;
     Ok(CreatorStage {
         read_errors: records.read_errors.get(),
         ..stage
     })
+}
+
+/// Projects a document against real packages, for either document source.
+///
+/// [`load_creator`] is the record path: it locates the packages, reads the document
+/// and projects it. There was no equivalent for the **saved-file** path, because
+/// [`read_document`] and the projection were private, so a round trip -- write a
+/// document, read it back, project it against the same packages -- could only be
+/// done through the engine's own binary and a screenshot. That is the whole
+/// replace/save/reload loop, so it needed a public seam.
+///
+/// Takes the document rather than reading it, so the caller decides which of the two
+/// documents it is projecting: the one it just edited, or the one it read back from
+/// disk. Comparing those two projections IS the round-trip assertion.
+pub fn project_against_packages(
+    document: CreatorDocument,
+    source: &DocumentSource,
+    packages: &[PathBuf],
+) -> Result<CreatorStage, CreatorLoadError> {
+    let world = ResourceWorld::open(packages)
+        .map_err(|error| CreatorLoadError::Packages(crate::loader::describe(&error)))?;
+    project_document(
+        document,
+        source,
+        &StoreSource::new(world.store()),
+        world.package_names().len(),
+    )
 }
 
 /// Reads the document itself.
