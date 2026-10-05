@@ -669,3 +669,114 @@ fn the_index_block_is_never_mistaken_for_bone_data() {
         let _ = ordinals;
     }
 }
+
+/// The whole-body layer, reached by pointer from the `gmdl` trailer.
+///
+/// Not the part layer. The part layer is `0x40606000` in `Spore_Graphics`; this is
+/// `0x41606100` in `Spore_Content`, and the `gmdl` records' trailers name it —
+/// see `docs/analysis/creator/12-gmdl-anim-data-vocabulary.md`. Only one digit of
+/// group id separates the two, which is why conflating them is easy and why this
+/// test exists rather than a comment.
+fn content() -> Option<(Vec<u8>, PackageIndex)> {
+    package("Spore_Content.package")
+}
+
+const WHOLE_BODY_GROUP: u32 = 0x4160_6100;
+
+/// Counts, over every skeleton section at the whole-body group, how many times
+/// `word` appears as a skeleton root and how many as a child.
+fn root_word_counts(
+    image: &[u8],
+    index: &PackageIndex,
+    word: spore_rigblock::vocabulary::BoneName,
+) -> (usize, usize) {
+    let mut as_root = 0;
+    let mut as_child = 0;
+    for (_instance, bytes) in records_of_type(image, index, TYPE_RW4, Some(WHOLE_BODY_GROUP)) {
+        for (_type_id, offset, size) in rw4_sections(&bytes) {
+            let section = &bytes[offset..(offset + size).min(bytes.len())];
+            let Ok(skeleton) = spore_rigblock::Skeleton::decode(section) else {
+                continue;
+            };
+            let root = skeleton.root();
+            for (index_bone, name) in skeleton.named_bones() {
+                if name == word_str(word) {
+                    if index_bone == root {
+                        as_root += 1;
+                    } else {
+                        as_child += 1;
+                    }
+                }
+            }
+        }
+    }
+    (as_root, as_child)
+}
+
+/// The name `word` denotes, borrowed from the vocabulary's own table.
+fn word_str(word: spore_rigblock::vocabulary::BoneName) -> &'static str {
+    word.name_if_certain().expect("a strong-graded name")
+}
+
+#[test]
+#[ignore = "needs SPORE/"]
+fn the_whole_body_layer_decodes_with_one_root_per_skeleton() {
+    let Some((image, index)) = content() else {
+        eprintln!("SKIP: no SPORE/Data/Spore_Content.package");
+        return;
+    };
+    let records = records_of_type(&image, &index, TYPE_RW4, Some(WHOLE_BODY_GROUP));
+    assert_eq!(
+        records.len(),
+        591,
+        "the whole-body group is 591 rw4 records; a different count means the group \
+         id or the package moved, not that the format changed"
+    );
+
+    let mut sections = 0usize;
+    let mut bones = 0usize;
+    let mut multi_root = 0usize;
+    for (_instance, bytes) in &records {
+        for (_type_id, offset, size) in rw4_sections(bytes) {
+            let section = &bytes[offset..(offset + size).min(bytes.len())];
+            let Ok(skeleton) = spore_rigblock::Skeleton::decode(section) else {
+                continue;
+            };
+            sections += 1;
+            bones += skeleton.len();
+            // "Exactly one root" is asserted structurally: in a rooted tree every
+            // node but the root is somebody's child, so the child count must be
+            // exactly len-1. Counting `path_to_root` successes instead would pass
+            // even with two roots, which is the bug worth avoiding here.
+            let children_of_everyone: usize = (0..skeleton.len())
+                .map(|i| skeleton.children(i).len())
+                .sum();
+            if children_of_everyone != skeleton.len() - 1 {
+                multi_root += 1;
+            }
+        }
+    }
+    assert_eq!(sections, 1182, "whole-body skeleton sections");
+    assert_eq!(bones, 3074, "whole-body bones");
+    assert_eq!(multi_root, 0, "every skeleton must have exactly one root");
+}
+
+#[test]
+#[ignore = "needs SPORE/"]
+fn the_token_root_is_the_root_bone_in_every_case() {
+    let Some((image, index)) = content() else {
+        eprintln!("SKIP: no SPORE/Data/Spore_Content.package");
+        return;
+    };
+    let root = spore_rigblock::vocabulary::identity_of("root").expect("root is in the vocabulary");
+    let (as_root, as_child) = root_word_counts(&image, &index, root);
+    assert_eq!(
+        as_root, 190,
+        "`root` occurrences that ARE the skeleton root"
+    );
+    assert_eq!(
+        as_child, 0,
+        "`root` must never be a child bone. If this fails, the vocabulary word \
+         `root` is not the skeleton-root marker and the semantic claim is wrong."
+    );
+}

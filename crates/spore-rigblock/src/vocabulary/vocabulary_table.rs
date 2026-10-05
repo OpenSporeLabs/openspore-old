@@ -1,7 +1,7 @@
 //! The recovered bone-identity vocabulary, generated from a measurement.
 //!
 //! **Do not hand-edit this file.** It is emitted by the search recorded in
-//! `docs/analysis/creator/11-bone-identity-vocabulary.md` Â§1, and the crate
+//! `docs/analysis/creator/11-bone-identity-vocabulary.md` §1, and the crate
 //! carries a test that re-hashes every row and fails if one does not reproduce
 //! its own identity. A hand-edited row cannot survive that test, which is the
 //! point: a name in this table is a *claim about a hash*, not a label.

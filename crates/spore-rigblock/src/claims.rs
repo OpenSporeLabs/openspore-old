@@ -47,6 +47,9 @@ pub const REST_POSE: &str = "rest_pose_selection";
 /// Where the creature's anatomical vocabulary is actually used.
 pub const ANATOMY_LOCATION: &str = "anatomy_location";
 
+/// The vocabulary word `root` as the skeleton-root marker.
+pub const ROOT_WORD_IS_ROOT_BONE: &str = "root_word_is_root_bone";
+
 /// Bone identities in the whole-body `gmdl` layer.
 pub const GMDL_BONE_IDENTITY: &str = "gmdl_bone_identity";
 
@@ -58,7 +61,7 @@ pub fn all() -> Vec<Claim> {
             fact: Fact::unavailable(format!(
                 "the meaning of the skeleton section's d+0x10 id word: 1352 distinct \
                  values across 6270 sections and never the record's own instance id \
-                 (0 of 6270); no registry or name table exists ({REPORT_10} Â§4)"
+                 (0 of 6270); no registry or name table exists ({REPORT_10} §4)"
             )),
         },
         Claim {
@@ -66,7 +69,7 @@ pub fn all() -> Vec<Claim> {
             fact: Fact::unavailable(format!(
                 "the meaning of skeleton array 2: values lie in {{0,1,2,3}} in 6270 of \
                  6270 sections and correlate with nothing yet measured, so it is kept \
-                 for being stable rather than for being understood ({REPORT_10} Â§4)"
+                 for being stable rather than for being understood ({REPORT_10} §4)"
             )),
         },
         Claim {
@@ -74,7 +77,7 @@ pub fn all() -> Vec<Claim> {
             fact: Fact::unavailable(format!(
                 "which rigblock parameter each subdivision level drives: the writer \
                  FUN_0041aaa0 calls model.vtable[0x74]/[0x80], which were not resolved. \
-                 The encoding is verified; the levels are not named ({REPORT_08} Â§7)"
+                 The encoding is verified; the levels are not named ({REPORT_08} §7)"
             )),
         },
         Claim {
@@ -82,7 +85,7 @@ pub fn all() -> Vec<Claim> {
             fact: Fact::unavailable(format!(
                 "why 233 of 1549 rigblocks have no 0x40606000 counterpart, and why flora \
                  has none at all (0 of 107): a second geometry layer is a lead, not a \
-                 finding ({REPORT_10} Â§5)"
+                 finding ({REPORT_10} §5)"
             )),
         },
         Claim {
@@ -106,7 +109,7 @@ pub fn all() -> Vec<Claim> {
                 "names for 1758 of the 2002 bone identities: 244 were recovered, \
                  covering 43% of bone occurrences, and the remainder is dominated by \
                  per-asset names such as CA_shoulders_01 that cannot be enumerated \
-                 without the asset database ({REPORT_11} Â§2)"
+                 without the asset database ({REPORT_11} §2)"
             )),
         },
         Claim {
@@ -115,18 +118,44 @@ pub fn all() -> Vec<Claim> {
                 "whether attach / csnap bones reference other parts: both are recovered \
                  names living inside one part's skeleton, and no array in 0x70002 stores \
                  a part-to-part reference because the payload has zero slack \
-                 ({REPORT_11} Â§6)"
+                 ({REPORT_11} §6)"
             )),
+        },
+        Claim {
+            subject: ROOT_WORD_IS_ROOT_BONE,
+            fact: Fact::new(
+                EvidenceLevel::Observed,
+                EvidenceState::Derived,
+                vec![Provenance::derived(
+                    "crates/spore-rigblock/src/vocabulary.rs",
+                )],
+                "the FNV-1 identity 0x7BD05F71, which hashes the morph-parameter \
+                 name 'root', occurs 190 times across the 1182 whole-body skeleton \
+                 sections at rw4 group 0x41606100, and in 190 of those 190 cases it \
+                 IS that skeleton's root (parent == -1). It occurs as a child 0 \
+                 times. A name matching its structural role in every case is a \
+                 marker, not a coincidence",
+            ),
         },
         Claim {
             subject: ANATOMY_LOCATION,
             fact: Fact::unavailable(
-                "where Spore's anatomical bone names (hip, knee, eye, iris, jaw, \
-                 shoulder) are used: the 244 recovered names are correct hashes, but \
-                 across the 677 bones in the 680 composed <blockref> parts the ONLY \
-                 recovered name is joint1 - no anatomy, no laterality, no \
-                 attach/csnap. The creator core's parts are simple articulated blocks, \
-                 so the anatomy belongs to a different record (report 11 section 11)",
+                "where Spore's anatomical bone vocabulary is used. Three layers were \
+                 measured and all three refuse the dense-anatomy reading. Block \
+                 layer: across the 677 bones in the 680 composed <blockref> parts the \
+                 ONLY recovered name is joint1, with no anatomy, no laterality and no \
+                 attach/csnap. gmdl whole-body records: 11236365 trailer words over \
+                 4209 of 4209 records gave 0 of 17 anatomical targets, and 58 hits \
+                 over 3 distinct tokens where chance expects 4.14, i.e. BELOW \
+                 chance; all 58 are resource-key instance words rather than hashes. \
+                 The layer the trailer points TO, rw4 group 0x41606100 in \
+                 Spore_Content: 591 records, 1182 skeletons, 3074 bones, 64 distinct \
+                 tokens, where root=190, attach=34 and eye=24 are real but body, hip, \
+                 knee, jaw, shoulder and hand are 2 each and spike is 1, which is \
+                 below the ~29 chance collisions expected corpus-wide and so is not \
+                 demonstrated as used. Every L/R pair is 0 there too, so laterality \
+                 is unused in the whole-body rig as well. The creature's anatomical \
+                 rig remains unlocated",
             ),
         },
         Claim {
@@ -144,7 +173,7 @@ pub fn all() -> Vec<Claim> {
             fact: Fact::unavailable(format!(
                 "which of a part's transforms is its rest pose: 10859 orthonormal 3x3 \
                  transforms exist in section 0x12000E05 and nothing indexes or labels \
-                 them ({REPORT_11} Â§3)"
+                 them ({REPORT_11} §3)"
             )),
         },
     ]
@@ -173,17 +202,19 @@ mod tests {
     }
 
     #[test]
-    fn exactly_one_claim_is_available_and_it_is_the_measured_one() {
+    fn exactly_the_measured_claims_are_available() {
         let claims = all();
-        let available: Vec<&str> = claims
+        let mut available: Vec<&str> = claims
             .iter()
             .filter(|claim| claim.fact.is_available())
             .map(|claim| claim.subject)
             .collect();
+        available.sort_unstable();
+        let mut expected = vec![RESOLUTION_COUNTS, ROOT_WORD_IS_ROOT_BONE];
+        expected.sort_unstable();
         assert_eq!(
-            available,
-            vec![RESOLUTION_COUNTS],
-            "a claim became available without a measurement, or the measured one was lost"
+            available, expected,
+            "a claim became available without a measurement, or a measured one was lost"
         );
     }
 
