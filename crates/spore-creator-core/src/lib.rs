@@ -63,6 +63,7 @@ pub mod color;
 pub mod document;
 pub mod edit;
 pub mod error;
+pub mod history;
 pub mod persist;
 pub mod sporemodel;
 pub mod validate;
@@ -79,6 +80,7 @@ pub use edit::{IndexRemap, OnLastChild, Remap};
 pub use error::{
     CreatorError, EditError, EditResult, PersistError, PersistResult, PersistSite, Result,
 };
+pub use history::{CreatorHistory, HistoryStep, SelectionStep, DEFAULT_MAX_DEPTH};
 pub use persist::{content_digest, load, load_bytes, save, save_bytes, FLOAT_ENCODING, FORMAT};
 pub use sporemodel::{parse_sporemodel, Family};
 pub use validate::{validate, Severity, ValidationIssue};
