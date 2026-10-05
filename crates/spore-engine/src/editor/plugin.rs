@@ -106,6 +106,20 @@ pub struct CreatorEditorState {
     pub session: CreatorSession,
     /// The revision the scene was last built from.
     built_revision: u64,
+    /// The selection the scene was last built for.
+    ///
+    /// Separate from `built_revision` because selection is **not** a document
+    /// edit: it changes no block, so the revision does not move, so nothing would
+    /// otherwise tell the spawn system the tint on screen is stale. The first
+    /// version of this file had no such field, and the result was that clicking a
+    /// part selected it correctly, applied it to the session, published it in two
+    /// reflected resources -- and changed **nothing on screen**, because the
+    /// selection tint is written once at spawn.
+    ///
+    /// A user reported "I cannot click anywhere", which was a true observation of
+    /// a true defect: the click worked and was invisible. Selection that cannot be
+    /// seen is not selection.
+    built_selection: Option<usize>,
     /// Whether the camera has been framed on the projection **and found**.
     ///
     /// Separate from `built_revision` because the two genuinely diverge on the
@@ -157,6 +171,23 @@ pub struct LastPick {
     /// A creature's limb boxes contain each other, so this is normally more than
     /// one and "the part under the cursor" is a choice among them.
     pub hits: u32,
+    /// Left-button press events this app actually observed, ever.
+    ///
+    /// The diagnostic that separates "the pointer never reached us" from "the
+    /// pointer reached us and the pick was rejected". Those two failures look
+    /// identical from the outside -- nothing gets selected -- and guessing between
+    /// them is how a picking bug gets reported as a UI bug.
+    pub presses_seen: u32,
+    /// Presses that arrived but fell outside the viewport's rectangle.
+    ///
+    /// Non-zero with `presses_seen` non-zero means the guard is wrong, most likely
+    /// a units mismatch: `ComputedNode::size` and `GlobalTransform` are in
+    /// **physical** pixels while `Window::cursor_position` is in **logical** ones,
+    /// and on any display where those differ the rectangle test rejects every
+    /// cursor including ones plainly inside the viewport.
+    pub rejected_outside_viewport: u32,
+    /// The last cursor position observed, in the window's own units.
+    pub last_cursor: Option<[f32; 2]>,
     /// Selection requests that the document refused, ever.
     ///
     /// A refusal is not an error state to clear; it is a count. A UI that silently
@@ -184,7 +215,12 @@ fn spawn_or_respawn_creature(
     roots: Query<Entity, With<CreatorRootMarker>>,
     mut runtime: ResMut<CreatorRuntimeState>,
 ) {
-    if state.built_revision == state.session.revision() {
+    // Rebuild when the DOCUMENT changed **or** the SELECTION changed. Both feed
+    // what is on screen -- the revision for geometry, the selection for the tint --
+    // and conflating them means one of the two never triggers.
+    if state.built_revision == state.session.revision()
+        && state.built_selection == state.session.selection()
+    {
         return;
     }
     // `Commands::spawn` is deferred and `despawn` is a command too, so the old
@@ -216,6 +252,7 @@ fn spawn_or_respawn_creature(
     runtime.total_triangles = outcome.triangles as u32;
     runtime.total_vertices = outcome.vertices as u32;
     runtime.total_bones = outcome.bones as u32;
+    state.built_selection = selection;
     runtime.max_depth = state.session.stage().projection.max_depth() as u32;
     state.built_revision = state.session.revision();
 }
@@ -293,12 +330,17 @@ fn read_viewport_click(
     if !buttons.just_pressed(MouseButton::Left) {
         return;
     }
+    last_pick.presses_seen += 1;
+    if let Some(cursor) = windows.iter().find_map(Window::cursor_position) {
+        last_pick.last_cursor = Some([cursor.x, cursor.y]);
+    }
     let (block, hits) = pick_under_cursor(
         &buttons,
         &windows,
         &cameras,
         &viewports,
         state.session.projection(),
+        &mut last_pick.rejected_outside_viewport,
     );
     last_pick.hits = hits;
     // Same block clicked twice in a row is not a new event, so re-running the
@@ -335,6 +377,7 @@ fn pick_under_cursor(
     cameras: &Query<(&Camera, &GlobalTransform), With<MainCamera>>,
     viewports: &ViewportNodes,
     projection: &spore_morphology::Projection,
+    rejected: &mut u32,
 ) -> (Option<usize>, u32) {
     if !buttons.just_pressed(MouseButton::Left) {
         return (None, 0);
@@ -356,6 +399,7 @@ fn pick_under_cursor(
         let half = node.size * 0.5;
         let local = cursor - Vec2::new(centre.x, centre.y);
         if local.x.abs() > half.x || local.y.abs() > half.y {
+            *rejected += 1;
             return (None, 0);
         }
     }
@@ -542,6 +586,7 @@ impl CreatorEditorState {
         Self {
             session,
             built_revision: u64::MAX,
+            built_selection: None,
             framed: false,
             view,
         }
