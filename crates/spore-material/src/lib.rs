@@ -267,7 +267,8 @@ pub use material::{
 };
 pub use resolve::{
     inspect_envelope, resolve_model_record, resolve_model_textures, resolve_texture, ModelTextures,
-    OrdinalAgreement, ResolvedTexture, TexSetShape, TextureClaim, TextureKind, REQUIRED_FOURCC,
+    OrdinalAgreement, ResolvedTexture, TexSetShape, TextureClaim, TextureKind, TextureResolution,
+    REQUIRED_FOURCC,
 };
 pub use role::{
     classify, colour_and_mask_signature, normal_map_signature, role_evidence, ChannelBinding,

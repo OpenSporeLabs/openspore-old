@@ -361,9 +361,24 @@ impl ModelTextures {
 
     /// The content role of the reference at flat position `index`.
     ///
-    /// [`TextureRole::Unidentified`] for an out-of-range index or a reference
-    /// that failed: both are absences, and neither is reported as a role the
-    /// record does not have.
+    /// [`TextureRole::Unidentified`] for an out-of-range index **or** for a
+    /// reference that failed to resolve.
+    ///
+    /// # Read `slot` for anything that cares why
+    ///
+    /// The two are **not** the same fact and this method cannot tell them apart.
+    /// `Unidentified` is documented — and graded at
+    /// [`spore_core::evidence::EvidenceLevel::Observed`] — as *the record
+    /// decoded and its content matched no signature*: a specific negative with a
+    /// known cause. For an absent record no such observation exists, because
+    /// nothing was decoded and nothing declined. So a caller reading
+    /// [`Self::role_of`], [`Self::roles`] or [`Self::role_census`] alone learns
+    /// that "this slot has no role", which is true, and **not** whether the
+    /// texture was missing, unreadable or refused — which is the actionable half.
+    ///
+    /// The signature is unchanged on purpose: it is what `spore-engine` reads
+    /// for the roles it *did* resolve. [`Self::slot`] is the view that keeps the
+    /// three failures apart.
     pub fn role_of(&self, index: usize) -> TextureRole {
         self.textures
             .get(index)
@@ -371,13 +386,56 @@ impl ModelTextures {
             .map_or(TextureRole::Unidentified, |texture| texture.role)
     }
 
+    /// One flat slot's outcome, with the failure classes kept apart.
+    ///
+    /// `None` for an out-of-range index — and `None` means the flat list never had
+    /// that slot, which is a **fourth** thing again: not a failure, not a role,
+    /// not an absence. This is the view a caller reads when it needs to know
+    /// whether a missing texture is missing, unreadable or refused.
+    pub fn slot(&self, index: usize) -> Option<TextureResolution<'_>> {
+        match self.textures.get(index)? {
+            Ok(texture) => Some(TextureResolution::Present(texture.role)),
+            Err(error) => Some(TextureResolution::of(error)),
+        }
+    }
+
+    /// How many slots landed in each of the four classes.
+    ///
+    /// Only classes with at least one member appear, so a reader cannot mistake a
+    /// missing key for a zero: an absent `refused` entry means *no refusal was
+    /// observed*, which is a measurement, not an absence of measurement. The
+    /// shape matches [`Self::role_census`] so the two read side by side — and
+    /// they are **not** the same census: `role_census` counts content roles, this
+    /// counts resolution outcomes, and a role can only exist for a slot that
+    /// resolved.
+    pub fn slot_census(&self) -> Vec<(&'static str, usize)> {
+        let mut counts: Vec<(&'static str, usize)> = Vec::new();
+        for index in 0..self.textures.len() {
+            let Some(slot) = self.slot(index) else {
+                continue;
+            };
+            let name = slot.class_name();
+            match counts.iter_mut().find(|(seen, _)| *seen == name) {
+                Some((_, count)) => *count += 1,
+                None => counts.push((name, 1)),
+            }
+        }
+        counts
+    }
+
     /// Every mesh's content roles, in slot order.
     ///
     /// One `Vec` per mesh, positionally aligned with
     /// [`MeshMaterial::slots`]. A mesh's `Vec` is empty only when the mesh holds
     /// no slots; a slot whose record failed contributes
-    /// [`TextureRole::Unidentified`], which is how a renderer can tell "this
-    /// mesh has no textures" from "this mesh's texture did not decode".
+    /// [`TextureRole::Unidentified`].
+    ///
+    /// **That contribution is a loss, not a distinction.** An empty `Vec` means
+    /// "this mesh declares no slots"; a `Vec` holding `Unidentified` means either
+    /// "this slot's record decoded and matched no signature" **or** "this slot's
+    /// record is absent, unreadable or refused". Only [`Self::slot`] separates
+    /// those, and the previous version of this comment claimed the roles alone
+    /// could — which is exactly the silent-wrong this workstream measured.
     ///
     /// Under [`BindingScope::WholeModel`] and [`BindingScope::Undetermined`]
     /// every mesh's `Vec` is the model's **whole** collected list, so the `Vec`s
@@ -436,6 +494,156 @@ impl ModelTextures {
             }
         }
         counts
+    }
+}
+
+/// What one flat texture-reference slot resolved to.
+///
+/// # The four classes, kept apart
+///
+/// [`resolve_texture`] has four outcomes and they are **four different facts**.
+/// A resolver that reported them all as "no texture" would turn three of them
+/// into fabrications, so this type exists to keep them apart at the point a
+/// caller actually reads — [`ModelTextures::slot`], and in counts through
+/// [`ModelTextures::slot_census`].
+///
+/// | class | what happened | what it is NOT |
+/// |---|---|---|
+/// | [`Self::Present`] | the identity was found and its bytes decoded | — |
+/// | [`Self::Absent`] | every opened package was searched and the identity is in none | not "we could not search" |
+/// | [`Self::CouldNotLook`] | the store could not answer — a container, a decompression, an empty store | not `Absent` |
+/// | [`Self::Refused`] | the record was reached and a decoder **declined**, naming why | not `Absent` |
+///
+/// # Why this exists when `textures` is already `Vec<Result<..>>`
+///
+/// The per-reference `Result` is the authority and always was; nothing is lost
+/// by matching on it. What is lossy is the **role** view built over it.
+/// [`ModelTextures::role_of`] answers [`TextureRole::Unidentified`] for a
+/// reference that did not resolve, and `Unidentified` is documented — and graded
+/// — as *the record decoded and its content matched no signature*, i.e. a
+/// specific negative at [`spore_core::evidence::EvidenceLevel::Observed`]. For an
+/// absent record there is no such observation: nothing was decoded, so nothing
+/// declined. Reporting the absence with the grade of an observation is the
+/// silent-wrong this type is the fix for.
+///
+/// `role_of` keeps its signature on purpose — it is consumed by `spore-engine`,
+/// which reads it for the roles it *did* resolve — so this is additive.
+#[derive(Debug, PartialEq)]
+pub enum TextureResolution<'a> {
+    /// The identity was found in an opened package and its bytes decoded.
+    ///
+    /// A payload of [`TextureRole::Unidentified`] here is the graded negative it
+    /// is documented to be: the check ran and declined.
+    Present(TextureRole),
+
+    /// Every opened package was searched and the identity is in none of them.
+    ///
+    /// A genuine, negative observation — and specifically *not* a decode
+    /// failure. `key` is the identity the lookup asked for, with the **assumed**
+    /// type word already substituted in; see
+    /// [`claims::ASSUMED_RECORD_TYPE`], because a wrong assumed type is the
+    /// usual cause and this variant cannot tell a wrong guess from a reference
+    /// that never named a real record.
+    Absent {
+        /// The identity that was looked for.
+        key: ResourceKey,
+        /// How many packages were actually searched.
+        ///
+        /// Carried because "absent from 1 package" and "absent from 12" are
+        /// different findings, and because a caller reading one line of a log
+        /// cannot otherwise tell which. It comes from the store's own answer
+        /// ([`spore_assets::AssetError::NotFound`]) and is never recomputed.
+        searched: usize,
+    },
+
+    /// The store could not answer.
+    ///
+    /// `key` is the identity the lookup asked for and `source` is why the store
+    /// had nothing to say: a package that would not open, a DBPF container that
+    /// would not extract or decompress, an empty store. **Never** merged into
+    /// [`Self::Absent`]: "we looked and it is not there" and "we could not look"
+    /// are different facts, and collapsing them is how a fabricated negative is
+    /// born.
+    CouldNotLook {
+        /// The identity that was looked for.
+        key: ResourceKey,
+        /// The store's own failure, **borrowed** rather than rebuilt.
+        ///
+        /// Borrowed because rebuilding it would mean inventing an
+        /// `std::io::Error` for [`spore_assets::AssetError::Open`] — fabricating
+        /// the very thing this variant exists to report faithfully.
+        source: &'a spore_assets::AssetError,
+    },
+
+    /// The record was reached and a decoder declined, naming why.
+    ///
+    /// The whole [`MaterialError`] is carried, so the reason code is the typed
+    /// one rather than a string: an unsupported `fourcc`, an assumed type that is
+    /// not a raster, a wildcard component, a texture-layer refusal, or the
+    /// defensive [`MaterialError::EmptyImage`]. A refusal means **the record is
+    /// present**, which is the fact most easily lost.
+    Refused(&'a MaterialError),
+}
+
+impl<'a> TextureResolution<'a> {
+    /// Builds the slot view from one resolution failure.
+    ///
+    /// A success has no failure to classify, so it is not accepted here:
+    /// [`ModelTextures::slot`] fills the role in and produces
+    /// [`Self::Present`] itself.
+    pub fn of(error: &'a MaterialError) -> Self {
+        match error {
+            // The load-bearing arm. `NotFound` is the store *answering* that the
+            // key is in none of its packages; every other `AssetError` is the
+            // absence of an answer.
+            MaterialError::Lookup { key, source } => match source {
+                spore_assets::AssetError::NotFound { searched, .. } => Self::Absent {
+                    key: *key,
+                    searched: *searched,
+                },
+                other => Self::CouldNotLook {
+                    key: *key,
+                    source: other,
+                },
+            },
+            other => Self::Refused(other),
+        }
+    }
+
+    /// The class name, for a count key or a log line.
+    ///
+    /// A closed vocabulary of **four** strings. Deliberately does not include the
+    /// reason: [`Self::reason`] carries that, and folding it in here would make
+    /// every distinct refusal a separate class, which is a different question
+    /// from "which of the four happened".
+    pub const fn class_name(&self) -> &'static str {
+        match self {
+            Self::Present(_) => "present",
+            Self::Absent { .. } => "absent",
+            Self::CouldNotLook { .. } => "could-not-look",
+            Self::Refused(_) => "refused",
+        }
+    }
+
+    /// Why, for the three failure classes. `None` for [`Self::Present`], which
+    /// has no failure to explain.
+    pub fn reason(&self) -> Option<String> {
+        match self {
+            Self::Present(_) => None,
+            Self::Absent { key, searched } => Some(format!(
+                "{key} is in none of the {searched} opened package(s)"
+            )),
+            Self::CouldNotLook { key, source } => Some(format!("{key}: {source}")),
+            Self::Refused(error) => Some(error.to_string()),
+        }
+    }
+
+    /// Whether the reference named a record that an opened package holds.
+    ///
+    /// `false` for all three failure classes, and the three are **not** the same
+    /// `false`: read [`Self::class_name`] for which one this is.
+    pub const fn is_present(&self) -> bool {
+        matches!(self, Self::Present(_))
     }
 }
 
