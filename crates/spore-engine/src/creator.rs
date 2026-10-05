@@ -1311,7 +1311,15 @@ fn frame_creator_camera(
 /// OpenSpore-owned reflected type. The cost is one `Transform` copy per frame; the
 /// benefit is that "did the camera move" becomes a question with an answer, and
 /// asking it no longer requires believing a screenshot.
-fn tick_creator_runtime(
+/// Advances the editor-side runtime state every frame.
+///
+/// Public because the **editor** needs it and does not add `CreatorPlugin`:
+/// without this the editor's `CreatorRuntimeState` carried the block table and
+/// nothing else, so `camera_framed` and `camera_distance_to_centre` were `null`
+/// in exactly the mode where a framing question is most likely -- after an edit.
+/// A BRP reader would then have had `camera_framed: null` and no way to tell
+/// "not framed" from "this mode does not report framing".
+pub fn tick_creator_runtime(
     mut state: ResMut<CreatorRuntimeState>,
     cameras: Query<&Transform, With<MainCamera>>,
     framing: Option<Res<CameraFraming>>,

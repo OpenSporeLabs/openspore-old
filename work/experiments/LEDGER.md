@@ -61,7 +61,7 @@ is evidence about the probe until proven otherwise.**
 | id | hypothesis | result | evidence |
 |---|---|---|---|
 | 02 | the camera does not frame the creator (`CameraFraming` is absent, or the camera query does not match) | **REFUTED** | headless probe: resource present in the world, 1 camera matched, camera at `(0.0, 0.5258, 1.8056)` — exactly the closed form for that creature's measured extent |
-| 02a | framing holds across real geometry, not just a tidy fixture | **PROVEN** | 47/47 real creature documents frame; distances span **0.43 .. 130.45**, a 300x range, each from its own measured extent |
+| 02a | framing holds across real geometry, not just a tidy fixture | **PROVEN** | 47/47 real creature documents frame. Distances now span **0.30 .. 133.14**, a ~440x range, each from its own measured extent. This was **0.43 .. 130.45** when first measured: `Projection::bounds` was adding `world_position` to *untransformed* geometry positions, so it framed a box smaller than a rotated part and the wrong size for a scaled one. It now maps the box's eight corners through the full world transform, which is exact for an affine map. The count was 47/47 before and is 47/47 after; only the box is finally the right one. |
 | 02b | the creature in the session's screenshot was a representative creature | **REFUTED** | `0x40626200:0x05e3df13` is six copies of ONE part (`0x40626200:0xd05ff5c3`) in a sparse line. 46 of the 47 creature documents are single-part chains |
 
 ### What actually happened, and why it is worth the space

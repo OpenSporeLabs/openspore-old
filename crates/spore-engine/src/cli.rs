@@ -98,6 +98,15 @@ pub struct CreatorRequest {
     pub window: WindowOptions,
     /// Print what was loaded and exit without opening a window.
     pub info_only: bool,
+    /// Open the **editor** rather than the viewer: the Creature Creator screen,
+    /// with the catalog panel, the viewport, the tab strip, the bottom bar, and
+    /// click-to-select against the real document.
+    ///
+    /// A flag on the same request rather than a separate subcommand because every
+    /// other creator flag -- `--creator-doc`, `--creator-replace`, `--select-block`,
+    /// `--creator-save` -- means the same thing in both modes, and a second
+    /// subcommand would mean parsing and validating all of them twice.
+    pub editor: bool,
 }
 
 /// Which creator document to stage.
@@ -546,6 +555,10 @@ pub fn usage() -> String {
          \x20                       silently missing. May be given once.\n\
          \x20   --select-block <N>   Mark block N as selected; it is tinted, and the\n\
          \x20                       selection is readable in the runtime state.\n\
+         \x20   --editor              Open the Creature Creator screen: catalog panel,\n\
+         \x20                       viewport, tab strip, bottom bar, and click to select\n\
+         \x20                       a real body part. Every other creator flag still\n\
+         \x20                       applies.\n\
          \n\
          A creator part spans TWO packages: the rigblock bounds live in\n\
          Spore_Game.package and the prop pointer plus the 0x40606000 pair in\n\
@@ -578,6 +591,7 @@ fn parse_vec(args: &[String]) -> Result<LaunchRequest, CliError> {
     let mut scale = 1.0f32;
     let mut window = WindowOptions::default();
     let mut info_only = false;
+    let mut editor = false;
     let mut placeholder = false;
     let mut textured = false;
     let mut sporemodel: Option<ResourceKey> = None;
@@ -716,6 +730,7 @@ fn parse_vec(args: &[String]) -> Result<LaunchRequest, CliError> {
                 window.title = value_for("--title")?;
             }
             "--info" => info_only = true,
+            "--editor" => editor = true,
             "--texture" => textured = true,
             "--flip-normal-y" => flip_normal_y = true,
             "--creator" => {
@@ -847,6 +862,7 @@ fn parse_vec(args: &[String]) -> Result<LaunchRequest, CliError> {
             scale,
             window,
             info_only,
+            editor,
         }));
     }
     // A creator-only flag with no creator document is a typo, not a default: the

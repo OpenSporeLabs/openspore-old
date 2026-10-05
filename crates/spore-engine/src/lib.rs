@@ -86,6 +86,7 @@ pub mod texture;
 pub mod brp;
 
 pub use creator::{CreatorDecoded, CreatorPlugin, StagedCreator};
+pub use editor::{CreatorSession, SessionError};
 pub use loader::{SceneOutcome, SporeAssetPlugin, WorldResources};
 pub use scene::ScenePlugin;
 
@@ -274,7 +275,17 @@ fn run_creator(request: CreatorRequest) -> std::process::ExitCode {
         return std::process::ExitCode::SUCCESS;
     }
 
-    let exit = build_creator_app(request.window.clone(), *stage, request).run();
+    // The editor is the same decode and the same projection, with a UI and a
+    // session bolted on. The `--info` path is above this and never reaches it, so
+    // the headless gate stays headless: `DefaultPlugins` builds a winit
+    // `EventLoop`, which panics off the main thread, so an "the editor assembles"
+    // claim that runs in `cargo test` would be a claim about nothing.
+    let exit = if request.editor {
+        build_creator_editor_app(request.window.clone(), &request)
+    } else {
+        build_creator_app(request.window.clone(), *stage, request)
+    }
+    .run();
     match exit {
         AppExit::Success => std::process::ExitCode::SUCCESS,
         AppExit::Error(cause) => {
@@ -335,6 +346,71 @@ pub fn build_creator_app(
         app.insert_resource(framing);
     }
     app.add_plugins((ScenePlugin, CreatorPlugin));
+    app.add_systems(Update, exit_on_escape);
+    app
+}
+
+/// Assembles the **Creature Creator**: the editor screen over a staged document.
+///
+/// The viewer ([`build_creator_app`]) and the editor differ in one resource --
+/// [`CreatorEditorState`] holds a [`CreatorSession`], which owns a *mutable*
+/// document -- and one plugin. Everything else, including the decode that
+/// happens before this function is ever called, is shared, so the two cannot
+/// disagree about what the document is.
+///
+/// [`CreatorRuntimeState`] is inserted as its own resource here rather than
+/// living inside [`CreatorEditorState`], because it is the thing BRP reads and a
+/// BRP reader must not have to know about the editor's private state to ask "how
+/// many blocks are on screen".
+///
+/// # Framing
+///
+/// The framing comes from the stage *before* the session takes it, because the
+/// session clones the document and the stage is what holds the projection. Read
+/// it here and insert it as a resource; the editor plugin does not re-frame,
+/// since framing once per load is correct and framing every frame would fight the
+/// user's orbiting.
+pub fn build_creator_editor_app(window: WindowOptions, request: &CreatorRequest) -> App {
+    use editor::plugin::{CreatorEditorPlugin, CreatorEditorState, LastPick};
+    use editor::ui::spawn::CreatorUiView;
+
+    let source = request
+        .document
+        .to_document_source()
+        .unwrap_or_else(|reason| panic!("openspore: the editor cannot open a document: {reason}"));
+
+    // The session opens its OWN package mapping rather than adopting the stage
+    // the report lines were printed from. That is deliberate: a session has to
+    // hold a live mapping to re-resolve an edited document, and the only honest
+    // way to get one is to own it. Adopting the stage would have meant either
+    // resolving the document twice on every launch, or keeping a reference into
+    // a `ResourceWorld` that the stage does not own.
+    let session = CreatorSession::open(&source, &request.packages, request.scale)
+        .unwrap_or_else(|error| panic!("openspore: the editor cannot open its document: {error}"));
+
+    let framing = session.stage().camera_framing();
+    let mut runtime = session.stage().runtime_state(request.select);
+
+    let mut session = session;
+    if let Err(error) = session.select(request.select) {
+        // A selection the document refuses is a typo in the command line, and
+        // saying so is better than opening an editor with the wrong part lit.
+        panic!(
+            "openspore: the editor cannot select block {:?}: {error}",
+            request.select
+        );
+    }
+    runtime.document = session.stage().document_identity();
+
+    let mut app = base_app(window);
+    app.insert_resource(CreatorEditorState::new(session, CreatorUiView::default()));
+    app.insert_resource(LastPick::default());
+    app.insert_resource(editor::plugin::CreatorSelectionCommand::default());
+    app.insert_resource(runtime);
+    if let Some(framing) = framing {
+        app.insert_resource(framing);
+    }
+    app.add_plugins((ScenePlugin, CreatorEditorPlugin));
     app.add_systems(Update, exit_on_escape);
     app
 }

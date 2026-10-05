@@ -667,6 +667,18 @@ impl SessionRecords {
     }
 }
 
+impl CreatorSession {
+    /// The current projection, for a caller that wants to pick against it
+    /// without also reaching for the stage.
+    ///
+    /// A named accessor rather than a re-exported field, because `stage` is
+    /// already public and a second path to the same projection is a second way
+    /// for the two to be read differently.
+    pub fn projection(&self) -> &spore_morphology::Projection {
+        &self.stage.projection
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

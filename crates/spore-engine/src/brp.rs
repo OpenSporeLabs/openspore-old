@@ -129,6 +129,13 @@ fn register_openspore_types(app: &mut App) {
     app.register_type::<crate::creator::CreatorRuntimeState>();
     app.register_type::<crate::creator::CreatorBlockState>();
     app.register_type::<crate::creator::CreatorBlockMarker>();
+    // The editor's two reflected resources. Minimum dev-only reflection, and only
+    // because without it BRP reports them as `Unknown resource type` while the app
+    // is plainly running -- so "is the editor wired up" is unanswerable over the
+    // one channel built to answer it. Registered here rather than unconditionally
+    // so the hermetic test build gains no registry entries.
+    app.register_type::<crate::editor::plugin::LastPick>();
+    app.register_type::<crate::editor::plugin::CreatorSelectionCommand>();
     app.register_type::<crate::creator::CreatorRootMarker>();
 }
 

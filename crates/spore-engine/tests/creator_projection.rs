@@ -1309,6 +1309,7 @@ fn decode(packages: &[PathBuf], identity: ResourceKey) -> creator::CreatorStage 
         scale: 1.0,
         window: cli::WindowOptions::default(),
         info_only: true,
+        editor: false,
     };
     match spore_engine::prepare_creator(&request) {
         CreatorDecoded::Ready(stage) => *stage,
@@ -2232,7 +2233,7 @@ fn an_unresolved_projection_publishes_no_framing_and_no_camera_distance() {
 /// arithmetic on a synthetic fixture; this is what says the arithmetic survives
 /// **real** geometry, real scales and real authored transforms, rather than one
 /// tidy three-block document. Measured over the real corpus: 47 creature
-/// documents, all 47 framing, distances spanning **0.43 to 130.45** -- a ~300x
+/// documents, all 47 framing, distances spanning **0.30 to 133.14** -- a ~440x
 /// range in creature size.
 ///
 /// The spread is the interesting half. A single constant, or a bounds source that
@@ -2376,7 +2377,11 @@ fn every_real_creature_document_frames_from_its_own_measured_extent() {
     // 250, not 20. The printed range is ~300x and the point of the assertion is
     // that the range CANNOT quietly collapse -- a 21x floor would have sat under a
     // published "300x" claim and let exactly that collapse through. The two numbers
-    // that disagreed (0.47..23.6 here, 0.43..130.45 in the commit) are now one: this
+    // that disagreed (0.47..23.6 here, 0.43..130.45 in the commit) are now one. They
+    // moved a second time when `Projection::bounds` began applying orientation and
+    // scale instead of offset alone, so the range is now 0.30..133.14: a ~440x span
+    // rather than ~300x. The framing is still 47/47; only the box it frames against
+    // is finally the box the creature occupies.
     // test prints them and asserts against the same figure the message quotes.
     assert!(
         largest / smallest > 250.0,

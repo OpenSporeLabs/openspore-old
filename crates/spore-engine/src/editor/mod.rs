@@ -10,8 +10,11 @@
 //! |---|---|---|
 //! | [`session`] | the mutable document, the history, the re-projection | it is the only thing that holds a live package mapping |
 //! | [`picking`] | cursor ray -> `BlockIndex` | pure maths, testable with no camera, so the interesting cases can be written down |
+//! | [`ui`] | the screen's layout, proportions and colours | a screenshot cannot be asserted on, so the proportions have to be numbers first |
 
 pub mod picking;
+pub mod plugin;
 pub mod session;
+pub mod ui;
 
 pub use session::{CreatorSession, SessionError};

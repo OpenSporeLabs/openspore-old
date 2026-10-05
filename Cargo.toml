@@ -42,16 +42,29 @@ spore-rigblock = { path = "crates/spore-rigblock", version = "0.1.0" }
 spore-morphology = { path = "crates/spore-morphology", version = "0.1.0" }
 
 # Bevy: no default features. The set below is the smallest one that gives a
-# native window, a wgpu renderer, PBR materials and PNG image loading.
-# Anything not listed here is deliberately NOT pulled in (audio, gamepad,
-# networking, gizmos, ui, ...) so the engine builds on machines without ALSA
+# native window, a wgpu renderer, PBR materials, PNG image loading and the
+# Creator's UI. Anything not listed here is deliberately NOT pulled in (audio,
+# gamepad, networking, gizmos, ...) so the engine builds on machines without ALSA
 # or udev and so the dependency graph stays auditable.
+#
+# `bevy_ui` + `bevy_ui_render` + `default_font` were added when the Creature
+# Creator screen was built, and they are the three smallest that make a UI
+# actually appear: without `bevy_ui` there is no `Node`; without
+# `bevy_ui_render` the nodes are laid out and never drawn; and without
+# `default_font` every `TextFont` resolves to `FontSource::Default`, which finds
+# no font, so every label is invisible while the code and the tests look fine.
+# That last one is the trap worth naming -- a UI with no labels is a green test
+# run.
 bevy = { version = "0.19", default-features = false, features = [
     "bevy_asset",
     "bevy_core_pipeline",
     "bevy_log",
     "bevy_pbr",
     "bevy_render",
+    # The Creator's own screen. See the note above: all three are required.
+    "bevy_ui",
+    "bevy_ui_render",
+    "default_font",
     "bevy_winit",
     "png",
     "tonemapping_luts",
