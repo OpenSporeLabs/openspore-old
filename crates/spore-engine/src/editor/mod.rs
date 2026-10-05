@@ -5,7 +5,13 @@
 //! `spore-creator-core` mutator, which ends in a [`CreatorDocument`]. If a UI
 //! path could mutate the ECS directly, the same edit would have two
 //! implementations and the tests would only be exercising one of them.
+//!
+//! | module | what it owns | why it is separate |
+//! |---|---|---|
+//! | [`session`] | the mutable document, the history, the re-projection | it is the only thing that holds a live package mapping |
+//! | [`picking`] | cursor ray -> `BlockIndex` | pure maths, testable with no camera, so the interesting cases can be written down |
 
+pub mod picking;
 pub mod session;
 
 pub use session::{CreatorSession, SessionError};

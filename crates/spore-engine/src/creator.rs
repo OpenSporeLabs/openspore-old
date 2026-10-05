@@ -425,26 +425,40 @@ impl CreatorRuntimeState {
     /// Whether [`spore_morphology::Projection::bounds`] applies a part's
     /// orientation and scale to its geometry.
     ///
-    /// **It does not.** `bounds` adds `world_position` to each of a part's
-    /// *untransformed* geometry positions, so a rotated or non-unit-scaled part
-    /// contributes a box that does not match what is drawn. Correct for this
-    /// corpus, which is authored at small near-axis scales; wrong in general.
+    /// **It does**, as of the commit that added
+    /// [`ProjectedBlock::world_bounds`](spore_morphology::ProjectedBlock::world_bounds).
     ///
-    /// # Why a `const` and not a per-frame field
+    /// This was `false`, and the reason it was `false` is the useful part: `bounds`
+    /// added `world_position` to each of a part's *untransformed* geometry
+    /// positions. That is correct for the corpus it was measured on, where every
+    /// part is small, near-axis and unscaled, and wrong everywhere else. A rotated
+    /// creature was framed against a box smaller than itself and a scaled one
+    /// against a box the wrong size entirely.
     ///
-    /// This was a `bool` on the struct below, assigned `false` in one place and
-    /// read nowhere. A reviewer caught what that costs. The field's name said "the
-    /// drawn geometry", which is **false**: the spawned `Transform` does apply
-    /// `local_orientation` and `local_scale`, and Bevy composes them through
-    /// parenting, so the creature on screen *is* oriented. A BRP reader seeing
-    /// `world_transform_applies_orientation: false` would conclude it was not.
+    /// It stayed `false` for so long because nothing consumed a correct answer:
+    /// the spawn path uses `local_scale` and lets Bevy's parent chain apply the
+    /// rest, which is right, and the camera framing it fed was unremarkable on the
+    /// near-axis corpus. The first real consumer was **picking** -- and a picker
+    /// built on an offset-only box selects the wrong part, which is a worse failure
+    /// than a slightly loose frame.
     ///
-    /// So two things change: the name now says **bounds**, and a property of the
-    /// code is a `const` rather than a value that can go stale. Fixing `bounds`
-    /// means changing this line, and the compiler then names every reader that
-    /// assumed the old answer. A per-frame field would have said `false` forever
-    /// and taught nobody anything -- and, worse, taught them something false.
-    pub const BOUNDS_APPLY_ORIENTATION: bool = false;
+    /// Two things had to be true before this could flip, and the second is the
+    /// reason it is a `const` at all:
+    ///
+    /// * `ProjectedBlock` gained a `world_scale`. It did not have one -- the value
+    ///   was computed in `descend`, carried down to every child, and then dropped
+    ///   at the struct literal, with its doc comment migrated onto the neighbouring
+    ///   `parent` field. A bounds implementation cannot honour a field that is not
+    ///   stored, so this was the actual blocker.
+    /// * The transform is applied by mapping the box's eight corners, which is
+    ///   **exact** for an affine map rather than approximate: an affine map sends a
+    ///   convex hull to the hull of the mapped points.
+    ///
+    /// Keeping it a `const` rather than restoring a per-frame `bool` is deliberate.
+    /// The previous field was assigned once and read nowhere, so it said `false`
+    /// forever and taught readers something untrue. A `const` cannot go stale, and
+    /// changing it makes the compiler name every reader that assumed the old answer.
+    pub const BOUNDS_APPLY_ORIENTATION: bool = true;
 }
 
 /// Everything an agent can ask about a staged creator scene.

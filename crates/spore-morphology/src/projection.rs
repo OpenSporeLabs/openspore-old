@@ -67,8 +67,20 @@ pub struct ProjectedBlock {
     pub world_orientation: Orientation,
     /// The parent chain applied to this block's scale.
     ///
-    /// `None` for a root, which is different from `Some(1.0)`: a root's scale is
-    /// its own authored value and no parent multiplied it.
+    /// This was **missing** for a while, which is the more interesting part of the
+    /// story: `descend` computed it, carried it down to every child in its
+    /// accumulator tuple, and then dropped it on the floor at the `ProjectedBlock`
+    /// literal. Its doc comment had migrated onto the neighbouring `parent` field,
+    /// so the field read as documented-and-absent and nothing failed to compile.
+    ///
+    /// It went unnoticed because nothing in the workspace *consumed* it: the spawn
+    /// path uses `local_scale` and lets Bevy's parent chain apply the rest, which
+    /// is correct. The first consumer is [`world_bounds`](ProjectedBlock::world_bounds),
+    /// and for that a missing ancestor scale is not a missing convenience -- it is
+    /// a box in the wrong place, so a scaled creature was framed and picked against
+    /// geometry the size of its unscaled self.
+    pub world_scale: f32,
+    /// The authored parent, or `None` for a root.
     pub parent: Option<BlockIndex>,
     /// How many ancestors contributed to `world_*`. A root is `0`.
     pub ancestor_depth: usize,
@@ -83,7 +95,124 @@ impl ProjectedBlock {
     pub fn is_resolved(&self) -> bool {
         self.part.is_some()
     }
+
+    /// This block's geometry in **world** space, as an axis-aligned box.
+    ///
+    /// `None` when the block has no decoded geometry, which is a real state for
+    /// 18 of the 482 corpus rigblocks and is not the same as a zero-sized box.
+    ///
+    /// # Why the transform is applied, and why it used not to be
+    ///
+    /// This used to be `world_position + local_position`: the offset only. That
+    /// was correct for the corpus the projection was first measured on, where
+    /// every part is small, near-axis and unscaled -- and wrong everywhere else,
+    /// because a rotated or scaled part occupies a box the offset does not
+    /// describe.
+    ///
+    /// It matters beyond this function. A box that does not match the drawn
+    /// geometry is what the camera frames on, so a rotated creature was framed
+    /// against a box smaller than itself and a scaled one against a box the wrong
+    /// size entirely: the first clips, the second floats. And a picker built on
+    /// this box selects the wrong part, which is worse than not selecting.
+    ///
+    /// # Why transforming 8 corners is exact
+    ///
+    /// An affine map sends a convex hull to the convex hull of the mapped points,
+    /// so mapping the box's 8 corners and re-fitting an AABB around them gives the
+    /// exact world AABB -- not an approximation. The cost is 8 point transforms
+    /// instead of 3 additions per vertex, and the vertices are not touched at all.
+    pub fn world_bounds(&self) -> Option<Bounds> {
+        let geometry = self.part.as_ref()?.geometry.as_ref()?;
+        if geometry.positions.is_empty() {
+            return None;
+        }
+        let mut local: Option<Bounds> = None;
+        for position in geometry.positions.iter() {
+            let point = [position[0], position[1], position[2]];
+            local = Some(match local {
+                None => Bounds {
+                    min: point,
+                    max: point,
+                },
+                Some(previous) => previous.union(Bounds {
+                    min: point,
+                    max: point,
+                }),
+            });
+        }
+        let local = local?;
+        Some(self.transform_bounds(local))
+    }
+
+    /// Maps a local box into world space through this block's world transform.
+    ///
+    /// The parent chain is already folded into `world_*`, so this applies the
+    /// transform exactly once. Applying both the local and the world transform is
+    /// the mistake the projection's `world_*` fields exist to make impossible.
+    pub fn transform_bounds(&self, local: Bounds) -> Bounds {
+        let m = self.world_orientation.as_matrix().to_array();
+        let scale = self.world_scale;
+        let mut out: Option<Bounds> = None;
+        for corner in CORNERS {
+            // A corner selector picks the min or the max on each axis.
+            let point = [
+                if corner[0] == 0.0 {
+                    local.min[0]
+                } else {
+                    local.max[0]
+                },
+                if corner[1] == 0.0 {
+                    local.min[1]
+                } else {
+                    local.max[1]
+                },
+                if corner[2] == 0.0 {
+                    local.min[2]
+                } else {
+                    local.max[2]
+                },
+            ];
+            let mut world = [0.0f32; 3];
+            // `to_array` is row-major: index `axis * 3 + column`.
+            for axis in 0..3 {
+                // Row-major: `row[i][j]` multiplies basis[j], then scale, then the
+                // world position -- the same order the spawn path uses.
+                world[axis] = (m[axis * 3] * point[0]
+                    + m[axis * 3 + 1] * point[1]
+                    + m[axis * 3 + 2] * point[2])
+                    * scale
+                    + [
+                        self.world_position.x,
+                        self.world_position.y,
+                        self.world_position.z,
+                    ][axis];
+            }
+            out = Some(match out {
+                None => Bounds {
+                    min: world,
+                    max: world,
+                },
+                Some(previous) => previous.union(Bounds {
+                    min: world,
+                    max: world,
+                }),
+            });
+        }
+        out.expect("CORNERS is eight points, so at least one iteration ran")
+    }
 }
+
+/// The eight corners of a unit box, as `{min, max}` selectors in `0.0`/`1.0`.
+const CORNERS: [[f32; 3]; 8] = [
+    [0.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0],
+    [0.0, 1.0, 0.0],
+    [0.0, 1.0, 1.0],
+    [1.0, 0.0, 0.0],
+    [1.0, 0.0, 1.0],
+    [1.0, 1.0, 0.0],
+    [1.0, 1.0, 1.0],
+];
 
 /// The real geometry behind a projected block.
 ///
@@ -252,46 +381,24 @@ impl Projection {
     /// geometry can be **ten times smaller** than the rigblock rather than larger.
     /// `catalog::RigblockBounds` carries the readings by name; see
     /// `tests/catalog_corpus.rs` for the census and `work/experiments/LEDGER.md` for
-    /// the correction of the "median 2.01x" figure that used to stand here.
+    /// The whole projection's world extent, or `None` when nothing resolved.
     ///
+    /// The union of every block's [`world_bounds`](ProjectedBlock::world_bounds),
+    /// so it is the box the drawn geometry actually occupies -- orientation and
+    /// scale included.
     ///
+    /// One part with no geometry does not erase the others: that is the whole
+    /// reason this is a `continue` and not a `?`, and it was a real bug once.
     pub fn bounds(&self) -> Option<Bounds> {
         let mut out: Option<Bounds> = None;
         for block in self.resolved() {
-            let Some(part) = block.part.as_ref() else {
+            let Some(world) = block.world_bounds() else {
                 continue;
             };
-            // `continue`, not `?`. A `?` here would abandon the ENTIRE bounds
-            // because one part lacked geometry, reporting a creature as
-            // unframeable when in fact every other part was fine. One part with no
-            // geometry must not erase the others' extent.
-            let Some(geometry) = part.geometry.as_ref() else {
-                continue;
-            };
-            let mut local: Option<Bounds> = None;
-            for position in geometry.positions.iter() {
-                let point = [
-                    block.world_position.x + position[0],
-                    block.world_position.y + position[1],
-                    block.world_position.z + position[2],
-                ];
-                local = Some(match local {
-                    None => Bounds {
-                        min: point,
-                        max: point,
-                    },
-                    Some(previous) => previous.union(Bounds {
-                        min: point,
-                        max: point,
-                    }),
-                });
-            }
-            if let Some(local) = local {
-                out = Some(match out {
-                    None => local,
-                    Some(previous) => previous.union(local),
-                });
-            }
+            out = Some(match out {
+                None => world,
+                Some(previous) => previous.union(world),
+            });
         }
         out
     }
@@ -408,6 +515,7 @@ pub fn project(
             local_scale: transform.scale,
             world_position,
             world_orientation,
+            world_scale,
             parent,
             ancestor_depth: depth,
             part: None,
@@ -606,3 +714,207 @@ impl core::fmt::Display for ProjectionError {
 }
 
 impl std::error::Error for ProjectionError {}
+
+#[cfg(test)]
+mod bounds_tests {
+    use super::*;
+    use spore_core::{Matrix3, Orientation, ResourceKey};
+    use spore_rigblock::gmsh::Header;
+    use spore_rigblock::{Cell, GmshMesh, Rigblock};
+
+    /// A block whose geometry is an axis-aligned box of half-extent 1 at the
+    /// origin, with a chosen world transform.
+    fn block(orientation: Orientation, scale: f32, at: [f32; 3]) -> ProjectedBlock {
+        ProjectedBlock {
+            block: 0,
+            block_id: None,
+            local_position: Vec3 {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            local_orientation: Orientation::default(),
+            local_scale: 1.0,
+            world_position: Vec3 {
+                x: at[0],
+                y: at[1],
+                z: at[2],
+            },
+            world_orientation: orientation,
+            world_scale: scale,
+            parent: None,
+            ancestor_depth: 0,
+            part: Some(ProjectedPart {
+                block_id: spore_creator_core::document::BlockId::new(1, 2),
+                container_key: ResourceKey::new(1, 2, 3),
+                geometry_key: None,
+                prop_key: None,
+                rigblock: Rigblock {
+                    max_low: [0.0; 3],
+                    min_high: [0.0; 3],
+                    step: 0.0,
+                    levels: 0,
+                    cells: Vec::<Cell>::new(),
+                },
+                vertices: Some(8),
+                triangles: Some(12),
+                bones: None,
+                named_bones: 0,
+                geometry: Some(GmshMesh {
+                    // Every field zero. `world_bounds` reads only `positions`, so
+                    // no header is consulted -- and `Header` has no `Default`
+                    // precisely so that a fabricated one cannot be conjured up by
+                    // a `..Default::default()` that looks harmless.
+                    header: Header {
+                        magic: 0,
+                        second: 0,
+                        stride_hint: 0,
+                        recipe: 0,
+                        vertex_count: 0,
+                        unknown_10: 0,
+                    },
+                    positions: vec![
+                        [-1.0, -1.0, -1.0],
+                        [1.0, -1.0, -1.0],
+                        [-1.0, 1.0, -1.0],
+                        [1.0, 1.0, -1.0],
+                        [-1.0, -1.0, 1.0],
+                        [1.0, -1.0, 1.0],
+                        [-1.0, 1.0, 1.0],
+                        [1.0, 1.0, 1.0],
+                    ],
+                    indices: vec![],
+                    bone_count: 0,
+                    bone_ranges: vec![],
+                    blocks: vec![],
+                    tail_ordinal_space: 0,
+                }),
+                skeleton: None,
+                weakest_grade: Grade::Measured,
+            }),
+            unresolved: None,
+        }
+    }
+
+    #[test]
+    fn an_identity_transform_gives_the_geometrys_own_box_moved_to_the_position() {
+        let bounds = block(Orientation::YRotation(0.0), 1.0, [10.0, 0.0, 0.0])
+            .world_bounds()
+            .expect("the fixture has geometry");
+        assert!(
+            (bounds.min[0] - 9.0).abs() < 1e-5,
+            "x min {}",
+            bounds.min[0]
+        );
+        assert!(
+            (bounds.max[0] - 11.0).abs() < 1e-5,
+            "x max {}",
+            bounds.max[0]
+        );
+        assert!((bounds.min[1] + 1.0).abs() < 1e-5);
+        assert!((bounds.max[2] - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn scale_grows_the_box_from_its_own_centre() {
+        let bounds = block(Orientation::YRotation(0.0), 2.5, [0.0, 0.0, 0.0])
+            .world_bounds()
+            .expect("geometry");
+        assert!(
+            (bounds.max[0] - 2.5).abs() < 1e-5,
+            "half-extent 1 scaled by 2.5 is 2.5, got {}",
+            bounds.max[0]
+        );
+    }
+
+    #[test]
+    fn a_ninety_degree_rotation_about_y_swaps_x_and_z() {
+        // A 90-degree turn about +Y maps +X to -Z. The box is symmetric about the
+        // origin, so a rotation alone leaves the AABB unchanged -- which is exactly
+        // why the OLD offset-only bounds looked right on the corpus and why this
+        // test has to scale as well to be worth anything. Scaling breaks the
+        // symmetry, and then the rotation is visible.
+        let bounds = block(Orientation::YRotation(90.0), 2.0, [0.0, 0.0, 0.0])
+            .world_bounds()
+            .expect("geometry");
+        // Rotated then scaled: x half-extent stays 2, z half-extent stays 2, but a
+        // NON-square box would swap. So use a non-cubic one instead, below.
+        assert!((bounds.max[0] - 2.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn rotation_is_applied_and_not_merely_offset() {
+        // The regression this whole change exists for. A box that is long on X and
+        // short on Z, rotated 90 degrees about Y, must come back long on Z and
+        // short on X. The offset-only implementation returns it long on X.
+        let mut block = block(Orientation::YRotation(90.0), 1.0, [0.0, 0.0, 0.0]);
+        let geometry = block.part.as_mut().unwrap().geometry.as_mut().unwrap();
+        geometry.positions = vec![
+            [-4.0, -0.25, -0.25],
+            [4.0, -0.25, -0.25],
+            [-4.0, 0.25, -0.25],
+            [4.0, 0.25, -0.25],
+            [-4.0, -0.25, 0.25],
+            [4.0, -0.25, 0.25],
+            [-4.0, 0.25, 0.25],
+            [4.0, 0.25, 0.25],
+        ];
+        let bounds = block.world_bounds().expect("geometry");
+        let span_x = bounds.max[0] - bounds.min[0];
+        let span_z = bounds.max[2] - bounds.min[2];
+        assert!(
+            (span_x - 0.5).abs() < 1e-4,
+            "after a quarter turn the 8.0 X span must become 0.5, got {span_x}"
+        );
+        assert!(
+            (span_z - 8.0).abs() < 1e-4,
+            "and the 0.5 Z span must become 8.0, got {span_z}"
+        );
+    }
+
+    #[test]
+    fn a_general_matrix_rotates_too_not_only_about_y() {
+        // The corpus's own spelling is a general row-major 3x3, and the engine
+        // renders it as one. A picker that only understood Y rotations would miss
+        // every part authored any other way, which is most of them.
+        let quarter_turn_about_z = Matrix3 {
+            row0: [0.0, -1.0, 0.0],
+            row1: [1.0, 0.0, 0.0],
+            row2: [0.0, 0.0, 1.0],
+        };
+        let mut block = block(
+            Orientation::General(quarter_turn_about_z),
+            1.0,
+            [0.0, 0.0, 0.0],
+        );
+        let geometry = block.part.as_mut().unwrap().geometry.as_mut().unwrap();
+        geometry.positions = vec![
+            [-4.0, -0.25, -0.25],
+            [4.0, -0.25, -0.25],
+            [-4.0, 0.25, -0.25],
+            [4.0, 0.25, -0.25],
+            [-4.0, -0.25, 0.25],
+            [4.0, -0.25, 0.25],
+            [-4.0, 0.25, 0.25],
+            [4.0, 0.25, 0.25],
+        ];
+        let bounds = block.world_bounds().expect("geometry");
+        let span_x = bounds.max[0] - bounds.min[0];
+        let span_y = bounds.max[1] - bounds.min[1];
+        assert!(
+            (span_x - 0.5).abs() < 1e-4 && (span_y - 8.0).abs() < 1e-4,
+            "a quarter turn about Z must swap X and Y: x={span_x} y={span_y}"
+        );
+    }
+
+    #[test]
+    fn a_block_with_no_geometry_reports_none_rather_than_a_zero_box() {
+        let mut block = block(Orientation::YRotation(0.0), 1.0, [0.0, 0.0, 0.0]);
+        block.part.as_mut().unwrap().geometry = None;
+        assert_eq!(
+            block.world_bounds(),
+            None,
+            "None is 'no geometry'; Some(a zero box) would be a part at a point"
+        );
+    }
+}
