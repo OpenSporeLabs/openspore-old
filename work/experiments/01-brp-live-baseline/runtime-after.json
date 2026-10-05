@@ -1,0 +1,6 @@
+### brp_extras_get_diagnostics
+{"status":"success","message":"FPS diagnostics retrieved","call_info":{"mcp_tool":"brp_extras_get_diagnostics","brp_method":"brp_extras/get_diagnostics"},"parameters":{"port":15702},"result":{"fps":{"current":58.9656539806976,"average":60.09942492126492,"smoothed":58.9656539806976,"history_len":120,"max_history_len":120,"history_duration_secs":1.983600779},"frame_time_ms":{"current":16.959025,"average":16.660838508333224,"smoothed":16.959025},"frame_count":159528.0}}
+
+### world_get_resources
+{"status":"success","message":"Retrieved spore_engine::brp::BrpProbe resource","call_info":{"mcp_tool":"world_get_resources","brp_method":"world.get_resources"},"parameters":{"resource":"spore_engine::brp::BrpProbe","port":15702},"result":{"value":{"frames":159531,"label":""}}}
+

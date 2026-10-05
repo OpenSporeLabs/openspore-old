@@ -29,6 +29,17 @@
 //! with no window, no GPU and no game install. The projection into engine
 //! types lives in `spore-engine`, never here — this crate may not depend on it.
 //!
+//! ## Persistence
+//!
+//! [`persist`] is the canonical interchange format, `spore-creator-doc/1`: a
+//! JSON Lines file whose first line is a metadata record and whose remaining
+//! lines are one block each in document order. It exists because a creator that
+//! only lives in RAM is not a creator, and its contract is narrow on purpose —
+//! [`save`] is a pure function of a document, and [`load`] returns a document
+//! that is **bitwise** equal under this crate's own `PartialEq` or refuses with
+//! a [`PersistError`] naming the line. It is **not** the in-game format; that is
+//! XML, read by [`parse_sporemodel`], and there is no XML writer here.
+//!
 //! ## The rule that shapes every field below
 //!
 //! **Absent is not zero, not empty, and not `false`.** The corpus writes
@@ -52,16 +63,22 @@ pub mod color;
 pub mod document;
 pub mod edit;
 pub mod error;
+pub mod persist;
 pub mod sporemodel;
 pub mod validate;
 pub mod xml;
 
+mod sha256;
+
 pub use color::{ColorError, UnitRgb};
 pub use document::{
     Block, BlockId, BlockIndex, BlockTransform, ChannelWeight, CreatorDocument, DocumentProperties,
-    Matrix3, PaintRegion, Vec3,
+    Limb, Matrix3, PaintRegion, Vec3,
 };
 pub use edit::{IndexRemap, OnLastChild, Remap};
-pub use error::{CreatorError, EditError, EditResult, Result};
+pub use error::{
+    CreatorError, EditError, EditResult, PersistError, PersistResult, PersistSite, Result,
+};
+pub use persist::{content_digest, load, load_bytes, save, save_bytes, FLOAT_ENCODING, FORMAT};
 pub use sporemodel::{parse_sporemodel, Family};
 pub use validate::{validate, Severity, ValidationIssue};

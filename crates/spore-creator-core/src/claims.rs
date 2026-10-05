@@ -47,6 +47,22 @@
 //! 6. **`paintregion_meaning` / `paintid_meaning`, again.** `set_paint` stores
 //!    what it is given and validates neither the values nor their order,
 //!    because there is no registry to validate them against.
+//!
+//! ## What the canonical save cannot record
+//!
+//! [`crate::persist`] encodes every field of the document, and the two things it
+//! does not are absences rather than losses — each is recorded as a claim so a
+//! reader finds them here instead of discovering them:
+//!
+//! 7. **`document_family_not_persisted`.** `parse_sporemodel` takes a [`crate::sporemodel::Family`]
+//!    and does not store it, so `CreatorDocument` does not know which of the six
+//!    families it came from and a save file cannot record it. The measurements
+//!    that differ per family — paint presence, `<handles>`, `<limbtype>` — are
+//!    therefore present in the data but absent from the header.
+//! 8. **`canonical_save_is_not_the_game_bytes`.** The save is a canonical
+//!    interchange format: one spelling per fact, where the corpus writes
+//!    `modeltype` in both radices. It cannot rebuild Spore's XML, and no code in
+//!    this crate tries.
 
 /// A subject this crate has looked for and not found.
 ///
@@ -150,6 +166,18 @@ pub const CLAIMS: &[Claim] = &[
         level: spore_core::EvidenceLevel::Unknown,
         searched: "no bone, joint or animation element in any creator document; gmdl BLENDINDICES exist but 0 of 582 creature meshes decode",
         would_settle: "a 0x01C135DA decoder plus the shader that consumes its bone block",
+    },
+    Claim {
+        subject: "document_family_not_persisted",
+        level: spore_core::EvidenceLevel::Unknown,
+        searched: "CreatorDocument carries no Family field: parse_sporemodel takes one and does not store it, so a spore-creator-doc/1 save has nowhere to record whether its document came from crt, cll, vcl, ufo, bld or flr",
+        would_settle: "either a Family field on CreatorDocument (a model change, not a format one) or an envelope field the caller supplies alongside the document",
+    },
+    Claim {
+        subject: "canonical_save_is_not_the_game_bytes",
+        level: spore_core::EvidenceLevel::Verified,
+        searched: "spore-creator-doc/1 writes one spelling per fact where the corpus writes two (modeltype 0x9ea3031a and 2661483290, six- and seven-digit colour components), and preserves no element order, attribute order or original decimal text",
+        would_settle: "settled by construction: it is a canonical interchange format, not a serialiser for Spore's XML, which no code in this crate writes",
     },
 ];
 

@@ -19,6 +19,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use spore_creator_core::persist::{load, save};
 use spore_creator_core::sporemodel::Family;
 use spore_creator_core::{
     validate, Block, BlockId, BlockIndex, BlockTransform, CreatorDocument, IndexRemap, Matrix3,
@@ -905,3 +906,259 @@ fn a_full_authoring_session_over_the_corpus_returns_every_document_to_its_shape(
         assert!(errors(&edited).is_empty(), "{}", family.name());
     }
 }
+
+// ---------------------------------------------------------------------------
+// canonical persistence
+//
+// The save format's claim is `load(save(doc)) == doc` bitwise, and `save` is a
+// pure function of the document. A synthetic fixture can show that; only the real
+// corpus can show it holds for the documents the game actually wrote — 68 of
+// them, 680 blocks, every measured absence in them.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "needs the game install; no asset byte is committed"]
+fn every_real_creator_document_round_trips_through_the_canonical_save() {
+    let documents = corpus_or_skip!();
+    let mut blocks = 0usize;
+    let mut bytes = 0usize;
+
+    for (family, document) in &documents {
+        let saved =
+            save(document).unwrap_or_else(|error| panic!("{} saving: {error}", family.name()));
+        let reloaded =
+            load(&saved).unwrap_or_else(|error| panic!("{} loading: {error}", family.name()));
+
+        // Bitwise, not "close": the document types' `PartialEq` compares floats by
+        // their bits, so a sign-bit flip or a rounded digit fails here rather than
+        // passing as a tolerance.
+        assert_eq!(
+            &reloaded,
+            document,
+            "{} must read back bitwise",
+            family.name()
+        );
+
+        // And the second save is byte-identical, which makes "equal documents" and
+        // "equal bytes" one property instead of two.
+        let again = save(&reloaded).unwrap();
+        assert_eq!(
+            again,
+            saved,
+            "{} must save identically twice",
+            family.name()
+        );
+
+        // The shape of the artifact: a header plus one line per block, in document
+        // order, each line declaring its own index.
+        let lines: Vec<&str> = saved.lines().collect();
+        assert_eq!(
+            lines.len(),
+            document.len() + 1,
+            "{} writes a header and one line per block",
+            family.name()
+        );
+        assert!(lines[0].contains("\"schema\":\"spore-creator-doc/1\""));
+        assert!(lines[0].contains(&format!("\"block_count\":{}", document.len())));
+        assert!(
+            lines[0].contains(&format!("\"root_count\":{}", document.roots().len())),
+            "{}: the header's root count is derived, so it is checkable",
+            family.name()
+        );
+        for (position, line) in lines.iter().enumerate().skip(1) {
+            assert!(
+                line.starts_with(&format!("{{\"index\":{}", position - 1)),
+                "{} content line {position} must declare index {}: {line}",
+                family.name(),
+                position - 1
+            );
+        }
+
+        // The absences the corpus is measured on survive as absent keys: 160 of
+        // 680 blocks write no `<childlist>`, and a save that wrote `[]` for one of
+        // them would have deleted the fact.
+        let absent_children = document
+            .blocks
+            .iter()
+            .filter(|block| !block.writes_children())
+            .count();
+        let written_children = lines
+            .iter()
+            .skip(1)
+            .filter(|line| line.contains("\"children\":"))
+            .count();
+        assert_eq!(
+            written_children,
+            document.len() - absent_children,
+            "{}: a leaf's line carries no children key at all",
+            family.name()
+        );
+        assert!(
+            !saved.contains("\"children\":null"),
+            "{}: absence is never a null",
+            family.name()
+        );
+
+        blocks += document.len();
+        bytes += saved.len();
+    }
+
+    assert_eq!(documents.len(), 68, "the corpus census is 68 documents");
+    assert_eq!(blocks, 680, "the census is 680 blocks");
+    assert!(
+        bytes > 0 && saved_line_count(&documents) == 748,
+        "the corpus saves to {bytes} bytes over 748 lines"
+    );
+}
+
+/// Total saved lines over the corpus: 68 headers plus 680 block lines.
+fn saved_line_count(documents: &[(Family, CreatorDocument)]) -> usize {
+    documents
+        .iter()
+        .map(|(_, document)| document.len() + 1)
+        .sum()
+}
+
+#[test]
+#[ignore = "needs the game install; no asset byte is committed"]
+fn a_removed_block_survives_the_canonical_save_with_the_graph_intact() {
+    let documents = corpus_or_skip!();
+
+    for on_last_child in [OnLastChild::OmitElement, OnLastChild::KeepWrittenList] {
+        for (family, document) in &documents {
+            // Every block of every document, removed once: 680 removals per
+            // policy. Picking one block per document would leave the interesting
+            // cases — a root, a mirror partner, an interior node — to chance.
+            for victim in 0..document.len() {
+                let before = document.clone();
+                let survivors = before.len() - 1;
+
+                let mut edited = before.clone();
+                let remap = edited
+                    .remove_block(victim, on_last_child)
+                    .expect("every corpus index exists");
+                assert_eq!(remap.len(), before.len());
+                assert_eq!(edited.len(), survivors);
+
+                let saved = save(&edited)
+                    .unwrap_or_else(|error| panic!("{} saving: {error}", family.name()));
+                let reloaded = load(&saved)
+                    .unwrap_or_else(|error| panic!("{} loading: {error}", family.name()));
+                assert_eq!(
+                    &reloaded,
+                    &edited,
+                    "{} removing {victim} under {on_last_child:?}",
+                    family.name()
+                );
+                assert_eq!(
+                    save(&reloaded).unwrap(),
+                    saved,
+                    "{} removing {victim} must save identically twice",
+                    family.name()
+                );
+                assert_eq!(reloaded.len(), survivors, "the count dropped by one");
+
+                // The graph invariants, on the **reloaded** document: nothing
+                // points at a slot that is gone, and nothing has re-parented
+                // itself silently.
+                for (index, block) in reloaded.blocks.iter().enumerate() {
+                    for &child in block.child_indices() {
+                        assert!(
+                            child < survivors,
+                            "{} edge {index} -> {child} dangles after removing {victim}",
+                            family.name()
+                        );
+                    }
+                    if let Some(partner) = block.symmetric {
+                        assert!(
+                            partner < survivors,
+                            "{} block {index} mirrors a block that is gone",
+                            family.name()
+                        );
+                    }
+                }
+                assert_eq!(
+                    errors(&reloaded),
+                    errors(&edited),
+                    "{} at {victim}",
+                    family.name()
+                );
+                assert!(
+                    errors(&reloaded).is_empty(),
+                    "{} at {victim}",
+                    family.name()
+                );
+
+                // No cycle, and the roots are exactly the pre-removal roots plus
+                // whatever the removal detached. `ancestors` walks parent links
+                // and stops on a cycle rather than looping, so a bounded walk is
+                // the check that would notice one.
+                for index in 0..reloaded.len() {
+                    assert!(
+                        reloaded.ancestors(index).len() <= reloaded.len(),
+                        "{} block {index} is inside a cycle after removing {victim}",
+                        family.name()
+                    );
+                }
+                let mut expected_roots: Vec<BlockIndex> = before
+                    .roots()
+                    .into_iter()
+                    .filter(|&root| root != victim)
+                    .map(|root| match remap.map(root) {
+                        // Only the victim maps to `Removed`, and it was just
+                        // filtered out.
+                        Remap::Moved(index) => index,
+                        Remap::Removed => victim,
+                    })
+                    .collect();
+                for &detached in remap.detached() {
+                    if let Remap::Moved(root) = remap.map(detached) {
+                        expected_roots.push(root);
+                    }
+                }
+                expected_roots.sort_unstable();
+                expected_roots.dedup();
+                let mut found = reloaded.roots();
+                found.sort_unstable();
+                assert_eq!(
+                    found,
+                    expected_roots,
+                    "{} removing {victim} under {on_last_child:?}: the roots are the \\
+                     survivors plus the detached",
+                    family.name()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs the game install; no asset byte is committed"]
+fn the_corpus_saves_to_a_pinned_number_of_bytes() {
+    // The strongest determinism assertion available over real data: if the format
+    // changes what it writes — a key order, a float spelling, a `0x` width — then
+    // this number moves, and that is a deliberate `spore-creator-doc/2` decision
+    // rather than an accident nobody noticed. It also pins that two runs over the
+    // same 68 records produce the same bytes.
+    let documents = corpus_or_skip!();
+    let bytes: usize = documents
+        .iter()
+        .map(|(_, document)| save(document).expect("saving").len())
+        .sum();
+    assert_eq!(bytes, CORPUS_SAVE_BYTES, "the corpus save size moved");
+    assert_eq!(
+        documents
+            .iter()
+            .map(|(_, document)| document.len() + 1)
+            .sum::<usize>(),
+        748,
+        "68 header lines and 680 block lines"
+    );
+}
+
+/// The measured size of all 68 canonical saves concatenated, in bytes.
+///
+/// Measured on Spore 3.1.0.22, `SPORE/Data/Spore_Game.package`. A different
+/// install of the same version gives the same number; a different corpus does not,
+/// which is the point of pinning it.
+const CORPUS_SAVE_BYTES: usize = 392_218;
