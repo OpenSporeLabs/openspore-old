@@ -453,6 +453,37 @@ pub fn parse(data: &[u8]) -> Result<GmdlModel, GmdlError> {
     Ok(walk.finish(data.len()))
 }
 
+/// The bytes that follow the validated geometry and material-info sections.
+///
+/// This is the **animation trailer**: the bone-range table, the `GameModelAnimData`
+/// array and the trailing resource key — the part of the record
+/// [`GmdlModel::bone_ranges`] is read out of, and the part
+/// [`GmdlModel::strict_consumed`] may stop in the middle of because its framing
+/// is best-effort.
+///
+/// # Why this is a function and not a field on [`GmdlModel`]
+///
+/// A caller measuring that region needs the trailer's **start**, and
+/// `strict_consumed` is the walk's **stop** — after a truncated walk those differ
+/// by an unknown amount, so `data[strict_consumed..]` is the un-validated
+/// remainder, not the trailer. Adding a field would break every crate that builds
+/// a `GmdlModel` literal; this walks the record instead and hands back a slice,
+/// which is additive.
+///
+/// `None` means the strict sections did not validate, so the record has no
+/// located trailer — not "an empty trailer". A record whose material info names a
+/// shader-data id this crate has no size for (the `0x218` family, including every
+/// creature-model record) returns `None` here even though it decodes perfectly
+/// far enough to render.
+pub fn trailer_region(data: &[u8]) -> Option<&[u8]> {
+    if data.is_empty() {
+        return None;
+    }
+    let mut walk = Walk::new(data);
+    walk.strict_sections().ok()?;
+    Some(&data[walk.r.position()..])
+}
+
 /// The walk itself, split into one method per record section so that the order
 /// of the source is the order of the walk.
 struct Walk<'a> {

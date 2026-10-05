@@ -77,9 +77,9 @@ pub use claims::{all_claims, claim, vertex_normal_encoding_level, GmdlClaim};
 pub use error::GmdlError;
 pub use mesh::{compute_mesh_bounds, mesh_from_gmdl, Mesh, Topology};
 pub use parse::{
-    parse, parse_recovering, GmdlIndexBuffer, GmdlMeshRef, GmdlModel, GmdlTextureRef,
-    GmdlVertexBuffer, GmdlVertexElement, PartialGmdl, StopReason, TrailerStage, TrailerWalk,
-    WalkStage,
+    parse, parse_recovering, trailer_region, GmdlIndexBuffer, GmdlMeshRef, GmdlModel,
+    GmdlTextureRef, GmdlVertexBuffer, GmdlVertexElement, PartialGmdl, StopReason, TrailerStage,
+    TrailerWalk, WalkStage,
 };
 pub use skin::GmdlSkinBinding;
 pub use tables::{

@@ -67,6 +67,10 @@ pub const BLEND_INDEX_STRIDE: &str = "blend_index_stride";
 /// What a `{start, count}` entry of the trailer's bone-range table counts.
 pub const BONE_RANGE_MEANING: &str = "bone_range_meaning";
 
+/// Whether the trailer's anim data carries bone-identity words, and what it
+/// points at instead.
+pub const ANIM_DATA_BONE_IDENTITIES: &str = "anim_data_bone_identities";
+
 /// What the `type_code` word of a vertex element holds.
 pub const VERTEX_ELEMENT_TYPE_CODE: &str = "vertex_element_type_code";
 
@@ -188,6 +192,27 @@ fn claims() -> &'static [GmdlClaim] {
                  exceptions exceed it, and nothing inside the record says what the counts count.",
                 EvidenceLevel::Inferred,
                 "docs/ANIMATION.md",
+            ),
+            claim_of(
+                ANIM_DATA_BONE_IDENTITIES,
+                "The trailer's anim data carries no bone identity. Over the whole \
+                 Spore_Content gmdl corpus, every 32-bit word of the trailer was histogrammed \
+                 against the 2002-token morph-parameter-name universe recovered in \
+                 docs/analysis/creator/11-bone-identity-vocabulary.md: 8889410 words at four \
+                 alignments over the 3590 records whose trailer is located, and 2346955 more \
+                 over the 619 whose material info this crate cannot size. Zero of the 170 \
+                 witnessed names occur, and none of hip, body, hipL, hipR, knee, kneeL, kneeR, \
+                 eye, iris, jaw, shoulder, head, wing, wingL, wingR, joint1. Three distinct \
+                 tokens of the universe do occur (58 words), every one of which is the instance \
+                 word of a resource key: two are rw4 records at group 0x41606100 and one is the \
+                 gmdl record's own instance id in its own trailing key. What the anim data does \
+                 carry is a pointer - it names rw4 group 0x41606100, whose 591 records hold 1182 \
+                 Skeleton (0x70002) sections over 623 identity tokens, 88.4 percent shared \
+                 with the part layer and carrying 96 already-named bones including the full \
+                 joint1..joint9 family, root, eye, hip, knee, jaw, shoulder and body. The whole \
+                 body anatomy is reached through that pointer, not stored in the gmdl.",
+                EvidenceLevel::Observed,
+                "docs/analysis/creator/12-gmdl-anim-data-vocabulary.md",
             ),
             claim_of(
                 VERTEX_ELEMENT_TYPE_CODE,

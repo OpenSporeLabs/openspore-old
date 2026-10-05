@@ -17,3 +17,8 @@ thiserror = { workspace = true }
 [dev-dependencies]
 spore-dbpf = { workspace = true }
 spore-rw4 = { workspace = true }
+# The bone-identity vocabulary (FNV-1 + the 244 recovered names) lives in
+# spore-rigblock. This measurement histograms gmdl trailer words against it, and
+# it must hash with *that* crate's `fnv1`: writing a second FNV-1 here is the one
+# mistake that would make the whole measurement look clean and be wrong.
+spore-rigblock = { workspace = true }
