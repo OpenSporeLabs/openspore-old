@@ -873,6 +873,72 @@ impl Catalog {
         Self { entries }
     }
 
+    /// A catalogue of **every** candidate identity, rather than only the ones a
+    /// document happens to name.
+    ///
+    /// # Why this exists: the 60-entry catalogue was a census, not the pool
+    ///
+    /// [`build`](Self::build) walks the 68 shipped `<sporemodel>` documents and
+    /// collects the `<blockid>`s they write, which measures **what Spore's own
+    /// shipped content uses** — 60 distinct parts. That is the wrong question for a
+    /// part palette, because it is circular: a part the shipped creatures never
+    /// place is invisible, so the palette can only ever offer what is already on
+    /// screen.
+    ///
+    /// Enumerating the rigblock group answers the different and correct question.
+    /// `0x40626000` in `Spore_Game.package` holds **482** rigblocks, of which
+    /// **464** resolve to real `gmsh` geometry — so the authorable creature pool
+    /// is ~7.7x the shipped census. The 60 are the ones the 68 documents happen to
+    /// touch, and one of them alone is named by **480 of the 680** blocks.
+    ///
+    /// # Why the identities are passed in
+    ///
+    /// Enumerating a group needs an index, and [`RecordSource`] deliberately is
+    /// not one: it is a lookup, not a listing. Enumerating here would mean adding
+    /// a listing method to a trait whose whole contract is "read this key", and
+    /// every implementation would then owe a method none of them needs. So the
+    /// caller enumerates — `ContentStore::identities_of_type` against
+    /// [`TYPE_RIGBLOCK`] does it — and this builds the entries.
+    ///
+    /// # An unreferenced part is still authorable
+    ///
+    /// Every entry here has an EMPTY `references`, because no shipped document
+    /// names it. That is the normal case for this builder and is exactly what
+    /// distinguishes it from the census: `is_authorable` asks whether the chain
+    /// reached drawable geometry, and says nothing about whether anything
+    /// references it.
+    ///
+    /// # Infallible, for the same reason [`build`](Self::build) is
+    ///
+    /// An unsearchable source yields entries whose non-findings all say
+    /// `not_searched`. An empty catalogue would instead say "Spore has no parts",
+    /// which is a claim about the game made from a missing install.
+    pub fn build_from_identities(
+        source: &dyn RecordSource,
+        ids: impl IntoIterator<Item = BlockId>,
+    ) -> Self {
+        let searchable = source.is_searchable();
+        let resolver = Resolver::new(source);
+
+        // A `BTreeMap` so the output is in ascending `(group, instance)` order
+        // regardless of the order the caller enumerated in: two runs over the same
+        // package must produce the same palette, or a screenshot comparison is
+        // comparing two different catalogues. It also collapses a duplicate id,
+        // which `identities_of_type` already dedupes but a hand-written list would
+        // not.
+        let mut collected: BTreeMap<BlockId, Vec<PartReference>> = BTreeMap::new();
+        for id in ids {
+            collected.entry(id).or_default();
+        }
+
+        let entries = collected
+            .into_iter()
+            .map(|(id, references)| build_entry(source, searchable, &resolver, id, references))
+            .collect();
+
+        Self { entries }
+    }
+
     /// Every entry, in ascending `(group, instance)` order.
     pub fn entries(&self) -> &[CatalogEntry] {
         &self.entries

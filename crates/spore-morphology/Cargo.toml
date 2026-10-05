@@ -13,3 +13,9 @@ spore-creator-core = { workspace = true }
 spore-rigblock = { workspace = true }
 spore-dbpf = { workspace = true }
 thiserror = { workspace = true }
+
+# Tests only. `part_pool.rs` enumerates a record group, which needs a package
+# INDEX rather than a lookup -- `spore-assets` is the layer that owns one. Dev-only
+# so the runtime dependency edge (morphology -> assets) never exists.
+[dev-dependencies]
+spore-assets = { workspace = true }

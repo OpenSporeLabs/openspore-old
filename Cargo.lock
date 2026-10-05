@@ -4378,6 +4378,7 @@ dependencies = [
 name = "spore-morphology"
 version = "0.1.0"
 dependencies = [
+ "spore-assets",
  "spore-core",
  "spore-creator-core",
  "spore-dbpf",
