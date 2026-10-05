@@ -30,10 +30,12 @@
 
 pub mod evidence;
 pub mod key;
+pub mod orientation;
 pub mod record;
 
 pub use evidence::{
     EvidenceLevel, EvidenceState, Fact, FactState, Provenance, ProvenanceMode, SourceClass,
 };
 pub use key::{parse_id, ResourceKey, WILDCARD};
-pub use record::{fourcc, RecordType};
+pub use orientation::{y_rotation_matrix, Orientation};
+pub use record::{fourcc, Matrix3, RecordType};

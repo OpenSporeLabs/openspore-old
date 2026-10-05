@@ -43,6 +43,7 @@
 pub mod composition;
 pub mod dbpf;
 pub mod error;
+pub mod projection;
 pub mod provenance;
 pub mod resolve;
 pub mod source;
@@ -50,6 +51,9 @@ pub mod source;
 pub use composition::{Composition, Counts, PartSlot, UnresolvedPart};
 pub use dbpf::PackageSource;
 pub use error::{MorphologyError, PartDecodeError};
+pub use projection::{
+    project, Bounds, ProjectedBlock, ProjectedPart, Projection, ProjectionError, Unresolved,
+};
 pub use provenance::{Grade, Hop, Stage, StopReason, Trail};
 pub use resolve::{compose, ResolvedPart, Resolver};
 pub use source::{MemorySource, RecordSource};

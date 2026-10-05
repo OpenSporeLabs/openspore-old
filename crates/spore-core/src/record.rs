@@ -390,3 +390,73 @@ mod container_tests {
         }
     }
 }
+
+/// A row-major 3×3 matrix.
+///
+/// Lives here, in the crate both the authoring layer and the engine depend on,
+/// because a creator block's `<orientation>` and a runtime placement's orientation
+/// are the same nine numbers and must not become two types.
+///
+/// Stored as three rows because that is the order `<row0>`, `<row1>`, `<row2>`
+/// appear in on disk, and converting to a transposed form at a boundary is how a
+/// rotation silently becomes its inverse.
+///
+/// [`Default`] is **all zeros**, not the identity: `#[derive(Default)]` is the
+/// obvious implementation and it is the wrong one, because a zero matrix is not a
+/// rotation and a caller who writes `BlockTransform { orientation: Matrix3::default(), .. }`
+/// gets a silently non-orthonormal orientation rather than a compile error. Use
+/// [`Matrix3::IDENTITY`] for "no rotation".
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Matrix3 {
+    /// The first row.
+    pub row0: [f32; 3],
+    /// The second row.
+    pub row1: [f32; 3],
+    /// The third row.
+    pub row2: [f32; 3],
+}
+
+impl Matrix3 {
+    /// The identity rotation, which is what an unwritten orientation would be.
+    pub const IDENTITY: Self = Self {
+        row0: [1.0, 0.0, 0.0],
+        row1: [0.0, 1.0, 0.0],
+        row2: [0.0, 0.0, 1.0],
+    };
+
+    /// The nine components in row-major order.
+    pub const fn to_array(self) -> [f32; 9] {
+        [
+            self.row0[0],
+            self.row0[1],
+            self.row0[2],
+            self.row1[0],
+            self.row1[1],
+            self.row1[2],
+            self.row2[0],
+            self.row2[1],
+            self.row2[2],
+        ]
+    }
+}
+
+impl PartialEq for Matrix3 {
+    fn eq(&self, other: &Self) -> bool {
+        // BITWISE, unlike a numeric comparison, and the difference is load-bearing:
+        // `CreatorDocument` round-trips authored bytes, where `-0.0` written by the
+        // game and `0.0` written by us are different documents. A derived `PartialEq`
+        // would call them equal and a round-trip test would pass on a document that
+        // is not byte-identical.
+        //
+        // Note the asymmetry with `Orientation::is_y_rotation`, which compares
+        // NUMERICALLY on purpose: a matrix computed from a sine has no authored
+        // zero-sign distinction to preserve. Same trap, opposite correct answer,
+        // because the two questions are different.
+        fn bits(v: f32) -> u32 {
+            v.to_bits()
+        }
+        self.row0.map(bits) == other.row0.map(bits)
+            && self.row1.map(bits) == other.row1.map(bits)
+            && self.row2.map(bits) == other.row2.map(bits)
+    }
+}

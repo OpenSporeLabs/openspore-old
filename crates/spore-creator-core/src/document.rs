@@ -50,42 +50,12 @@ impl Vec3 {
 
 /// A row-major 3×3 matrix: the block's `orientation`.
 ///
-/// Stored as three rows because that is the order `<row0>`, `<row1>`, `<row2>`
-/// appear in, and converting to a transposed form at the boundary is how a
-/// rotation silently becomes its inverse.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Matrix3 {
-    /// The first row.
-    pub row0: [f32; 3],
-    /// The second row.
-    pub row1: [f32; 3],
-    /// The third row.
-    pub row2: [f32; 3],
-}
-
-impl Matrix3 {
-    /// The identity rotation, which is what an unwritten orientation would be.
-    pub const IDENTITY: Self = Self {
-        row0: [1.0, 0.0, 0.0],
-        row1: [0.0, 1.0, 0.0],
-        row2: [0.0, 0.0, 1.0],
-    };
-
-    /// The nine components in row-major order.
-    pub const fn to_array(self) -> [f32; 9] {
-        [
-            self.row0[0],
-            self.row0[1],
-            self.row0[2],
-            self.row1[0],
-            self.row1[1],
-            self.row1[2],
-            self.row2[0],
-            self.row2[1],
-            self.row2[2],
-        ]
-    }
-}
+/// Re-exported from [`spore_core`], where it lives because the authoring layer and
+/// the engine both need it and neither may depend on the other. The original
+/// definition's note is worth keeping: stored as three rows because that is the order
+/// `<row0>`, `<row1>`, `<row2>` appear in, and converting to a transposed form at the
+/// boundary is how a rotation silently becomes its inverse.
+pub use spore_core::Matrix3;
 
 /// Which part a block places, as the `(group, instance)` pair `<blockid>` holds.
 ///
@@ -341,14 +311,6 @@ impl PartialEq for Vec3 {
         bits(self.x) == bits(other.x)
             && bits(self.y) == bits(other.y)
             && bits(self.z) == bits(other.z)
-    }
-}
-
-impl PartialEq for Matrix3 {
-    fn eq(&self, other: &Self) -> bool {
-        self.row0.map(bits) == other.row0.map(bits)
-            && self.row1.map(bits) == other.row1.map(bits)
-            && self.row2.map(bits) == other.row2.map(bits)
     }
 }
 
