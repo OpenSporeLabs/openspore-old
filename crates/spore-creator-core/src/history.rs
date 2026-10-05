@@ -289,16 +289,27 @@ impl StepShift {
     /// in the document being replaced. That is checked against `later_len`
     /// because the caller supplied the index and a stale one is not this type's
     /// business to guess about.
-    fn to_earlier(&self, later_len: usize, index: BlockIndex) -> SelectionStep {
-        if index >= later_len {
+    fn to_earlier(&self, earlier_len: usize, index: BlockIndex) -> SelectionStep {
+        // Undoing a removal puts a block BACK, so every index above the hole
+        // shifts DOWN by one -- which is `+1` on the way to the earlier document,
+        // and reads backwards only because the direction is.
+        let mapped = match self {
+            StepShift::Identity => index,
+            StepShift::Removal(remap) => index + usize::from(index >= remap.removed()),
+        };
+        // The bound is `earlier_len`, NOT the later document's length.
+        //
+        // That is the whole point of the check, and getting it backwards is a
+        // silent stale index rather than a panic: undoing an **add** restores a
+        // document with one fewer block, so an index naming the block the add
+        // created is perfectly valid in the current document and names nothing in
+        // the restored one. Bounding against the current length reports
+        // `Kept(2)` for a two-block document, and the caller then highlights
+        // whatever happens to be at index 2.
+        if mapped >= earlier_len {
             return SelectionStep::Removed;
         }
-        match self {
-            StepShift::Identity => SelectionStep::Kept(index),
-            StepShift::Removal(remap) => {
-                SelectionStep::Kept(index + usize::from(index >= remap.removed()))
-            }
-        }
+        SelectionStep::Kept(mapped)
     }
 
     /// Maps an index of the **earlier** document into the later one.
@@ -308,17 +319,21 @@ impl StepShift {
     /// index that names it any more. That is the same fact
     /// [`Remap::Removed`] and [`crate::EditError::RemovedTarget`] report, so the
     /// selection does not get a third spelling of it.
-    fn to_later(&self, earlier_len: usize, index: BlockIndex) -> SelectionStep {
-        if index >= earlier_len {
+    fn to_later(&self, later_len: usize, index: BlockIndex) -> SelectionStep {
+        // The mirror of `to_earlier`: bounded against the document being
+        // RESTORED, for the same reason and with the same failure mode if it is
+        // not.
+        let mapped = match self {
+            StepShift::Identity => index,
+            StepShift::Removal(remap) => match remap.map(index) {
+                Remap::Moved(moved) => moved,
+                Remap::Removed => return SelectionStep::Removed,
+            },
+        };
+        if mapped >= later_len {
             return SelectionStep::Removed;
         }
-        match self {
-            StepShift::Identity => SelectionStep::Kept(index),
-            StepShift::Removal(remap) => match remap.map(index) {
-                Remap::Moved(moved) => SelectionStep::Kept(moved),
-                Remap::Removed => SelectionStep::Removed,
-            },
-        }
+        SelectionStep::Kept(mapped)
     }
 }
 
@@ -561,7 +576,10 @@ impl CreatorHistory {
             document: current.clone(),
             shift: shift.clone(),
         });
-        let selection = selection.map(|index| shift.to_earlier(current.len(), index));
+        // Bounded against the RESTORED document, which is the one the index
+        // will be read in.
+        let earlier_len = document.len();
+        let selection = selection.map(|index| shift.to_earlier(earlier_len, index));
         Some(HistoryStep {
             document,
             selection,
@@ -591,7 +609,8 @@ impl CreatorHistory {
             document: current.clone(),
             shift: shift.clone(),
         });
-        let selection = selection.map(|index| shift.to_later(current.len(), index));
+        let later_len = document.len();
+        let selection = selection.map(|index| shift.to_later(later_len, index));
         Some(HistoryStep {
             document,
             selection,
@@ -1046,6 +1065,75 @@ mod tests {
         assert_eq!(step.selection(), Some(SelectionStep::Removed));
         let redone = history.redo(step.document(), Some(99)).expect("redo");
         assert_eq!(redone.selection(), Some(SelectionStep::Removed));
+    }
+
+    /// Regression: undoing an **add** must not report a selection that names
+    /// nothing.
+    ///
+    /// This is the one failure mode of the selection carry that no removal can
+    /// produce, and it is quiet. Undoing an add restores a document with one
+    /// FEWER block, so the index naming the block the add created is entirely
+    /// valid in the current document and names nothing in the restored one. Bound
+    /// the shift against the current document's length and the answer is
+    /// `Kept(2)` for a two-block document -- and the caller goes on to highlight
+    /// whatever happens to sit at index 2.
+    ///
+    /// Found by `spore-engine`'s `undo_after_an_add_removes_the_added_block`, and
+    /// pinned here as well because the defect is in THIS file, not in the caller
+    /// that noticed it.
+    #[test]
+    fn undoing_an_add_reports_a_selection_naming_nothing_as_removed() {
+        let mut history = CreatorHistory::default();
+        let before = chain(2);
+        history.record(&before);
+
+        let mut edited = before.clone();
+        let index = edited
+            .add_block(leaf(0xdd), None)
+            .expect("the add is accepted");
+        assert_eq!(index, 2, "an append lands last");
+
+        // The selection the editor would hold: the block that was just added.
+        let step = history
+            .undo(&edited, Some(index))
+            .expect("undo is available");
+        assert_eq!(
+            step.selection(),
+            Some(SelectionStep::Removed),
+            "the restored document has {} blocks, so index {index} names nothing; \
+             reporting Kept would hand the caller a stale index",
+            step.document().len()
+        );
+
+        // And the mirror: redoing that add brings the block back, and a selection
+        // that had nothing to point at still has nothing to point at.
+        let restored = step.into_document();
+        let step = history.redo(&restored, None).expect("redo is available");
+        assert_eq!(
+            step.selection(),
+            None,
+            "no selection was carried, so none is invented"
+        );
+        assert_eq!(step.document().len(), 3, "and the add really did replay");
+    }
+
+    /// And the same in the other direction: a selection that IS valid in the
+    /// restored document must survive, so the fix above is not merely "clear
+    /// everything", which would pass the test above and be useless.
+    #[test]
+    fn undoing_an_add_keeps_a_selection_that_still_names_a_block() {
+        let mut history = CreatorHistory::default();
+        let before = chain(3);
+        history.record(&before);
+        let mut edited = before.clone();
+        edited.add_block(leaf(0xdd), None).expect("added");
+
+        let step = history.undo(&edited, Some(1)).expect("undo");
+        assert_eq!(
+            step.selection(),
+            Some(SelectionStep::Kept(1)),
+            "index 1 names a block in both documents, so it must survive"
+        );
     }
 
     #[test]

@@ -77,6 +77,7 @@ pub mod cli;
 pub mod convert;
 pub mod creator;
 pub mod domain;
+pub mod editor;
 pub mod loader;
 pub mod scene;
 pub mod texture;

@@ -842,8 +842,19 @@ pub fn project_against_packages(
     )
 }
 
-/// Reads the document itself.
-fn read_document(
+/// Reads the document itself: a `<sporemodel>` record out of a package, or a
+/// `spore-creator-doc/1` file off disk.
+///
+/// Public because [`CreatorSession`](crate::editor::session::CreatorSession) needs
+/// exactly this and nothing more: it holds a live [`ContentStore`] so it can
+/// re-resolve an edited document, and reusing the engine's own read path is what
+/// makes "the editor opened the same document the loader would have" a fact
+/// rather than a resemblance.
+///
+/// The [`DocumentSource::SavedFile`] arm never touches the store, so
+/// [`read_saved_document`] serves a caller that has a file and no packages
+/// without having to hand it an empty [`ContentStore`] to satisfy the signature.
+pub fn read_document(
     source: &DocumentSource,
     store: &ContentStore,
 ) -> Result<CreatorDocument, CreatorLoadError> {
@@ -875,6 +886,21 @@ fn read_document(
             })
         }
     }
+}
+
+/// Reads a saved document with no [`ContentStore`] in hand at all.
+///
+/// Separate from [`read_document`] because the two arms of that function need
+/// different things: a `Record` source needs the packages, a `SavedFile` source
+/// needs a filesystem and nothing else. Giving this one the general signature
+/// would force a caller that only has a file to construct an empty store, and
+/// "this session has no packages" is a different claim from "this session needs
+/// no packages to read this".
+pub fn read_saved_document(path: &Path) -> Result<CreatorDocument, CreatorLoadError> {
+    read_document(
+        &DocumentSource::SavedFile(path.to_path_buf()),
+        &ContentStore::new(),
+    )
 }
 
 /// Resolves a document against a record source and projects it.
