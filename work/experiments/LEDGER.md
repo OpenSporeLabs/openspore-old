@@ -109,3 +109,31 @@ is the honest reading and is what a future fix must flip.
 Also recorded: 46 of 47 real creature documents are single-part chains, so
 `0x40626200:0xde727fa9` (5 distinct parts, 10 blocks, 1896 triangles) is the only
 multi-part creature in `Spore_Game.package` and the honest demo subject.
+
+### Correction to experiment 01's rigblock ratio — the number was not reproducible
+
+Experiment 01 recorded "geometry spans a median **2.01x** the rigblock half-extent,
+worst **13.2x**, over **1320** instances". Measured by a throwaway script that was
+never committed. `catalog.rs`'s corpus test now measures FOUR readings of that same
+comparison, and no reading produces 2.01 or 1320:
+
+| reading | n | min | median | max |
+|---|---|---|---|---|
+| geometry / rigblock cell-derived span | 159 | 0.097 | **0.633** | 8.508 |
+| geometry / half of the cell-derived span | 159 | 0.194 | 1.265 | 17.016 |
+| geometry / rigblock header-declared span | 171 | 0.250 | 1.551 | 18.684 |
+| widest axis extent / rigblock widest header offset | 58 | 1.058 | **2.585** | **13.210** |
+
+Only the last reproduces the 13.21x that `tests/projection.rs` pins. And "geometry is
+systematically larger than the rigblock" is **false** at the median axis, where it is
+0.633x — ten times *smaller*.
+
+So: **the fix stands, the justification does not.** A rigblock is a
+placement-allowance box and not the drawn extent, which is why `bounds()` reads
+geometry. What cannot be claimed is a single settled ratio, because "the rigblock's
+size" is genuinely ambiguous — hence `catalog::RigblockBounds` carries all four
+readings by name rather than collapsing them into one number that reads as settled.
+
+Lesson worth keeping next to the misdiagnosis above: a number produced by a script
+that was then deleted is not evidence, it is a memory. The worst-case ratio survived
+because a committed test prints it; the median did not, and turned out to be wrong.
