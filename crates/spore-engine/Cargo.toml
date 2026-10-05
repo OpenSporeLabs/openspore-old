@@ -48,6 +48,13 @@ bevy = { workspace = true }
 # `-dev` on the upstream main branch.
 bevy_brp_extras = { version = "0.22.8", optional = true }
 
+# Tests only. A corpus test needs to enumerate `<sporemodel>` records out of a
+# package image, and `spore-assets` re-exports no package reader of its own --
+# `ContentStore` is a resolved view, not an index. Dev-only so this never
+# becomes a runtime edge.
+[dev-dependencies]
+spore-dbpf = { workspace = true }
+
 # The shipped binary is `openspore`, not `spore-engine`. The crate is the
 # engine; the binary is the game you launch, and every document, CI step and
 # error message refers to it by that name. An earlier revision of this file lost

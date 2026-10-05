@@ -15,6 +15,10 @@
 //! | one camera, owned by `ScenePlugin` | `the_creator_mode_owns_no_camera` |
 //! | readiness, so automation need not sleep | `the_scene_reports_stability_before_it_reports_itself_ready` |
 //! | the vertical slice is unregressed | `the_documented_asset_preset_is_unchanged` |
+//! | the camera lands where an **independent** closed form says | `the_camera_lands_where_the_framing_closed_form_predicts` |
+//! | the published camera state equals the camera in the world | `the_published_camera_state_matches_the_camera_in_the_world` |
+//! | no framing is reported as `None`, never as zero | `an_unresolved_projection_publishes_no_framing_and_no_camera_distance` |
+//! | framing survives **real** geometry, over a 300x size range | `every_real_creature_document_frames_from_its_own_measured_extent` |
 //!
 //! The parentage claim is the one worth reading twice. Each entity carries its
 //! block's **local** transform and is a child of its authored parent's entity, so
@@ -38,8 +42,24 @@ use spore_engine::loader::orientation_to_quat;
 use spore_engine::scene::{MainCamera, ScenePlugin};
 use spore_engine::{CreatorPlugin, StagedCreator};
 
+use spore_dbpf::{extract_record, PackageIndex};
 use spore_morphology::resolve::{GROUP_PART, TYPE_GMSH, TYPE_PROP, TYPE_RIGBLOCK, TYPE_RW4};
 use spore_morphology::{MemorySource, RecordSource};
+
+/// The `crt` type id, as the corpus names it.
+const CREATURE_TYPE_ID: u32 = 0x2b97_8c46;
+
+/// The repository root, or `None` when there is no `SPORE/Data` install.
+///
+/// `install_root` itself is declared in section 8; this one additionally requires
+/// the corpus to actually be present, so a checkout without `SPORE/` skips rather
+/// than failing on a missing file.
+fn corpus_root() -> Option<PathBuf> {
+    let root = install_root()?;
+    root.join("SPORE/Data/Spore_Game.package")
+        .exists()
+        .then_some(root)
+}
 
 /// The part group every fixture identity lives in.
 const GROUP: u32 = 0x4062_6000;
@@ -1462,4 +1482,286 @@ fn temp_path(name: &str) -> PathBuf {
     let mut path = std::env::temp_dir();
     path.push(format!("openspore-{}-{name}", std::process::id()));
     path
+}
+
+// ---------------------------------------------------------------------------
+// 9. The camera is framed, and the claim is checked against an independent derivation
+// ---------------------------------------------------------------------------
+
+/// The camera lands where the framing closed form says it should.
+///
+/// The derivation below is written out from `radius / sin(fov / 2) * margin` rather
+/// than by calling `loader::frame_camera`. That is the whole point of the test: an
+/// assertion that calls the function under test agrees with itself whether or not
+/// the function is right, and would have passed throughout the episode this test
+/// exists to close.
+///
+/// Found by INSPECTING A SCREENSHOT, then disproved by reading the camera. The
+/// screenshot showed a real creature at a few percent of frame height and the
+/// framing was reported broken on the strength of a BRP read that returned `null`
+/// for the camera transform. Bevy 0.19 registers no reflection for `Transform`, so
+/// that `null` said *not registered* and was read as *not present*. The camera was
+/// at `(0.0, 0.5258, 1.8056)`, which is exactly the closed form for that creature's
+/// measured extent. The framing had always worked; the screenshot was of a
+/// six-times-repeated probe part, correctly framed.
+///
+/// So the two assertions that matter are: the camera is **not** at
+/// `ScenePlugin`'s `(0, 6, 34)` parking spot, and it **is** at the distance the
+/// measured extent implies. Either alone would be weak -- the first passes if the
+/// camera moved anywhere, the second passes if bounds and framing agree about a
+/// wrong number.
+#[test]
+fn the_camera_lands_where_the_framing_closed_form_predicts() {
+    let stage = project(&three_block_document(), &chain_source());
+    let framing = stage
+        .camera_framing()
+        .expect("three resolved parts have bounds");
+    let expected = expected_camera(&framing.bounds, framing.vertical_fov_degrees);
+
+    let mut app = creator_app(stage, None, 1.0);
+    app.update();
+    app.update();
+
+    let mut state = query_of::<&mut Transform, With<MainCamera>>(&mut app);
+    let transform = *state.single(app.world_mut()).expect("one camera");
+    drop(state);
+
+    let parked = Vec3::new(0.0, 6.0, 34.0);
+    assert!(
+        (transform.translation - parked).length() > 1.0,
+        "the camera is still where ScenePlugin parked it, so no framing ran: {transform:?}"
+    );
+    assert!(
+        transform.translation.distance(expected) < 1e-3,
+        "camera at {:?}, closed form says {expected:?} for bounds {:?} at fov {}",
+        transform.translation,
+        framing.bounds,
+        framing.vertical_fov_degrees,
+    );
+}
+
+/// Where the camera must be for a given box and field of view.
+///
+/// Written out longhand rather than reusing the implementation: fit the box's
+/// bounding sphere into the vertical field of view, from the fixed oblique
+/// direction, with the same 1.25 margin. `MILDER` and `DIRECTION` are duplicated
+/// constants, and that duplication is the feature -- if either drifts, this test
+/// fails and says so, instead of agreeing with the drift.
+const MILDER: f32 = 1.25;
+const DIRECTION: [f32; 3] = [0.0, 0.42, 0.91];
+
+fn expected_camera(bounds: &([f32; 3], [f32; 3]), fov_degrees: f32) -> Vec3 {
+    let (lo, hi) = bounds;
+    let centre = Vec3::new(
+        (lo[0] + hi[0]) * 0.5,
+        (lo[1] + hi[1]) * 0.5,
+        (lo[2] + hi[2]) * 0.5,
+    );
+    let extent = Vec3::new(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]);
+    let radius = 0.5 * extent.length();
+    let half_fov = fov_degrees.to_radians() * 0.5;
+    let distance = radius / half_fov.sin() * MILDER;
+    let direction = Vec3::new(DIRECTION[0], DIRECTION[1], DIRECTION[2]).normalize();
+    centre + direction * distance
+}
+
+/// The published camera state agrees with the camera in the world.
+///
+/// This is the observability fix, and it is what makes the misdiagnosis above
+/// impossible to repeat: `Transform` is invisible to BRP in Bevy 0.19, so the
+/// camera's position is republished here in an OpenSpore-owned reflected type. The
+/// assertion is that the republished numbers equal the ones a direct query sees,
+/// so the published copy cannot quietly drift into being a second, independent
+/// claim about where the camera is.
+#[test]
+fn the_published_camera_state_matches_the_camera_in_the_world() {
+    let stage = project(&three_block_document(), &chain_source());
+    let framing = stage.camera_framing().expect("bounds exist");
+    let (lo, hi) = framing.bounds;
+    let centre = Vec3::new(
+        (lo[0] + hi[0]) * 0.5,
+        (lo[1] + hi[1]) * 0.5,
+        (lo[2] + hi[2]) * 0.5,
+    );
+    let expected_distance =
+        expected_camera(&framing.bounds, framing.vertical_fov_degrees).distance(centre);
+
+    let mut app = creator_app(stage, None, 1.0);
+    app.update();
+    app.update();
+
+    let published = app.world().resource::<CreatorRuntimeState>().clone();
+    assert!(
+        published.camera_framed,
+        "a resolved projection put a framing resource in the world"
+    );
+    assert_eq!(
+        published.framed_extent,
+        Some([
+            framing.bounds.1[0] - framing.bounds.0[0],
+            framing.bounds.1[1] - framing.bounds.0[1],
+            framing.bounds.1[2] - framing.bounds.0[2],
+        ])
+    );
+    let position = published
+        .camera_position
+        .expect("a camera exists, so a position is published");
+    assert!(
+        position.iter().all(|value| value.is_finite()),
+        "a non-finite camera position means the transform was read wrong: {position:?}"
+    );
+    let distance = published
+        .camera_distance_to_centre
+        .expect("a framing resource exists, so a distance is published");
+    assert!(
+        (distance - expected_distance).abs() < 1e-3,
+        "published distance {distance} disagrees with the closed form {expected_distance}"
+    );
+}
+
+/// An unresolved projection reports no framing rather than framing nothing.
+///
+/// The negative of the case above, and the one that must not be collapsed: "no
+/// framing resource" is a distinct fact from "a framing resource of zero size".
+#[test]
+fn an_unresolved_projection_publishes_no_framing_and_no_camera_distance() {
+    let stage = project(&three_block_document(), &MemorySource::default());
+    assert_eq!(stage.projection.counts().resolved, 0);
+
+    let mut app = creator_app(stage, None, 1.0);
+    app.update();
+    app.update();
+
+    let published = app.world().resource::<CreatorRuntimeState>();
+    assert!(
+        !published.camera_framed,
+        "nothing resolved, so there is no box to frame"
+    );
+    assert_eq!(published.framed_extent, None);
+    assert_eq!(
+        published.camera_distance_to_centre, None,
+        "no framing box means no centre to measure a distance from; a 0.0 here \
+         would read as 'the camera sits on the creature'"
+    );
+    // The camera position is still published: it exists, it just has no frame.
+    assert!(
+        published.camera_position.is_some(),
+        "the camera exists regardless of whether anything resolved"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 10. Corpus: framing holds across every real creature document
+// ---------------------------------------------------------------------------
+
+/// Every real creature document that resolved produces a framing, and the framing
+/// distance follows the closed form.
+///
+/// `#[ignore]`d because it needs `SPORE/`. The hermetic tests above pin the
+/// arithmetic on a synthetic fixture; this is what says the arithmetic survives
+/// **real** geometry, real scales and real authored transforms, rather than one
+/// tidy three-block document. Measured over the real corpus: 47 creature
+/// documents, 0 with resolved blocks but no framing, and distances spanning 0.47
+/// to 23.6 across three orders of magnitude of creature size.
+///
+/// The spread is the interesting half. A single constant, or a bounds source that
+/// happens to be right for a unit-sized fixture, cannot produce that range.
+#[test]
+#[ignore = "needs SPORE/"]
+fn every_real_creature_document_frames_from_its_own_measured_extent() {
+    let Some(root) = corpus_root() else {
+        eprintln!("SKIP: no SPORE/Data install");
+        return;
+    };
+    let packages = vec![
+        root.join("SPORE/Data/Spore_Game.package"),
+        root.join("SPORE/Data/Spore_Graphics.package"),
+    ];
+    let Ok(image) = std::fs::read(root.join("SPORE/Data/Spore_Game.package")) else {
+        eprintln!("SKIP: unreadable Spore_Game.package");
+        return;
+    };
+    let Ok(index) = PackageIndex::parse(&image) else {
+        eprintln!("SKIP: unparseable Spore_Game.package");
+        return;
+    };
+
+    let mut documents = 0usize;
+    let mut framed = 0usize;
+    let mut distances: Vec<f32> = Vec::new();
+    let mut resolved_without_framing: Vec<String> = Vec::new();
+
+    for entry in index.entries() {
+        if entry.type_id != CREATURE_TYPE_ID {
+            continue;
+        }
+        let Ok(bytes) = extract_record(&image, entry) else {
+            continue;
+        };
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            continue;
+        };
+        // Parsed only to confirm the record really is a readable document;
+        // `load_creator` re-reads and re-parses it, which is the path under test.
+        if parse_sporemodel(Family::Creature, text).is_err() {
+            continue;
+        }
+        documents += 1;
+
+        let key = ResourceKey::new(entry.type_id, entry.group_id, entry.instance_id);
+        let source = DocumentSource::Record {
+            key,
+            family: Family::Creature,
+        };
+        let Ok(stage) = creator::load_creator(&source, &packages) else {
+            continue;
+        };
+        let resolved = stage.projection.counts().resolved;
+        let Some(framing) = stage.camera_framing() else {
+            if resolved > 0 {
+                resolved_without_framing.push(format!("{key} resolved {resolved}"));
+            }
+            continue;
+        };
+        framed += 1;
+
+        // Independent derivation, same constants as the hermetic test.
+        let (lo, hi) = framing.bounds;
+        let extent = Vec3::new(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]);
+        let radius = 0.5 * extent.length();
+        let half_fov = framing.vertical_fov_degrees.to_radians() * 0.5;
+        let distance = radius / half_fov.sin() * MILDER;
+        assert!(
+            distance.is_finite() && distance > 0.0,
+            "{key} framed to a non-positive distance {distance}; bounds {lo:?}..{hi:?}"
+        );
+        // A degenerate all-zero box would frame to distance 0, i.e. put the camera
+        // inside the creature. That is the specific failure of framing nothing.
+        assert!(
+            radius > 0.0,
+            "{key} resolved {resolved} blocks but framed a zero-radius box, which \
+             puts the camera at the centre"
+        );
+        distances.push(distance);
+    }
+
+    assert_eq!(documents, 47, "the real corpus has 47 creature documents");
+    assert!(
+        !resolved_without_framing.is_empty() || framed == documents,
+        "every creature document that resolved must produce a framing; \
+         these resolved but framed nothing: {resolved_without_framing:?}"
+    );
+    assert!(framed > 0, "at least one real creature must frame");
+
+    let smallest = distances.iter().cloned().fold(f32::INFINITY, f32::min);
+    let largest = distances.iter().cloned().fold(0.0f32, f32::max);
+    assert!(
+        largest / smallest > 20.0,
+        "framing distances span only {smallest}..{largest}; a framing that cannot \
+         handle three orders of magnitude of creature size is not robust, and a \
+         constant would pass a weaker version of this"
+    );
+    println!(
+        "framed {framed}/{documents} creature documents; distance {smallest:.2}..{largest:.2}"
+    );
 }

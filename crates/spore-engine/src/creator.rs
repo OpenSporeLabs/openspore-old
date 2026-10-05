@@ -327,6 +327,11 @@ impl CreatorStage {
             packages: self.packages as u32,
             scene_stable: false,
             frame: 0,
+            camera_framed: false,
+            framed_extent: None,
+            camera_position: None,
+            camera_distance_to_centre: None,
+            world_transform_applies_orientation: false,
             blocks: self
                 .projection
                 .blocks()
@@ -464,6 +469,48 @@ pub struct CreatorRuntimeState {
     pub scene_stable: bool,
     /// Frames since the app started updating. `0` before the first `Update`.
     pub frame: u64,
+    /// Whether a [`CameraFraming`] resource existed, i.e. whether the projection
+    /// produced bounds at all.
+    ///
+    /// Read from the world rather than assumed from the projection, so it reports
+    /// what the camera system actually received. `false` here with
+    /// [`Self::resolved_count`] greater than zero is the one combination that means
+    /// "the creature composed but was never framed".
+    pub camera_framed: bool,
+    /// The extent the framing resource asked to fit, as `(x, y, z)`.
+    ///
+    /// `None` when there was no framing resource. This is the box the creature's
+    /// geometry was measured into, which is not the same thing as what is drawn
+    /// unless [`Self::world_transform_applies_orientation`] is also true.
+    pub framed_extent: Option<[f32; 3]>,
+    /// The camera's measured world position, read back out of the scene.
+    ///
+    /// Present so a framing question can be answered without trusting a
+    /// screenshot. See the note on [`Self::camera_framed`]: Bevy 0.19 registers no
+    /// reflection for `Transform`, `GlobalTransform`, `Visibility` or `Name`, so a
+    /// BRP query for the camera's own transform returns nothing and a `null` there
+    /// means *not reflected*, never *not present*. Reading the transform here and
+    /// republishing it in an OpenSpore-owned reflected type is what makes the
+    /// difference between those two answerable. Cost and intent are stated in
+    /// `tick_creator_runtime`.
+    pub camera_position: Option<[f32; 3]>,
+    /// How far the camera sits from the centre of the framed box.
+    ///
+    /// The single number that says whether framing happened: `ScenePlugin` parks
+    /// the camera at `(0, 6, 34)` looking at the origin, so an unframed creature
+    /// reads as a very large distance and a framed one as a small one, derived
+    /// from the creature's own measured extent rather than from any constant.
+    pub camera_distance_to_centre: Option<f32>,
+    /// Whether the projection's `world_orientation` is applied to the drawn
+    /// geometry.
+    ///
+    /// `false` today, and recorded rather than hidden: `Projection::bounds` adds a
+    /// part's world position to its **untransformed** geometry positions, so a
+    /// rotated or scaled part contributes a box that does not match what is drawn.
+    /// It is correct for the corpus, which is authored at small uniform scales
+    /// near the axis, and wrong in general. `false` here is the honest reading, and
+    /// it is what a future fix must flip.
+    pub world_transform_applies_orientation: bool,
     /// One row per authored block, in document order.
     ///
     /// **Including the unresolved ones.** An agent can therefore enumerate a
@@ -1114,9 +1161,56 @@ fn frame_creator_camera(
 /// `scene_stable` and `frame` instead of sleeping a guessed interval: "the app
 /// launched" and "the app has something on screen" are different claims, and only
 /// one of them is true on frame 0.
-fn tick_creator_runtime(mut state: ResMut<CreatorRuntimeState>) {
+///
+/// It also republishes the camera's measured state. That half exists because of a
+/// misdiagnosis worth keeping. The framing of a real creature was reported broken,
+/// on the strength of a BRP read that came back `null` for the camera transform.
+/// In Bevy 0.19 `bevy_transform`, `bevy_camera` and `bevy_mesh` contain **zero**
+/// `register_type` calls, so `Transform` is invisible to reflection: that `null`
+/// said *not registered*, and was read as *not present*. A headless probe then
+/// measured the camera at `(0.0, 0.5258, 1.8056)` -- exactly what the framing
+/// closed form predicts for that creature's measured extent. The framing had worked
+/// the whole time, and the screenshot that prompted the search was of a six-times
+/// repeated probe part.
+///
+/// So this reads the camera out of the world and republishes it in an
+/// OpenSpore-owned reflected type. The cost is one `Transform` copy per frame; the
+/// benefit is that "did the camera move" becomes a question with an answer, and
+/// asking it no longer requires believing a screenshot.
+fn tick_creator_runtime(
+    mut state: ResMut<CreatorRuntimeState>,
+    cameras: Query<&Transform, With<MainCamera>>,
+    framing: Option<Res<CameraFraming>>,
+) {
     state.frame = state.frame.saturating_add(1);
     state.scene_stable = true;
+
+    // Read the same resource `frame_creator_camera` read, so this reports what the
+    // camera system actually received rather than what the projection intended.
+    state.camera_framed = framing.is_some();
+    state.framed_extent = framing.as_ref().map(|framing| {
+        let (lo, hi) = framing.bounds;
+        [hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]]
+    });
+
+    let Some(camera) = cameras.iter().next() else {
+        // No camera at all. `None` is the honest reading; leaving the previous
+        // frame's position in place would make a vanished camera look stationary.
+        state.camera_position = None;
+        state.camera_distance_to_centre = None;
+        return;
+    };
+    let translation = camera.translation;
+    state.camera_position = Some([translation.x, translation.y, translation.z]);
+    let centre = framing.as_ref().map(|framing| {
+        let (lo, hi) = framing.bounds;
+        Vec3::new(
+            (lo[0] + hi[0]) * 0.5,
+            (lo[1] + hi[1]) * 0.5,
+            (lo[2] + hi[2]) * 0.5,
+        )
+    });
+    state.camera_distance_to_centre = centre.map(|centre| (translation - centre).length());
 }
 
 /// The evidence vocabulary's own spelling for a grade.

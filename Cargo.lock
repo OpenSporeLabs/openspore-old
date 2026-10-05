@@ -4343,6 +4343,7 @@ dependencies = [
  "spore-assets",
  "spore-core",
  "spore-creator-core",
+ "spore-dbpf",
  "spore-gmdl",
  "spore-material",
  "spore-morphology",
