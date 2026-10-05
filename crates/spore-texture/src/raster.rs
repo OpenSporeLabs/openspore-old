@@ -51,7 +51,7 @@ use crate::dxt5::{decode_dxt1_mip, decode_dxt5_mip, BC1_BLOCK_BYTES, BLOCK_BYTES
 use crate::error::TextureError;
 use crate::framing::{
     frame_for, level_dimension, level_offset, level_size, record_size, FrameFormat,
-    LEVEL_PREFIX_SIZE,
+    LEVEL_PREFIX_SIZE, MAX_PLACEABLE_LEVELS,
 };
 use crate::luminance::decode_luminance_mip;
 use crate::ENVELOPE_SIZE;
@@ -175,8 +175,15 @@ pub fn layer_count_for(record_size: usize, env: &RasterEnvelope) -> Result<usize
 }
 
 /// The geometry checks every entry point shares: non-zero dimensions, non-zero
-/// mip count, a known format, and a length that is exactly the one the envelope
-/// implies.
+/// mip count, a chain this build can place, a known format, and a length that is
+/// exactly the one the envelope implies.
+///
+/// The chain-length check comes **before** the format lookup and the length
+/// comparison on purpose. A record declaring more levels than
+/// [`MAX_PLACEABLE_LEVELS`] cannot be walked at all, so reporting a
+/// `RecordSizeMismatch` for it would name a disagreement that is a consequence of
+/// the real one, and `layer_count_for` would answer `Ok(1)` for a record
+/// `decode_raster` refuses.
 fn check_envelope_shape(present: usize, env: &RasterEnvelope) -> Result<FrameFormat, TextureError> {
     if env.width == 0 || env.height == 0 {
         return Err(TextureError::ZeroDimension {
@@ -186,6 +193,12 @@ fn check_envelope_shape(present: usize, env: &RasterEnvelope) -> Result<FrameFor
     }
     if env.mip_count == 0 {
         return Err(TextureError::ZeroMipCount);
+    }
+    if env.mip_count > MAX_PLACEABLE_LEVELS {
+        return Err(TextureError::MipChainBeyondFloor {
+            levels: env.mip_count,
+            floor: MAX_PLACEABLE_LEVELS,
+        });
     }
     let frame =
         frame_for(env.fourcc).ok_or(TextureError::UnsupportedFourcc { fourcc: env.fourcc })?;
@@ -238,7 +251,13 @@ pub fn decode_raster(data: &[u8]) -> Result<RasterImage, TextureError> {
         let width = mip_dimension(envelope.width, mip);
         let height = mip_dimension(envelope.height, mip);
         let size = level_size(frame, envelope.width, envelope.height, mip);
-        let mut cursor = level_offset(frame, envelope.width, envelope.height, mip);
+        let mut cursor = level_offset(
+            frame,
+            envelope.width,
+            envelope.height,
+            mip,
+            envelope.mip_count,
+        )?;
         if mip >= frame.first_prefixed_level {
             let declared = read_u32(data, cursor)?;
             cursor += LEVEL_PREFIX_SIZE;

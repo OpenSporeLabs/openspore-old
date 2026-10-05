@@ -392,7 +392,8 @@ fn the_corpus_record_sizes_are_reproduced_by_the_public_identity() {
         let frame = spore_texture::frame_for(fourcc).expect("a frame");
         for mip in 0..mips {
             if mip >= frame.first_prefixed_level {
-                let at = spore_texture::framing::level_offset(frame, w, h, mip);
+                let at = spore_texture::framing::level_offset(frame, w, h, mip, mips)
+                    .expect("a level the envelope declares");
                 let level = spore_texture::framing::level_size(frame, w, h, mip);
                 bytes[at..at + 4].copy_from_slice(&(level as u32).to_le_bytes());
             }

@@ -83,6 +83,59 @@ pub enum TextureError {
     #[error("texture: mipCount is 0 (a raster record always has a base level)")]
     ZeroMipCount,
 
+    /// A level index the envelope's own `mip_count` does not contain.
+    ///
+    /// A raster record's header says how many levels it has, and that is the only
+    /// statement of the chain's length anywhere in the record. Asking for level
+    /// `mip` of a `mip_count`-level chain is a question about a level the record
+    /// does not have, and the honest answer to it is that there is no such level.
+    ///
+    /// **This refusal is why [`crate::framing::level_offset`] takes `mip_count`.**
+    /// Without it the function had to place an undeclared level from the geometry
+    /// alone, and for a ten-level 512x512 DXT5 record it answered `349_616` — which
+    /// is exactly the record's own length, so a caller would have sliced level 10
+    /// out of a record whose last byte is level 9's. Measured over all 4386 raster
+    /// records of the two content packages: 4386 of 4386 answer that way, because
+    /// every one of them is asked the same question. See
+    /// [`crate::claims::MIPS_BEYOND_32`] for the neighbouring past-the-floor case.
+    #[error("texture: level {mip} is not one of the {mip_count} level(s) the envelope declares")]
+    LevelNotInChain {
+        /// The level index that was asked for.
+        mip: u32,
+        /// Levels the envelope declares.
+        mip_count: u32,
+    },
+
+    /// The chain is longer than this build can place, so no level past the floor
+    /// has a known offset.
+    ///
+    /// The largest chain in the measured corpus is ten levels; this ceiling is
+    /// [`crate::framing::MAX_PLACEABLE_LEVELS`]. `levels` is the envelope's
+    /// declared `mip_count` when the refusal is about a whole record, and the
+    /// one-past-the-requested-level when it is about a single level index.
+    ///
+    /// This is deliberately a refusal and not an extrapolation.
+    /// [`crate::framing::record_size`] *does* extrapolate past the floor — one
+    /// prefix plus one 1x1 payload per extra level — and that rule is recorded as
+    /// an [`crate::claims::MIPS_BEYOND_32`] **approximation**, because it bounds an
+    /// absurd header rather than describing a 34th level. The former
+    /// `level_offset` did worse than extrapolate: it silently stopped
+    /// accumulating at the floor, so it returned the same plausible offset for
+    /// level 33, level 64 and level `u32::MAX`, and disagreed with its own
+    /// module's `record_size` by 40 bytes on a 34-level record. A number that
+    /// contradicts the function that sized the record it points into is worse than
+    /// no number.
+    #[error(
+        "texture: {levels} mip level(s) exceed the {floor} this build can place; the rule for a \
+         level past {floor} is a recorded approximation, not a measurement"
+    )]
+    MipChainBeyondFloor {
+        /// The level count that exceeds [`crate::framing::MAX_PLACEABLE_LEVELS`].
+        levels: u32,
+        /// The ceiling this build places up to.
+        floor: u32,
+    },
+
     /// The record handed to [`crate::layer_count_for`] is smaller than the
     /// envelope, so there is nothing to frame.
     #[error(

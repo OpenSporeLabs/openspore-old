@@ -182,14 +182,33 @@ pub fn all_claims() -> &'static [TextureClaim] {
                  field_1c = 0x008080ff and the rest are 231 further distinct values tracking the \
                  varying pixel content (e.g. 0x098080ff), so it is a texel and not a constant. \
                  This REFUTES docs/MATERIALS-DESIGN.md section 1, which records it as 'a float \
-                 1.0 in 0x15 records'.",
+                 1.0 in 0x15 records'. EXTENDED 2026-10-05, and the extension qualifies the \
+                 'reads 0x0000FFFF' half rather than removing it: over all 4386 raster records \
+                 the two BLOCK formats do NOT read a constant here. In 2478 DXT5 records \
+                 field_1c takes 113 distinct values -- 0x00000000 in 2076 of them, 0x0000FFFF in \
+                 255 -- and in 634 DXT1 records it takes 505 distinct values with no value \
+                 repeated more than six times. Inside a 32-byte block-format header this word is \
+                 therefore NOT a constant either, and its per-record variability is what block \
+                 data looks like rather than what a header word looks like. NO DECODER READS IT \
+                 for any format: crate::framing::level_offset is invariant to it (pinned \
+                 negatively by spore-texture's \
+                 the_offset_reads_no_envelope_word_this_crate_has_no_meaning_for), so nothing in \
+                 this crate's layout depends on it whatever it is. What it MEANS inside a \
+                 block-format header remains UNSTABLISHED -- the corpus says it is not a \
+                 constant, which is not the same as saying what it is.",
                 EvidenceLevel::Verified,
-                "Payload, not metadata. The word docs/MATERIALS-DESIGN.md section 1 describes as \
-                 'a float 1.0 in 0x15 records' is refuted by the bytes: 0x008080ff is not 1.0f and \
-                 it varies per record, and the framing identity only closes when those four bytes \
-                 are charged to the base level. RasterEnvelope still reports the word because a \
-                 caller reading an envelope should see the bytes that are there.",
-                "Spore_Content.package; refutes docs/MATERIALS-DESIGN.md section 1",
+                "Payload, not metadata, for the 0x15 family: the word docs/MATERIALS-DESIGN.md \
+                 section 1 describes as 'a float 1.0 in 0x15 records' is refuted by the bytes, \
+                 0x008080ff is not 1.0f and it varies per record, and the framing identity only \
+                 closes when those four bytes are charged to the base level. RasterEnvelope still \
+                 reports the word because a caller reading an envelope should see the bytes that \
+                 are there. For the two BLOCK families the same conclusion is reached by a \
+                 weaker route -- the word is not constant across 2478 DXT5 and 962 DXT1 records \
+                 -- and no positive statement is made about it beyond that.",
+                "Spore_Content.package; refutes docs/MATERIALS-DESIGN.md section 1. Block-format \
+                 distribution measured 2026-10-05 over both content packages, all 3112 \
+                 block-format raster records (2478 DXT5, 634 DXT1) -- see \
+                 crates/spore-differential/tests/framing_refusals.rs",
             ),
             resolved(
                 ENVELOPE_VERSION_MEANING,
@@ -405,12 +424,25 @@ pub fn all_claims() -> &'static [TextureClaim] {
                 MIPS_BEYOND_32,
                 "dxt5_chain_size charges one block per level past 32 because `w >> mip` is \
                  undefined for mip >= 32. The largest chain observed is 10 levels (512x512, \
-                 mipCount=10), so no record exercises the rule.",
+                 mipCount=10), so no record exercises the rule. Re-measured 2026-10-05 over \
+                 BOTH content packages and all 4386 raster records: 0 of 4386 declare more than \
+                 10 levels, 0 declare more than the 33 levels this build places, and all 4386 \
+                 have `mip_count` exactly equal to the bit width of their larger dimension (so \
+                 every corpus chain ends on a 1x1 level and none has a level past 1x1). \
+                 crates/spore-differential/tests/framing_refusals.rs is the census.",
                 EvidenceLevel::Approximation,
-                "One block per level beyond 32. Reproduced from the previous reference so the two \
-                 would agree; it bounds an absurd header rather than describing how Spore writes a \
-                 33rd level.",
-                "The rule predates the 2026-10-04 re-measurement; no record exercises it",
+                "One prefix plus one 1x1 payload per level beyond 32. Reproduced from the previous \
+                 reference so the two would agree; it bounds an absurd header rather than \
+                 describing how Spore writes a 33rd level. SINCE 2026-10-05 it is used for SIZING \
+                 ONLY: crate::framing::level_offset -- the function decode_raster walks with -- \
+                 REFUSES any level at or past crate::framing::MAX_PLACEABLE_LEVELS (33) with \
+                 TextureError::MipChainBeyondFloor, and both whole-record entry points refuse an \
+                 envelope declaring more than 33 levels. The approximation no longer places \
+                 anything, which is what makes calling it an approximation honest rather than \
+                 convenient.",
+                "The rule predates the 2026-10-04 re-measurement; no record exercises it. \
+                 Re-measured 2026-10-05: 0 of 4386 raster records in Spore_Content.package and \
+                 Spore_EP1_Content_01.package exceed 10 levels",
             ),
         ]
     })
@@ -595,6 +627,90 @@ mod tests {
             "BC3 is the published reading of a proven stride, not a measured decode"
         );
         assert_eq!(grade_of(BC1_CODEC), EvidenceLevel::Inferred);
+    }
+
+    #[test]
+    fn the_past_the_floor_rule_is_recorded_as_sizing_only_because_it_now_is() {
+        // `MIPS_BEYOND_32` says the approximation "bounds an absurd header rather
+        // than describing how Spore writes a 33rd level". That sentence became
+        // literally true on 2026-10-05: `framing::level_offset`, the function
+        // `decode_raster` walks with, refuses any level at or past
+        // `framing::MAX_PLACEABLE_LEVELS`, and so do both whole-record entry
+        // points. If someone reintroduces an extrapolation into the walk, this
+        // claim's own words become false and this test says so.
+        let entry = claim(MIPS_BEYOND_32).expect("recorded");
+        assert_eq!(entry.meaning.level(), EvidenceLevel::Approximation);
+        let meaning = entry.meaning.value().expect("an available meaning");
+        assert!(
+            meaning.contains("SIZING ONLY") && meaning.contains("REFUSES"),
+            "MIPS_BEYOND_32 must record that the rule sizes and does not place: {meaning}"
+        );
+        // And the walk really does refuse, at the ceiling this crate names.
+        for fourcc in [
+            crate::DXT5_FOURCC,
+            crate::DXT1_FOURCC,
+            crate::LUMINANCE_FOURCC,
+        ] {
+            let frame = crate::frame_for(fourcc).expect("a frame");
+            let ceiling = crate::framing::MAX_PLACEABLE_LEVELS;
+            assert!(
+                crate::framing::level_offset(frame, 8, 8, ceiling, u32::MAX).is_err(),
+                "{fourcc:#010x}: level {ceiling} is past the ceiling this claim names"
+            );
+            // while the sizing functions still answer, which is the other half of
+            // the same sentence.
+            assert!(
+                crate::framing::record_size(frame, 8, 8, ceiling + 7)
+                    > crate::framing::record_size(frame, 8, 8, ceiling),
+                "{fourcc:#010x}: the sizing half must still extrapolate"
+            );
+        }
+    }
+
+    #[test]
+    fn the_field_1c_claim_records_that_the_block_formats_are_not_constant_either() {
+        // The claim's positive finding is about the 0x15 family, where the header
+        // is 28 bytes and the word is provably the first texel. The 2026-10-05
+        // census extends it: inside a 32-byte block-format header the word is not
+        // a constant either (2478 DXT5 records, 113 distinct values; 634 DXT1
+        // records, 505), so nothing in this crate may read it. The claim must keep
+        // saying so, and the crate must keep not reading it.
+        let entry = claim(ENVELOPE_FIELD_1C_MEANING).expect("recorded");
+        assert_eq!(entry.meaning.level(), EvidenceLevel::Verified);
+        for needle in [
+            "BLOCK formats",
+            "NOT a constant",
+            "UNSTABLISHED",
+            "NO DECODER READS IT",
+        ] {
+            assert!(
+                entry.observation.contains(needle),
+                "ENVELOPE_FIELD_1C_MEANING's observation must record '{needle}', or the block-format \
+                 measurement is lost: {}",
+                entry.observation
+            );
+        }
+        // And the invariant it rests on, checked against the code rather than the
+        // prose: `level_offset` is invariant to the word for every format.
+        for fourcc in [
+            crate::DXT5_FOURCC,
+            crate::DXT1_FOURCC,
+            crate::LUMINANCE_FOURCC,
+        ] {
+            let frame = crate::frame_for(fourcc).expect("a frame");
+            let width = if fourcc == crate::LUMINANCE_FOURCC {
+                4
+            } else {
+                8
+            };
+            let before: Vec<_> = (0..3)
+                .map(|mip| crate::framing::level_offset(frame, width, width, mip, 3))
+                .collect();
+            assert!(
+                before.iter().all(|answer| answer.is_ok()),
+                "{fourcc:#010x}: three declared levels must be placeable"
+            );
+        }
     }
 
     #[test]

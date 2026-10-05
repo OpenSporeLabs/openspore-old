@@ -874,10 +874,28 @@ fn every_single_byte_flip_in_the_header_is_either_refused_or_changes_nothing_rea
                                 frame_name(frame),
                                 word * 4
                             );
+                            // Two named refusals are correct for a flipped
+                            // geometry word, and which one fires depends on the
+                            // flipped value rather than on which byte it was.
+                            //
+                            // A `width`/`height` flip can make the declared
+                            // `mip_count` longer than the chain the dimensions
+                            // reach, which is now `MipChainBeyondFloor` — the
+                            // record asks this build to place more levels than it
+                            // knows how to place, and that is refused before the
+                            // size comparison rather than after it. A `mip_count`
+                            // flip very far up is the same thing. Everything else
+                            // fails the exact-size check, which is the check that
+                            // a record is exactly as long as its own envelope
+                            // implies.
                             assert!(
-                                matches!(error, TextureError::RecordSizeMismatch { .. }),
-                                "{}: a flipped geometry word must fail the exact-size check, \
-                                 got {error}",
+                                matches!(
+                                    error,
+                                    TextureError::RecordSizeMismatch { .. }
+                                        | TextureError::MipChainBeyondFloor { .. }
+                                ),
+                                "{}: a flipped geometry word must fail the exact-size check or the \
+                                 chain-length ceiling, got {error}",
                                 frame_name(frame)
                             );
                         }
@@ -1598,127 +1616,150 @@ fn field_18_is_the_base_level_byte_count_in_every_format_and_is_read() {
     }
 }
 
+/// A defect in the crate under test, found by this file's oracle, pinned here
+/// rather than worked around — and now **fixed**, so this file pins the fix.
+///
+/// # What the defect was
+///
+/// `framing::record_size` charges every level past `MIP_FLOOR` a prefix plus a
+/// 1x1 payload, and `chain_size` agrees with it — which is why this file's
+/// `the_crates_record_size_equals_an_independently_written_identity` passes at 34
+/// and 40 levels. `framing::level_offset`, which is what `decode_raster` walks
+/// with, stopped its accumulation loop at `mip.min(MIP_FLOOR)`, so it omitted one
+/// prefix and one 1x1 payload for every level past the floor, and the tail of a
+/// long chain was read from the wrong offsets. Measured, not assumed: on a 34-level
+/// 1x1 DXT5 record the sizing said **704** and the walk said **664**, forty bytes
+/// apart.
+///
+/// Two faces, and only the first is silent: a chain whose tail is uniform (every
+/// level past the geometry is 1x1, hence every prefix `4`) **decoded as `Ok`** with
+/// another level's bytes, while any other shape was refused under a name that
+/// pointed at the wrong level. The cap bit from `mip_count == 34`, not 33:
+/// placing level `m` needs the accumulation of levels `0..m`, and level 32 is the
+/// last index whose offset is still exactly what both functions compute.
+///
+/// # What the fix is
+///
+/// `level_offset` no longer extrapolates, and no longer clamps silently. It
+/// **refuses**: `mip >= mip_count` is `LevelNotInChain`, `mip >= 33` is
+/// `MipChainBeyondFloor`, and a zero dimension is `ZeroDimension`. A chain this
+/// build cannot place is now refused by name at both whole-record entry points as
+/// well, so `layer_count_for` can no longer answer `Ok(1)` for a record
+/// `decode_raster` rejects.
+///
+/// # Why a refusal and not agreement with `record_size`
+///
+/// Because the past-the-floor rule is a recorded **approximation**, not a
+/// measurement: `spore_texture::claims::MIPS_BEYOND_32` grades it `Approximation`
+/// and says it "bounds an absurd header rather than describing how Spore writes a
+/// 33rd level". The sizing functions keep it — they are cross-checked against the
+/// record's own length and against every prefixed level's byte count, and
+/// `spore-texture`'s own `a_sizing_question_is_still_answered_past_the_floor`
+/// pins that they still answer. The *placement* function does not, because a
+/// number only an approximation can produce is a fabricated offset. Nothing in the
+/// corpus is affected either way: the largest chain in 4386 raster records is ten
+/// levels (`crates/spore-differential/tests/framing_refusals.rs` re-measures it).
 #[test]
-fn the_walk_past_level_32_disagrees_with_the_identity_it_reports() {
-    // A defect in the crate under test, found by this file's oracle and pinned
-    // here rather than worked around.
-    //
-    // `framing::record_size` charges every level past `MIP_FLOOR` a prefix plus a
-    // 1x1 payload, and `chain_size` agrees with it -- which is why this file's
-    // `the_crates_record_size_equals_an_independently_written_identity` passes
-    // at 34 and 40 levels. `framing::level_offset`, which is what `decode_raster`
-    // walks with, stops its accumulation loop at `mip.min(MIP_FLOOR)`, so it
-    // omits one prefix and one 1x1 payload for every level past the floor, and
-    // the tail of a long chain is read from the wrong offsets.
-    //
-    // The cap bites from `mip_count == 34`, not 33: placing level `m` needs the
-    // accumulation of levels `0..m`, and `min(33, 32) == 32` covers levels
-    // 0..31, which is exactly enough for level 32. `beyond_the_floor_shapes`
-    // says so in its own documentation, and the shortfall below is measured from
-    // the crate's function rather than assumed.
-    //
-    // Nothing in the corpus has more than ten levels, so this is not a ceiling
-    // over real data: it is an internal inconsistency between two functions of
-    // the same module, reachable only from a synthetic envelope. It is recorded
-    // because the alternative — dropping the shapes — would leave the next
-    // reader with a green suite and no idea. When the crate's owner fixes
-    // `level_offset`, this test fails and says what to update.
-    let (mut silent, mut refused) = (0usize, 0usize);
+fn the_walk_past_level_32_is_refused_rather_than_mis_placed() {
+    // --- the sizing half is unchanged, and this file's identity still holds.
     for (w, h, mips) in beyond_the_floor_shapes() {
         let record = build_luminance(w, h, mips);
         let exact = ref_record_size(REF_LUM, w, h, mips).expect("addressable");
         let frame = frame_for(LUMINANCE_FOURCC).expect("a frame");
-
-        // The sizing half is right: the record this file builds IS the record
-        // size the crate reports.
-        assert_eq!(record.len(), exact);
+        assert_eq!(record.len(), exact, "{w}x{h} mips={mips}: fixture length");
         assert_eq!(
             spore_texture::framing::record_size(frame, w, h, mips),
             exact,
-            "{w}x{h} mips={mips}: record_size must include the levels past the floor"
+            "{w}x{h} mips={mips}: record_size must still include the levels past the floor -- it \
+             is a recorded approximation, not a removal"
+        );
+    }
+
+    // --- and the walking half now refuses, by name, for every level past the
+    //     ceiling and for every level the envelope does not declare.
+    let frame = frame_for(LUMINANCE_FOURCC).expect("a frame");
+    let ceiling = spore_texture::framing::MAX_PLACEABLE_LEVELS;
+    assert_eq!(ceiling, MIP_FLOOR + 1);
+
+    for (w, h, mips) in beyond_the_floor_shapes() {
+        // Both whole-record entry points, one variant, naming the count and the
+        // ceiling. Before the fix the decode said `Ok` (wrong) or named a length
+        // prefix at a level that was not the one at fault.
+        let record = build_luminance(w, h, mips);
+        let expected = TextureError::MipChainBeyondFloor {
+            levels: mips,
+            floor: ceiling,
+        };
+        assert_eq!(
+            decode_raster(&record),
+            Err(expected.clone()),
+            "{w}x{h} mips={mips}: a chain this build cannot place must be refused by name, not \
+             decoded"
+        );
+        assert_eq!(
+            layer_count_for(record.len(), &parse_envelope(&record).expect("envelope")),
+            Err(expected),
+            "{w}x{h} mips={mips}: layer_count_for must not answer Ok(1) for a record decode_raster \
+             refuses"
         );
 
-        // The walking half is not. `level_offset` addresses a prefixed level's
-        // **prefix**, which is why the crate adds LEVEL_PREFIX_SIZE after reading
-        // it; this file's windows address the payload, so the two are compared
-        // with that shift.
+        // And the walk itself: one refusal per unplaceable index, and no value.
+        for mip in [MIP_FLOOR + 1, mips, mips + 1, u32::MAX] {
+            let answer = spore_texture::framing::level_offset(frame, w, h, mip, mips);
+            let placeable = mip < mips && mip < ceiling;
+            assert_eq!(
+                answer.is_ok(),
+                placeable,
+                "{w}x{h} mips={mips}: level {mip} {}",
+                if placeable {
+                    "is placeable"
+                } else {
+                    "must be refused"
+                }
+            );
+            if let Err(error) = answer {
+                assert!(
+                    matches!(
+                        error,
+                        TextureError::MipChainBeyondFloor { .. }
+                            | TextureError::LevelNotInChain { .. }
+                    ),
+                    "{w}x{h} mips={mips} level {mip}: an undeclared or unplaceable level must be \
+                     refused by name, got {error}"
+                );
+            }
+        }
+    }
+
+    // --- the levels that ARE placeable are placed exactly, right up to and
+    //     including the last one, 32. Before the fix the sweep stopped early and
+    //     the tail was mis-placed; now the tail is refused and the head is exact.
+    for (w, h, mips) in [
+        (1u32, 1u32, 33u32),
+        (8, 8, 33),
+        (64, 64, 33),
+        (512, 512, 33),
+    ] {
         let windows = ref_windows(REF_LUM, w, h, mips);
-        for (mip, (payload_at, _)) in windows.iter().enumerate().take(MIP_FLOOR as usize + 1) {
-            let mut at = spore_texture::framing::level_offset(frame, w, h, mip as u32);
-            if (mip as u32) >= REF_LUM.first_prefixed {
+        assert_eq!(mips, ceiling, "33 is the longest chain this build places");
+        assert_eq!(
+            windows.last().map(|(at, len)| at + len),
+            ref_record_size(REF_LUM, w, h, mips),
+            "{w}x{h} mips={mips}: this file's own windows must still close on the record"
+        );
+        for (mip, (payload_at, _)) in windows.iter().enumerate() {
+            let mut at = spore_texture::framing::level_offset(frame, w, h, mip as u32, mips)
+                .unwrap_or_else(|error| panic!("{w}x{h}: level {mip} must be placeable: {error}"));
+            if mip as u32 >= REF_LUM.first_prefixed {
                 at += PREFIX;
             }
             assert_eq!(
                 at, *payload_at,
-                "{w}x{h} mips={mips}: level {mip} is at or below the floor and must be placed \
-                 correctly"
+                "{w}x{h} mips={mips}: level {mip} is at or below the ceiling and must be placed \
+                 exactly"
             );
         }
-        let last = mips as usize - 1;
-        let beyond_offset = spore_texture::framing::level_offset(frame, w, h, mips) + PREFIX;
-        let shortfall = windows[last].0 - beyond_offset;
-        assert_eq!(
-            shortfall,
-            (mips as usize - 1 - MIP_FLOOR as usize) * (PREFIX + TEXEL),
-            "{w}x{h} mips={mips}: level_offset falls short by exactly one prefix plus one texel \
-             for each level past the floor -- DEFECT: this is the number a fix must make 0"
-        );
-        assert!(
-            shortfall > 0,
-            "{w}x{h} mips={mips}: a shape in this sweep must exercise the defect, or it proves \
-             nothing"
-        );
-
-        // The consequence, in whichever of the two faces it shows up. The
-        // mis-placed walk reads a length prefix out of whatever bytes sit at the
-        // wrong offset, so a shape whose tail is uniform (every level past the
-        // geometry being 1x1, hence every prefix `4`) DECODES as Ok with another
-        // level's bytes, while any other shape is refused -- naming a level
-        // whose prefix this record never got wrong. Both are the same defect;
-        // only the first is silent, which is why the two are counted apart.
-        match decode_raster(&record) {
-            Ok(image) => {
-                silent += 1;
-                assert_eq!(image.layers.len(), 1);
-                assert_eq!(image.layers[0].len(), mips as usize);
-                assert_ne!(
-                    &image.layers[0][last].pixels,
-                    &record[windows[last].0..windows[last].0 + windows[last].1],
-                    "DEFECT, recorded rather than worked around: level {last} of a {mips}-level \
-                     record is read {shortfall} bytes before its own window, so the decode is Ok \
-                     and wrong. No record in the corpus has more than ten levels, so no real data \
-                     is affected; the inconsistency is between framing::record_size and \
-                     framing::level_offset."
-                );
-                println!(
-                    "  {w}x{h} mips={mips}: decodes Ok, level {last} read {shortfall} bytes early \
-                     (SILENT)"
-                );
-            }
-            Err(error) => {
-                refused += 1;
-                assert!(
-                    matches!(
-                        error,
-                        TextureError::LevelLengthPrefix { .. }
-                            | TextureError::LevelSlicePastRecord { .. }
-                    ),
-                    "{w}x{h} mips={mips}: the mis-placed walk must not invent a third refusal, \
-                     got {error}"
-                );
-                println!("  {w}x{h} mips={mips}: refused ({shortfall} bytes early): {error}");
-            }
-        }
     }
-    println!(
-        "walk past level 32: {silent} shape(s) decoded Ok and wrong, {refused} refused by name, \
-         0 exact"
-    );
-    assert!(
-        silent > 0,
-        "no shape showed the silent face of the defect; this sweep must include one, or it only \
-         documents the loud one"
-    );
 }
 
 #[test]

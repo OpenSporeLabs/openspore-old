@@ -66,8 +66,22 @@
 //! corpus is exactly one chain of mip levels. `field_18` is not a layer count
 //! either — it is the base level's own byte count, which is why it read "two
 //! base levels" for DXT5 under the old 8-byte block size.
+//!
+//! # Placing a level is where this module refuses
+//!
+//! [`level_offset`] is the only function here that tells a caller *where to read*,
+//! and it is the only one that returns a [`crate::TextureError`]. Three input
+//! classes have no answer and are refused by name rather than answered from the
+//! geometry: a level the envelope's `mip_count` does not declare, a chain longer
+//! than [`MAX_PLACEABLE_LEVELS`], and a zero dimension. The sizing functions
+//! beside it ([`level_size`], [`chain_size`], [`record_size`]) are unchanged, are
+//! cross-checked against the record's own length and against every prefixed
+//! level's `u32` byte count, and keep their documented past-the-floor
+//! approximation — which is graded as an approximation in
+//! [`crate::claims::MIPS_BEYOND_32`] precisely because it is not used to place
+//! anything.
 
-use crate::{DXT1_FOURCC, DXT5_FOURCC, LUMINANCE_FOURCC};
+use crate::{TextureError, DXT1_FOURCC, DXT5_FOURCC, LUMINANCE_FOURCC};
 
 /// Bytes per output texel: RGBA8.
 pub(crate) const RGBA_BYTES: usize = 4;
@@ -205,16 +219,89 @@ pub fn record_size(frame: FrameFormat, width: u32, height: u32, mip_count: u32) 
         .saturating_add(chain_size(frame, width, height, mip_count))
 }
 
-/// Byte offset of level `mip`'s payload, headers and prefixes included.
-pub fn level_offset(frame: FrameFormat, width: u32, height: u32, mip: u32) -> usize {
+/// The number of mip levels this build can place, and therefore the level count
+/// above which it refuses to answer.
+///
+/// [`crate::MIP_FLOOR`] is 32, and `base >> 32` is exhausted for every `u32`
+/// base, so [`level_dimension`] pins every level at or past it to 1x1. Level 32
+/// is still *placeable* — its offset is the exact sum of levels `0..32`, which is
+/// the same sum [`chain_size`] and the independent transcription in
+/// `crates/spore-differential/tests/luminance_corpus.rs` both produce — so the
+/// ceiling is **33**, not 32. Level 33 is the first index whose offset would have
+/// to come from the past-the-floor rule instead of the measured geometry.
+///
+/// Measured over the real corpus this is not a ceiling at all: the largest chain
+/// in 4386 raster records is **10** levels, and
+/// `crates/spore-differential/tests/framing_refusals.rs` re-measures that. This
+/// constant exists because a decoder that extrapolates silently past the end of
+/// its evidence is worse than one that stops.
+pub const MAX_PLACEABLE_LEVELS: u32 = crate::MIP_FLOOR + 1;
+
+/// Byte offset of level `mip`'s payload, headers and prefixes included, or the
+/// refusal that says why there is none.
+///
+/// # Why this refuses
+///
+/// Four arguments are not enough to place a level, and every refusal below names
+/// a piece of evidence this function was handed and did not have:
+///
+/// * **`mip_count`** — a raster record's header says how many levels it has, and
+///   it is the only statement of the chain's length in the record. Placing a
+///   level the envelope does not declare is a question about a level that does
+///   not exist. Before `mip_count` was a parameter this function answered one
+///   anyway: for every one of the 4386 raster records in the two content
+///   packages, `level_offset(_, _, _, mip_count)` returned the record's own
+///   length, which a caller would have sliced as though a level 10 existed in a
+///   ten-level record.
+/// * **`mip >= MAX_PLACEABLE_LEVELS`** — the past-the-floor rule is recorded as an
+///   [`crate::claims::MIPS_BEYOND_32`] approximation, not a measurement, and the
+///   largest chain in the corpus is ten levels. The previous loop bound was
+///   `0..mip.min(MIP_FLOOR)`, which quietly stopped accumulating: level 33, level
+///   64 and level `u32::MAX` all came back with the *same* plausible offset, and
+///   the result disagreed with [`record_size`] on the very record it pointed into
+///   (664 against 704 on a 34-level 1x1 DXT5 record).
+/// * **a zero dimension** — [`level_dimension`] pins `max(1, base >> mip)`, so a
+///   zero base is silently promoted to 1x1 and a 0-wide image acquires 16 bytes
+///   per level and an offset for each. `decode_raster` already refuses such a
+///   record with [`TextureError::ZeroDimension`]; this is the same refusal at the
+///   function that places levels. The corpus holds none (measured), so this
+///   aligns the two rather than fixing a seen defect.
+///
+/// [`level_size`], [`chain_size`] and [`record_size`] are **unchanged**. They are
+/// sizing arithmetic with documented saturating behaviour, they are cross-checked
+/// against the record's own length and against every prefixed level's `u32` byte
+/// count, and the past-the-floor part of them is a recorded approximation rather
+/// than a silent guess. This function is the one that tells a caller where to
+/// read, so it is the one that refuses.
+pub fn level_offset(
+    frame: FrameFormat,
+    width: u32,
+    height: u32,
+    mip: u32,
+    mip_count: u32,
+) -> Result<usize, TextureError> {
+    if width == 0 || height == 0 {
+        return Err(TextureError::ZeroDimension { width, height });
+    }
+    if mip >= mip_count {
+        return Err(TextureError::LevelNotInChain { mip, mip_count });
+    }
+    if mip >= MAX_PLACEABLE_LEVELS {
+        return Err(TextureError::MipChainBeyondFloor {
+            levels: mip + 1,
+            floor: MAX_PLACEABLE_LEVELS,
+        });
+    }
+    // No clamp: `mip < MAX_PLACEABLE_LEVELS`, so every level walked here is one
+    // the measured geometry accounts for and `record_size` agrees on.
     let mut off = frame.header_size;
-    for level in 0..mip.min(crate::MIP_FLOOR) {
+    for level in 0..mip {
         if level >= frame.first_prefixed_level {
             off = off.saturating_add(LEVEL_PREFIX_SIZE);
         }
         off = off.saturating_add(level_size(frame, width, height, level));
     }
-    off
+    Ok(off)
 }
 
 #[cfg(test)]
@@ -266,14 +353,99 @@ mod tests {
             let mut off = frame.header_size;
             for mip in 0..8u32 {
                 assert_eq!(
-                    level_offset(frame, 64, 64, mip),
-                    off,
+                    level_offset(frame, 64, 64, mip, 8),
+                    Ok(off),
                     "{fourcc:#010x} mip {mip}"
                 );
                 if mip >= frame.first_prefixed_level {
                     off += LEVEL_PREFIX_SIZE;
                 }
                 off += level_size(frame, 64, 64, mip);
+            }
+        }
+    }
+
+    #[test]
+    fn a_level_offset_is_the_record_size_of_the_chain_before_it() {
+        // The identity the previous version contradicted. `level_offset` addresses
+        // a prefixed level's **prefix** (which is why `decode_raster` adds
+        // `LEVEL_PREFIX_SIZE` after reading it), so a level past
+        // `first_prefixed_level` contributes its prefix twice — once inside the
+        // truncated chain's size and once ahead of its payload. Level 32, the last
+        // placeable index, is included because `chain_size` and this function
+        // agree about it; level 33 is not placeable at all, and is refused below.
+        for fourcc in [DXT5_FOURCC, DXT1_FOURCC, LUMINANCE_FOURCC] {
+            let frame = frame_for(fourcc).unwrap();
+            for mip in 1..=crate::MIP_FLOOR {
+                let prefix = usize::from(mip >= frame.first_prefixed_level) * LEVEL_PREFIX_SIZE;
+                assert_eq!(
+                    level_offset(frame, 8, 8, mip, mip + 1).unwrap()
+                        + level_size(frame, 8, 8, mip)
+                        + prefix,
+                    record_size(frame, 8, 8, mip + 1),
+                    "{fourcc:#010x} chain of {} levels",
+                    mip + 1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_past_the_floor_placement_is_refused_not_extrapolated() {
+        for fourcc in [DXT5_FOURCC, DXT1_FOURCC, LUMINANCE_FOURCC] {
+            let frame = frame_for(fourcc).unwrap();
+            for mip in [crate::MIP_FLOOR + 1, crate::MIP_FLOOR + 2, 64, u32::MAX - 1] {
+                assert_eq!(
+                    level_offset(frame, 8, 8, mip, u32::MAX),
+                    Err(TextureError::MipChainBeyondFloor {
+                        levels: mip + 1,
+                        floor: MAX_PLACEABLE_LEVELS
+                    }),
+                    "{fourcc:#010x} level {mip} is past the ceiling"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_level_the_envelope_does_not_declare_has_no_offset() {
+        for fourcc in [DXT5_FOURCC, DXT1_FOURCC, LUMINANCE_FOURCC] {
+            let frame = frame_for(fourcc).unwrap();
+            // Every corpus shape: the declared chain's own length is refused, and
+            // so is the level after it. The pre-fix function answered the first of
+            // these with `record_size`, i.e. with a plausible in-record offset.
+            for (mips, mip) in [(10u32, 10u32), (9, 9), (7, 7), (6, 6), (10, 11), (1, 1)] {
+                assert_eq!(
+                    level_offset(frame, 512, 512, mip, mips),
+                    Err(TextureError::LevelNotInChain {
+                        mip,
+                        mip_count: mips
+                    }),
+                    "{fourcc:#010x} a {mips}-level chain has no level {mip}"
+                );
+            }
+            // And a zero-level chain has no levels at all, which is the same
+            // refusal rather than a special case: `mip >= mip_count` covers it.
+            assert_eq!(
+                level_offset(frame, 512, 512, 0, 0),
+                Err(TextureError::LevelNotInChain {
+                    mip: 0,
+                    mip_count: 0
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn a_degenerate_dimension_has_no_level_to_place() {
+        for frame in [DXT5_FRAME, DXT1_FRAME, LUMINANCE_FRAME] {
+            for (width, height) in [(0u32, 8u32), (8, 0), (0, 0)] {
+                assert_eq!(
+                    level_offset(frame, width, height, 0, 1),
+                    Err(TextureError::ZeroDimension { width, height }),
+                    "{:?} {width}x{height}",
+                    frame.fourcc
+                );
             }
         }
     }

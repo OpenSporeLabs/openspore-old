@@ -12,8 +12,10 @@
 //!                                                            ▼
 //!                                       spore-rigblock ──> part pair, body graph
 //!                                                            │
-//!                                                            ▼
-//!                                                  spore-engine (projection)
+//!                          ┌─────────────────────────────────┴──────────────────┐
+//!                          ▼                                                    ▼
+//!                       catalog                                   spore-engine (projection)
+//!            which (group, instance) a document can name          what gets drawn
 //! ```
 //!
 //! Authoring data, morphology semantics and runtime stay separate layers, which
@@ -36,10 +38,23 @@
 //! followed from the chain without an independent witness for that record is
 //! `Inferred`, and a part carrying any inferred hop reports that rather than
 //! presenting as fully measured.
+//!
+//! # The catalogue, and the same rule one layer out
+//!
+//! [`catalog`] turns a set of creator documents into the list of `(group,
+//! instance)` pairs they actually name — 680 `<blockref>` blocks over 60
+//! distinct parts in the shipped corpus — so a creator tool can browse what is
+//! reachable and replace one block with another. It resolves through [`Resolver`]
+//! rather than re-walking the chain, and its contribution is the *classification*
+//! of what comes back: [`Absent`] keeps a miss, a record that would not decode, a
+//! structure that is not what was expected, a source that could not look at all,
+//! and a stage the chain never reached as five different statements instead of
+//! one `Option`.
 
 #![forbid(unsafe_code)]
 #![warn(missing_debug_implementations)]
 
+pub mod catalog;
 pub mod composition;
 pub mod dbpf;
 pub mod error;
@@ -48,6 +63,10 @@ pub mod provenance;
 pub mod resolve;
 pub mod source;
 
+pub use catalog::{
+    Absent, Catalog, CatalogCounts, CatalogEntry, DeclaredDependency, Dependencies, DocumentRecord,
+    ExtentComparison, Geometry, Lookup, PartReference, RigblockBounds, Skeleton, Stop,
+};
 pub use composition::{Composition, Counts, PartSlot, UnresolvedPart};
 pub use dbpf::PackageSource;
 pub use error::{MorphologyError, PartDecodeError};
@@ -56,4 +75,4 @@ pub use projection::{
 };
 pub use provenance::{Grade, Hop, Stage, StopReason, Trail};
 pub use resolve::{compose, ResolvedPart, Resolver};
-pub use source::{MemorySource, RecordSource};
+pub use source::{MemorySource, Probe, RecordSource};

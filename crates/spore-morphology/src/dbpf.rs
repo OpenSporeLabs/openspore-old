@@ -25,7 +25,7 @@ use std::path::Path;
 use spore_core::ResourceKey;
 use spore_dbpf::{extract_record, DbpfEntry, PackageIndex};
 
-use crate::source::RecordSource;
+use crate::source::{Probe, RecordSource};
 
 /// One opened package.
 struct Loaded {
@@ -129,6 +129,19 @@ impl PackageSource {
         }
         None
     }
+
+    /// The `compression` word of the index row at `key`, in any opened package.
+    ///
+    /// Used only to tell "there is no row" from "there is a row whose payload
+    /// would not come out". A row whose extraction failed for a non-compression
+    /// reason (a truncated extent, a decompressed size mismatch) reports its own
+    /// word, because that is the row this source actually holds and a later
+    /// reader should be told which one it was.
+    fn compression_at(&self, key: &ResourceKey) -> Option<u16> {
+        self.packages
+            .iter()
+            .find_map(|package| package.find(key).map(|entry| entry.compression))
+    }
 }
 
 impl RecordSource for PackageSource {
@@ -139,6 +152,31 @@ impl RecordSource for PackageSource {
             self.misses.set(self.misses.get() + 1);
         }
         found
+    }
+
+    /// A source with no package open cannot look anything up, and every miss it
+    /// reports is therefore a statement about the source rather than about the
+    /// corpus. Zero packages is the state a caller reaches when it points at an
+    /// install that is not there, which is the exact case where "absent" and
+    /// "never looked" must not be confused.
+    fn is_searchable(&self) -> bool {
+        self.package_count() > 0
+    }
+
+    /// Separates "no index entry anywhere" from "an index entry whose bytes would
+    /// not come out".
+    ///
+    /// Refines only the `None` case of [`RecordSource::record`], which is why the
+    /// two can never disagree: `Present` is returned on exactly the path that
+    /// already produced `Some`.
+    fn probe(&self, key: &ResourceKey) -> Probe {
+        match self.get(key) {
+            Some(bytes) => Probe::Present(bytes),
+            None => match self.compression_at(key) {
+                Some(compression) => Probe::Unreadable { compression },
+                None => Probe::NoSuchRecord,
+            },
+        }
     }
 }
 
@@ -159,5 +197,18 @@ mod tests {
         let source = PackageSource::new().open(Path::new("/nonexistent/package.package"));
         assert_eq!(source.package_count(), 0, "the miss must be visible");
         assert!(source.get(&ResourceKey::new(1, 2, 3)).is_none());
+    }
+
+    #[test]
+    fn a_source_with_no_package_is_not_searchable_and_says_so() {
+        // The distinction this module exists for: with no package open, the
+        // record was never looked for, so reporting a miss would be a fabricated
+        // negative about the corpus.
+        let source = PackageSource::new();
+        assert!(!source.is_searchable());
+        assert!(matches!(
+            source.probe(&ResourceKey::new(1, 2, 3)),
+            Probe::NoSuchRecord
+        ));
     }
 }

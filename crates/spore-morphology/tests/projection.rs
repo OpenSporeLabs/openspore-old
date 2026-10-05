@@ -306,9 +306,26 @@ fn bounds_come_from_the_geometry_and_not_from_the_rigblock_bounds_box() {
     // `k == 0` rigblock (36 bytes, header only) had an all-zero envelope. It does not:
     // all 1549 rigblocks carry real envelope values, including the part in question,
     // whose envelope is +/-0.05. The rigblock is simply TIGHTER than the geometry it
-    // bounds -- and it is supposed to be. Over the 1320 instances carrying both a
-    // rigblock and a gmsh, geometry spans a median 2.01x the rigblock's half-extent,
-    // and up to 9.3x in the worst case.
+    // bounds -- and it is supposed to be.
+    //
+    // A SECOND correction, and the reason the summary below is a table rather than a
+    // sentence. This comment used to claim a "median 2.01x" over "1320 instances",
+    // measured by a throwaway script that was never committed and cannot be
+    // reproduced. `catalog.rs`'s corpus test now measures four readings of the same
+    // comparison, and NO reading produces 2.01 -- nor is "geometry is systematically
+    // larger" true at the median axis, where it can be ten times SMALLER:
+    //
+    //   geometry / rigblock cell-derived span ............ median 0.633  (n=159)
+    //   geometry / half of the cell-derived span ......... median 1.265  (n=159)
+    //   geometry / rigblock header-declared span ......... median 1.551  (n=171)
+    //   widest axis extent / rigblock widest header ..... median 2.585  max 13.210
+    //
+    // Only the last reproduces the 13.21x this test pins. So the FIX stands -- a
+    // rigblock is a placement-allowance box and not the drawn extent -- but the
+    // justification is "the two measure different things", not a ratio. The four
+    // readings disagree because "the rigblock's size" is genuinely ambiguous, which
+    // is why `catalog::RigblockBounds` carries all of them by name instead of
+    // collapsing them into one number that would read as settled.
     let documents = creator_documents();
     if documents.is_empty() {
         eprintln!("SKIP: no SPORE/Data install");

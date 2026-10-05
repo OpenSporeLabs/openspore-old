@@ -13,6 +13,7 @@
 
 use core::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Environment variable that overrides the workspace root.
 pub const ROOT_ENV: &str = "OPENSPORE_ROOT";
@@ -129,13 +130,33 @@ impl Corpus {
     ///
     /// Returns an error only when the repository's own fixtures are missing,
     /// which is a broken checkout rather than an ordinary state.
+    ///
+    /// # The staging directory is per CALL, not per process
+    ///
+    /// This used to be keyed on the process id alone, which is a real race and
+    /// produced a real intermittent failure: cargo runs a crate's tests as
+    /// concurrent threads inside ONE process, so every test calling
+    /// `synthetic()` shared a staging path. The next caller then executed the
+    /// `remove_dir_all` below and deleted the fixtures out from under a sibling
+    /// that was still comparing them. The symptom was
+    /// `a_fixture_run_produces_no_divergence_except_the_one_the_oracle_gets_wrong`
+    /// failing with "the committed fixtures must exist", which reads like a
+    /// missing checkout and is nothing of the kind -- the checkout was fine and
+    /// the test's own helper had eaten the files.
+    ///
+    /// A process-unique counter is what distinguishes the calls. It is also why
+    /// the counter is an `AtomicU64` and not a plain `static mut`: the tests
+    /// that hit this are exactly the ones running in parallel.
     pub fn synthetic() -> Result<Self, CorpusError> {
+        static CALL: AtomicU64 = AtomicU64::new(0);
         let fixtures = workspace_root().join("tests").join("fixtures");
         let staging = std::env::temp_dir().join(format!(
-            "spore-differential-synthetic-{}",
-            std::process::id()
+            "spore-differential-synthetic-{}-{}",
+            std::process::id(),
+            CALL.fetch_add(1, Ordering::Relaxed),
         ));
-        // A stale directory from a previous run would silently serve old bytes.
+        // A stale directory would silently serve old bytes. Safe now that the path
+        // is unique to this call, so it cannot belong to a concurrent one.
         let _ = std::fs::remove_dir_all(&staging);
         std::fs::create_dir_all(&staging).map_err(|source| CorpusError::Io {
             action: format!("create {}", staging.display()),
