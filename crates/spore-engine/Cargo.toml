@@ -7,6 +7,24 @@ license.workspace = true
 repository.workspace = true
 description = "The OpenSpore runtime: a Bevy application that loads and renders real Spore assets."
 
+[features]
+# Development-only. `brp` adds the Bevy Remote Protocol bridge
+# (`bevy_brp_extras`), which is what `bevy_brp_mcp` drives so a coding agent can
+# inspect and mutate a *running* `openspore`, screenshot it, inject input and
+# shut it down.
+#
+# It is OFF by default and that is the point: enabling it opens an HTTP
+# listener and pulls `bevy_remote` (plus its UI/text/sprite dependencies) into
+# the bevy feature union. Nothing about a debug bridge belongs in a shipped
+# build, and enabling it by feature rather than by an env var keeps it out of
+# the dependency graph of the hermetic `cargo test --workspace`.
+#
+#   cargo run -p spore-engine --features brp -- --placeholder
+#
+# Bumped in lockstep with `bevy_brp_mcp`; both must target the same Bevy minor.
+# See docs/BRP.md.
+brp = ["dep:bevy_brp_extras"]
+
 [dependencies]
 spore-core = { workspace = true }
 spore-assets = { workspace = true }
@@ -14,6 +32,10 @@ spore-gmdl = { workspace = true }
 spore-texture = { workspace = true }
 spore-material = { workspace = true }
 bevy = { workspace = true }
+# Only ever reached through the `brp` feature above. 0.22.8 is the release that
+# targets Bevy 0.19 (see extras/README.md compatibility table); 0.23.x is still
+# `-dev` on the upstream main branch.
+bevy_brp_extras = { version = "0.22.8", optional = true }
 
 # The shipped binary is `openspore`, not `spore-engine`. The crate is the
 # engine; the binary is the game you launch, and every document, CI step and

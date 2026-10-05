@@ -69,6 +69,9 @@ pub mod loader;
 pub mod scene;
 pub mod texture;
 
+#[cfg(feature = "brp")]
+pub mod brp;
+
 pub use loader::{SceneOutcome, SporeAssetPlugin, WorldResources};
 pub use scene::ScenePlugin;
 
@@ -294,6 +297,10 @@ fn base_app(window: WindowOptions) -> App {
         }),
         ..default()
     }));
+    // Development-only, and the one caller of `bevy_remote` in the workspace.
+    // Compiled out entirely unless `--features brp`; see `brp`.
+    #[cfg(feature = "brp")]
+    brp::add(&mut app);
     app
 }
 

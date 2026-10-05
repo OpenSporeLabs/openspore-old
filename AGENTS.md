@@ -54,6 +54,15 @@ crates/spore-engine      the Bevy runtime
 crates/spore-tools       `osptool`, the inspection CLI
 ```
 
+`spore-engine` carries one **off-by-default feature, `brp`**, which adds
+`bevy_brp_extras::BrpExtrasPlugin` so a coding agent can inspect, mutate,
+screenshot, input-drive and shut down a *running* `openspore` over the Bevy
+Remote Protocol. It is off by default so that `bevy_remote` (and the UI /
+text / sprite family Bevy 0.19 already pulls in transitively) never enters the
+hermetic test build's dependency graph. `crates/spore-engine/src/brp.rs` is the
+only file that pulls in the bridge at all — no file imports `bevy_remote`
+itself, since `BrpExtrasPlugin` brings it transitively. See `docs/BRP.md`.
+
 **The load-bearing invariant: everything above `loader` is renderer-agnostic
 and Bevy-free.** `spore-core` … `spore-material`, `spore-creator-core`,
 `spore-rigblock`, `spore-morphology` and
@@ -84,6 +93,16 @@ Real-corpus differential (needs `SPORE/`, slow, `#[ignore]`d by default):
 ```bash
 cargo test -p spore-differential --release -- --ignored --nocapture
 ```
+
+Agent-driven runtime inspection (dev-only; opens a listener on 15702):
+```bash
+cargo install bevy_brp_mcp --version 0.22.8 --locked --root ~/.local
+cargo run -p spore-engine --features brp -- --placeholder
+./tools/brp/smoke.sh                            # launch → inspect → screenshot → shutdown
+```
+`bevy` 0.19.1 pairs with `bevy_brp_extras` / `bevy_brp_mcp` **0.22.8**; bump all
+three together. `docs/BRP.md` is the design, `docs/BRP-SMOKE.md` the verified
+transcript, and the MCP server is registered as `brp` in `opencode.json`.
 
 ### Rust traps (each one cost real debugging time)
 
@@ -131,6 +150,30 @@ cargo test -p spore-differential --release -- --ignored --nocapture
   graded per name by what witnesses them, and an exhaustive 62M-string search is
   expected to produce **29 accidental collisions** — so a single unrepeated hit
   proves nothing. Never re-derive the hash; use `spore_rigblock::vocabulary`.
+
+- **In Bevy 0.19 only ASSET types register for reflection.** `bevy_transform`,
+  `bevy_camera` and `bevy_mesh` contain **zero** `register_type` calls in
+  0.19.1, so `Transform`, `GlobalTransform`, `Visibility` and `Name` are all
+  invisible to BRP: a query for them fails with `Component ... isn't
+  registered or used in the world`, and with `strict: false` it fails
+  **silently as zero rows** — which reads exactly like "the bridge is broken."
+  It is not; `registry.schema` on a live `openspore` returns 112 types and
+  every one is an asset or asset handle. Two more consequences:
+  `world.find_entities_by_name` returns 0 against 241 live entities (OpenSpore
+  also sets no `Name`s), and component-level mutation and `+watch` are
+  unreachable. **A connected bridge and an inspectable app are different
+  claims.** Register the type, or it does not exist as far as BRP is concerned.
+
+- **An *optional* dependency still moves `Cargo.lock` for everyone.** The lock
+  is feature-agnostic, so `bevy_brp_extras`'s exact `image = "=0.25.9"` pin
+  dragged the default build's `image` 0.25.10 → 0.25.9 and `moxcms` 0.8.1 →
+  0.7.11, even though nothing off the `brp` feature compiles it. `image` is
+  used by `bevy_image`, so this is NOT confined to the dev path. Safe here
+  (`bevy_image` wants `^0.25.2`, and `image 0.25.9` + `moxcms 0.7.11` is the
+  pair `image` itself was built against; 1622 tests pass), but an off-by-
+  default feature is **not** automatically lockfile-neutral. Audit
+  `git diff Cargo.lock` for version *changes*, not just additions, whenever a
+  new dependency is optional.
 
 - **A prop record's FIRST container pointer is the part, not its own-instance
   entry.** A block's part lives at the instance named by the *first* validated
@@ -450,6 +493,12 @@ cargo test -p spore-differential --release -- --ignored --nocapture
   -- --preset documented-asset --package SPORE/Data/Spore_Content.package`
   decodes a real Spore record and renders it through Bevy/wgpu/Vulkan. See
   `docs/RUST-ENGINE.md` for the crate graph, the commands and the gotchas.
+- **Runtime inspection**: an agent can drive a *running* `openspore` over BRP
+  (`cargo run -p spore-engine --features brp -- …`), which is verified working
+  end to end — live diagnostics, resource read/mutate, a non-blank screenshot,
+  synthetic `Escape` driving `exit_on_escape`, and a status-0 shutdown. What it
+  is **not** yet is an inspector for OpenSpore's own state: see the reflection
+  trap above. `docs/BRP.md`, `docs/BRP-SMOKE.md`.
 - **C++/research corpus**: see `docs/STATE.md` for the reconstruction phases,
   `docs/MIGRATION.md` for what became what, and `docs/replacement-status.json`
   for per-subsystem status.

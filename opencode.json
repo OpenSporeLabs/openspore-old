@@ -35,6 +35,16 @@
         "tools/mcp/server.py"
       ],
       "enabled": true
+    },
+    "brp": {
+      "type": "local",
+      "command": [
+        "/home/juanr/.local/bin/bevy_brp_mcp"
+      ],
+      "environment": {
+        "PATH": "/home/juanr/.local/bin:/usr/local/bin:/usr/bin:/bin"
+      },
+      "enabled": true
     }
   }
 }
