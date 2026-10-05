@@ -69,11 +69,12 @@ pub const DEFAULT_PORT: u16 = 15702;
 /// end-to-end. It is `#[cfg(feature = "brp")]`-only and changes no product
 /// behaviour.
 ///
-/// Registering OpenSpore's *real* runtime state (`LoadedScene`,
-/// `WorldResources`, `NormalMapPolicy`, `CameraFraming`) would be the useful
-/// follow-up, and it is deliberately not done here: `Reflect` is a
-/// `bevy_reflect` derive, and putting it on domain types is a design decision
-/// about the Bevy-free domain layer, not an infrastructure one.
+/// [`register_openspore_types`] registers OpenSpore's *real* runtime state beside
+/// it -- [`crate::creator::CreatorRuntimeState`] and friends. The reason that
+/// registration lives here rather than in `creator` is the one that matters: this
+/// is the only module in the workspace that talks to the type registry, so the
+/// `brp` feature stays a single `#[cfg]` in one place and `creator` stays a plain
+/// runtime module with no knowledge of a debug bridge.
 #[derive(Resource, Reflect, Default, Debug)]
 #[reflect(Resource)]
 pub struct BrpProbe {
@@ -86,6 +87,49 @@ pub struct BrpProbe {
 /// Keeps [`BrpProbe::frames`] moving, which is what makes it worth watching.
 fn tick_probe(mut probe: ResMut<BrpProbe>) {
     probe.frames = probe.frames.wrapping_add(1);
+}
+
+/// Registers OpenSpore's own runtime types so a query can return rows for them.
+///
+/// # Which types, and which deliberately not
+///
+/// Bevy 0.19 registers **only asset types**, so `world.query` with component or
+/// resource data returns nothing for anything outside `bevy_asset`,
+/// `bevy_material` and friends -- and under `strict: false` it fails *silently as
+/// zero rows*, which reads exactly like "the bridge is broken". So the answer is
+/// not to work around the registry but to give it OpenSpore-owned types that are
+/// genuinely worth reading.
+///
+/// Registered:
+///
+/// | type | why an agent needs it |
+/// |---|---|
+/// | [`crate::creator::CreatorRuntimeState`] | the whole creator scene as one read: document identity, block/resolved/unresolved/visible counts, selection, triangle/vertex/bone totals, `scene_stable`, `frame`, and one row per block **including the ones with no entity** |
+/// | [`crate::creator::CreatorBlockState`] | a per-block row: which records it resolved to, its counts, its provenance grade, and the stage and reason for a block that did not |
+/// | [`crate::creator::CreatorBlockMarker`] | the entity side, so `world.query` can find the block entities and read which one is selected |
+/// | [`crate::creator::CreatorRootMarker`] | the one entity carrying the creature's world transform |
+/// | [`crate::loader::BrpProbe`] | a live counter an agent can read, write and watch, which is the honest demonstration that the read/write path works end to end |
+///
+/// **Not** registered, and not attempted: `Transform`, `GlobalTransform`,
+/// `Visibility` and `Name`. Those live in `bevy_transform`, `bevy_camera` and
+/// `bevy_mesh`, which contain **zero** `register_type` calls in 0.19.1, so they
+/// are invisible to BRP no matter what this module does -- `registry.schema` on a
+/// live `openspore` returns 112 types and every one is an asset or an asset
+/// handle. Registering Bevy's types from here is not possible either: it would
+/// mean upstream crates' decisions becoming this crate's dependency graph.
+/// A connected bridge and an inspectable app are different claims; the second one
+/// needs types OpenSpore owns.
+///
+/// Two further consequences, both recorded in `AGENTS.md`, and both unchanged
+/// here: `world.find_entities_by_name` returns rows only because the creator path
+/// now sets `Name`s (it set none before, which is why it returned 0 against 241
+/// live entities), and component-level mutation and `+watch` remain reachable only
+/// for the types listed above.
+fn register_openspore_types(app: &mut App) {
+    app.register_type::<crate::creator::CreatorRuntimeState>();
+    app.register_type::<crate::creator::CreatorBlockState>();
+    app.register_type::<crate::creator::CreatorBlockMarker>();
+    app.register_type::<crate::creator::CreatorRootMarker>();
 }
 
 /// Adds the BRP bridge to an app that has already had its window configured.
@@ -104,5 +148,6 @@ pub fn add(app: &mut App) {
     app.add_plugins(BrpExtrasPlugin);
     app.init_resource::<BrpProbe>();
     app.register_type::<BrpProbe>();
+    register_openspore_types(app);
     app.add_systems(Update, tick_probe);
 }

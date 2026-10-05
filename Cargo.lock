@@ -4345,6 +4345,7 @@ dependencies = [
  "spore-creator-core",
  "spore-gmdl",
  "spore-material",
+ "spore-morphology",
  "spore-texture",
 ]
 

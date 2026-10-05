@@ -36,6 +36,12 @@ spore-material = { workspace = true }
 # them. The dependency runs one way only: creator-core is Bevy-free and does not
 # know this crate exists.
 spore-creator-core = { workspace = true }
+# The composition layer: a creator document resolved into parts, and the
+# projection that turns that composition into placed geometry. `spore-engine` is
+# the only place that consumes a projection, so this edge runs one way and
+# `spore-morphology` stays Bevy-free (it is the projection's input, not its
+# output). See docs/RUST-ENGINE.md §1.
+spore-morphology = { workspace = true }
 bevy = { workspace = true }
 # Only ever reached through the `brp` feature above. 0.22.8 is the release that
 # targets Bevy 0.19 (see extras/README.md compatibility table); 0.23.x is still

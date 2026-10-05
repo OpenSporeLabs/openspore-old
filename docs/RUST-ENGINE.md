@@ -45,7 +45,16 @@ ends at pixels:
                      ^             part blocks, transforms, paint, validation,
                      |             and the six authoring operations (src/edit.rs)
                      |
-             (projection lives in spore-engine, never here)
+                     +--> spore-rigblock  (from spore-core)
+                     |         bounds, gmsh geometry, RW4 skeleton, bone names
+                     |
+                     +--> spore-morphology (no Bevy)
+                                compose: block -> part, graded per hop
+                                project: one entry per block, always
+                     ^
+                     |
+              spore-engine        the only consumer of a projection
+              (Bevy)
 ```
 
 > **The rule: everything above `loader` is renderer-agnostic and Bevy-free.**
@@ -88,7 +97,7 @@ exception path carry the weaker form on purpose:
 | `spore-texture` | Raster envelope parsing and the DXT5/BC3 block codec. |
 | `spore-assets` | The boundary where Spore data enters the engine: package priority, identity resolution, typed decode, the canonical manifest. |
 | `spore-material` | What a gmdl material id names — and what this build does not know. The narrowest crate in the workspace. |
-| `spore-engine` | The runtime: a Bevy application that loads and renders real Spore assets. |
+| `spore-engine` | The runtime: a Bevy application that loads and renders real Spore assets — both single records and whole `<sporemodel>` creator documents. Depends on `spore-morphology`, one way only. |
 | `spore-tools` | `osptool`, an offline inspector. Library-first, binary-as-shim, so every command is drivable from a test with an in-memory sink. |
 | `spore-creator-core` | The authoring core: Spore's own `<sporemodel>` creator documents (68 of them, six record families), decoded into plain Rust. Depends on `spore-core` and nothing else. See `docs/CREATOR-CORE.md`. |
 | `spore-rigblock` | The part layer: rigblock bounds records (`0x5CAA5E28`), the RW4 `Skeleton (0x70002)` body graph, and the bone-name vocabulary. Also `spore-core` only. |
@@ -116,36 +125,53 @@ cold build was not measured — a clean rebuild would have destroyed the shared
 | command | measured | note |
 |---|---|---|
 | `cargo build --workspace` | `Finished ... in 0.23s` | nothing to do; no-op re-check |
-| `cargo test --workspace` | `0.85s` wall for the whole run, 696 passed / 0 failed / 10 ignored | tests themselves take ~0.1 s |
-| `cargo clippy --workspace --all-targets -- -D warnings` | `Finished ... in 0.31s`, **clean, zero warnings** | no-op re-check; `-D warnings` passes |
-| `cargo fmt --all --check` | **not run here** | it was explicitly out of scope for this pass |
+| `cargo test --workspace` | **1755 passed / 0 failed / 133 ignored** | re-measured 2026-10-05 with `--no-fail-fast`, so the per-crate rows below sum to the headline exactly |
+| `cargo clippy --workspace --all-targets -- -D warnings` | **clean, zero warnings** | includes every integration test target |
+| `cargo fmt --all --check` | **clean** | |
 
 The number that actually matters is the test count, because it is the one you
 can check:
 
 ```
-$ cargo test --workspace
-# 696 passed; 0 failed; 10 ignored  (48 suites)
+$ cargo test --workspace --no-fail-fast
+# 1755 passed; 0 failed; 133 ignored
 ```
 
-Per crate, from `cargo test -p <crate>`:
+Per crate, each measured separately with `cargo test -p <crate> --no-fail-fast`.
+The column sums to the headline, which is the check that the table is a
+measurement and not a transcription:
 
 | crate | passed | ignored |
 |---|---|---|
-| `spore-core` | 24 | 0 |
+| `spore-core` | 35 | 0 |
 | `spore-dbpf` | 109 | 0 |
 | `spore-rw4` | 45 | 0 |
-| `spore-gmdl` | 121 | 0 |
-| `spore-texture` | 71 | 0 |
-| `spore-assets` | 22 | 0 |
-| `spore-material` | 61 | 1 |
-| `spore-engine` | 40 | 0 |
-| `spore-tools` | 203 | 9 |
+| `spore-gmdl` | 145 | 11 |
+| `spore-texture` | 101 | 1 |
+| `spore-assets` | 75 | 10 |
+| `spore-material` | 141 | 10 |
+| `spore-creator-core` | 108 | 21 |
+| `spore-rigblock` | 38 | 9 |
+| `spore-morphology` | 22 | 10 |
+| `spore-cellcontent` | 148 | 8 |
+| `spore-differential` | 95 | 18 |
+| `spore-semantic-bridge` | 159 | 10 |
+| `spore-engine` | **211** | **9** |
+| `spore-tools` | 323 | 16 |
 
-All **10 ignored tests** need the git-ignored `SPORE/` tree and say so in their
+All **133 ignored tests** need the git-ignored `SPORE/` tree and say so in their
 own `#[ignore]` note (`needs SPORE/Data/Spore_Content.package; run with
---ignored`). On a machine with the game installed, run `cargo test --workspace
--- --ignored` to include them.
+--ignored`). On a machine with the game installed:
+
+```bash
+cargo test --workspace --release -- --ignored   # 58 passed / 0 failed
+```
+
+Two of `spore-engine`'s nine ignored tests are `tests/creator_projection.rs`'s
+corpus pair, which need `Spore_Game.package` + `Spore_Graphics.package` (and
+`Spore_Content.package` for the widest scan). They skip cleanly with an `SKIP`
+line when the install is absent, and they assert the corpus figure this document
+quotes: **680 blocks, 678 resolved, 2 unresolved, 678 entities**.
 
 ---
 
@@ -447,6 +473,160 @@ Three consequences:
    decoder is a Sporepedia/editor-preview feature, not a blocker for creature
    rendering, and it should not be built before something that is.
 
+## 3d. A whole creator document, staged as a composition
+
+The vertical slice above stages **records**. A creature the way Spore authored it
+is a *document*: a `<sporemodel>` record naming 680 part placements across 68
+records, each block carrying its own position, scale and orientation, and each
+hanging off a parent block. That is what `--creator` stages.
+
+```bash
+# headless: decode, resolve every block, report, exit
+cargo run -q -p spore-engine -- \
+    --creator 0x2b978c46:0x40626200:0x05e3df13 \
+    --package SPORE/Data/Spore_Game.package \
+    --package SPORE/Data/Spore_Graphics.package \
+    --info
+
+# a window showing the composed creature
+cargo run -q -p spore-engine -- \
+    --creator 0x2b978c46:0x40626200:0x05e3df13 \
+    --package SPORE/Data/Spore_Game.package \
+    --package SPORE/Data/Spore_Graphics.package
+
+# save the authoring data as spore-creator-doc/1, then stage that file back
+cargo run -q -p spore-engine -- --creator 0x2b978c46:0x40626200:0x05e3df13 \
+    --package SPORE/Data/Spore_Game.package \
+    --creator-save /tmp/creature.sporedoc --info
+cargo run -q -p spore-engine -- --creator-doc /tmp/creature.sporedoc \
+    --package SPORE/Data/Spore_Game.package \
+    --package SPORE/Data/Spore_Graphics.package --select-block 3
+```
+
+**Both packages are required, and the reason is a fact about the data.** The
+rigblock bounds records live in `Spore_Game.package`; the `prop` pointer and the
+`0x40606000` part pair live in `Spore_Graphics.package`. A source holding only one
+resolves nothing at the part-pair stage, which reads exactly like a resolver bug
+and is not one. `spore-morphology`'s own `PackageSource` reads whole files with
+`fs::read`; the engine instead adapts the `ContentStore` it has **already mapped**
+(`creator::StoreSource`), so staging a creator costs no second copy of a
+multi-gigabyte package.
+
+### The two paths, and why they are separate modes
+
+| | `--record` / `--preset` | `--creator` |
+|---|---|---|
+| stages | a list of records, placed by hand | one document's own block graph |
+| transform source | `Placement` (a Y rotation by default) | the block's `<position>`/`<scale>`/`<orientation>` |
+| completeness | whole-scene: one bad record fails the run | per-block: a block that does not resolve is **named**, not dropped |
+| report | `OPENSPORE-STAGED v1` + `OPENSPORE-SCENE v1` | `OPENSPORE-CREATOR v1` + one `OPENSPORE-CREATOR-BLOCK v1` per block that did not reach the screen |
+
+Both decode **outside** Bevy (`prepare` and `prepare_creator`), so `--info` never
+constructs a window in either mode.
+
+### The report line
+
+```
+OPENSPORE-CREATOR v1 source=record document=0x2b978c46:0x40626200:0x05e3df13   family=crt (group low bits 0x6200) formatversion=16 blocks=12 resolved=12   unresolved=0 without_geometry=0 visible=12 triangles=1836 vertices=2014   bones=43 depth=5 packages=2 lookups=36 misses=0 read_errors=0
+```
+
+and for a block that did not:
+
+```
+OPENSPORE-CREATOR-BLOCK v1 block=3 parent=none depth=0 resolved=false \
+  stage=rigblock reason=no_such_record
+```
+
+Three numbers in that line are the whole point:
+
+* `unresolved` — blocks that produced no part at all.
+* `without_geometry` — blocks that **resolved** to a part whose `gmsh` record would
+  not decode. Resolved, but nothing on screen, and not the same claim.
+* `visible` — blocks that will actually be spawned. `visible <= resolved <=
+  blocks`, always, and the equality is not assumed anywhere.
+
+Over the shipped corpus that is **680 blocks, 678 resolved, 2 unresolved, 678
+entities** — asserted in `tests/creator_projection.rs`, not asserted here.
+
+### Entities, parentage and orientation
+
+One entity per visible block, plus one root entity carrying the creature's world
+scale (`--scale`). Each block entity carries its block's **local** transform and
+is a child of the entity for its authored parent, so Bevy's own
+`parent_world * child_local` composition produces the projection's
+`world_position` / `world_orientation`. Writing the world transform onto the child
+*and* parenting it would apply the parent chain twice, and the outermost part is
+the only one that would look wrong — so
+`the_composed_world_transform_is_the_projections_world_transform` asserts the
+composed `GlobalTransform`, not the local `Transform`.
+
+A block whose parent did not resolve is parented to the root rather than dropped.
+Its geometry is real and re-parenting is the only placement that is not a claim,
+but its own `world_position` then does not apply — which is why every such block is
+named in the report.
+
+`loader::orientation_to_quat` is the **only** function in the crate that turns an
+`Orientation` into a `Quat`, and it now has two callers (the record path and the
+creator path) because a second copy of a row-major→column-major transpose is a
+second answer to "which way does a rotation face". A `General` orientation reaches
+`Quat::from_mat3` through that transpose; it is never narrowed to a Y rotation.
+
+### The meshes
+
+A part's geometry is a `gmsh` record, not a `gmdl` one, so it does not come in
+through `convert::to_buffers`. It is lifted into the **same** engine-neutral
+`convert::MeshBuffers` and handed to the **same** `convert::to_bevy_mesh`, so
+there is one normal policy, one tangent policy and one index policy in the crate.
+The lift states its absences: `gmsh` has no TEXCOORD element and no NORMAL
+element, so `uvs` and `raw_normal_bytes` are `None` and these meshes genuinely
+have no tangent frame. They are lit by recomputed normals and cannot use a normal
+map, which `convert` logs rather than inventing tangents for.
+
+### The runtime state, and the readiness signal
+
+`CreatorRuntimeState` is the whole scene as one read, and it is what an agent asks
+instead of screenshotting and guessing:
+
+| field | the question it answers |
+|---|---|
+| `document`, `document_source`, `document_family`, `document_format_version` | which document is this, and is the family known or *not*? |
+| `block_count`, `resolved_count`, `unresolved_count` | how much of the document composed |
+| `visible_block_count` | how much is actually on screen (measured after the spawn, never assumed) |
+| `selected_block` | which block is marked |
+| `total_vertices`, `total_triangles`, `total_bones` | the size of what resolved |
+| `max_depth` | how deep the authored forest is |
+| `packages` | how many packages were opened |
+| `scene_stable`, `frame` | **is it ready?** |
+| `blocks[]` | one row per authored block, including the ones with no entity |
+
+`blocks[]` is the part that matters for a partial creature: an unresolved block has
+no entity, so without a row it would be invisible to anything but the log. Each row
+carries its parent's block index, depth, `<blockid>`, the `rw4`/`gmsh` keys it
+resolved to, its counts, the weakest evidence grade on its chain, and — for a block
+that failed — `stop_stage` and `stop_reason`.
+
+`scene_stable` is false until the spawn system has run and true from the first
+`Update` after it, because `Commands::spawn` is deferred and "the app launched" and
+"the app has something on screen" are different claims. Automation polls
+`scene_stable` and `frame`; it does not sleep.
+
+Reflecting that state over BRP, and what deliberately is not reflected, is in
+[`BRP.md`](BRP.md) §"What an agent can read".
+
+### What is deliberately not here
+
+* **Skeletal animation.** A part's body graph decodes and its bones are counted
+  and named where the vocabulary recovers a name, but nothing poses them. Across
+  the 677 bones the creator core actually composes, **every recovered name is
+  `joint1`** — coherent vocabulary, zero use — so an animation system built on it
+  today would be built on nothing.
+* **Selection as an editor.** `--select-block N` tints one block and is readable in
+  the runtime state. There is no click handling, no undo, no re-parenting: the
+  engine still projects a document, it does not edit one.
+* **Texture binding for parts.** The creator path stages `StandardMaterial`s with a
+  neutral debug tint. What a part's own raster records bind is the open texture
+  question `spore-material` already states, and it is not answered here.
+
 ## 4a. Package priority is a product decision, and it is load-bearing
 
 `ContentStore` resolves **first match wins** in the order packages were
@@ -685,6 +865,9 @@ returns a `PrepareOutcome` **before** any `App` exists.
 | what the runtime does and in what order | `crates/spore-engine/src/lib.rs` (crate docs) |
 | the CLI grammar and exit codes | `crates/spore-engine/src/cli.rs` |
 | the `OPENSPORE-STAGED v1` line | `crates/spore-engine/src/loader.rs` (`StagedContent::report_line`) |
+| the `OPENSPORE-CREATOR v1` line and the creator runtime state | `crates/spore-engine/src/creator.rs` |
+| the row-major → column-major transpose, in one place | `crates/spore-engine/src/loader.rs` (`orientation_to_quat`) |
+| what a projection asserts, over the real corpus | `crates/spore-morphology/tests/projection.rs` |
 | the normal policy and fan expansion | `crates/spore-engine/src/convert.rs` |
 | every graded claim about gmdl | `crates/spore-gmdl/src/claims.rs` |
 | every graded claim about textures | `crates/spore-texture/src/claims.rs` |

@@ -217,10 +217,20 @@ impl Projection {
     /// The axis-aligned extent of the projected creature, or `None` when nothing
     /// resolved.
     ///
-    /// Built from each part's **rigblock** envelope placed at the block's world
-    /// position. The rigblock is the part's authored bounds and is orientation-free,
-    /// so this is an extent and not an oriented box — which is the right thing for
-    /// framing a camera, and is stated rather than implied.
+    /// Built from each part's **decoded geometry**, placed at the block's world
+    /// position. NOT from the rigblock envelope, which was the obvious choice and is
+    /// wrong for a third of the parts: a `k == 0` rigblock is a 36-byte header with
+    /// **no cells**, so its envelope is identically zero and contributes a degenerate
+    /// point. Real creature parts hit this — the six blocks of
+    /// `0x2b978c46:0x40626200:0x05e3df13` share one `k == 0` rigblock, and framing on
+    /// it collapsed the camera onto the 0.36-unit authored position span while the
+    /// geometry is far larger. The geometry is the thing that will be drawn, so the
+    /// geometry is what bounds the drawing.
+    ///
+    /// Orientation is **not** applied to the corner offsets. This is an axis-aligned
+    /// extent for framing a camera, not an oriented box, and rotating the corners of
+    /// a box and re-taking the axis-aligned bounds of the result would be a second,
+    /// subtly different answer. Stated rather than implied.
     ///
     /// `None` is a real answer. "No geometry" is not "geometry at the origin", and a
     /// creature that failed to compose must not be framed as though it succeeded.
@@ -230,25 +240,37 @@ impl Projection {
             let Some(part) = block.part.as_ref() else {
                 continue;
             };
-            let rigblock = &part.rigblock;
-            // `max_low` is the HIGH end of the envelope and `min_high` the LOW end;
-            // the axis names read backwards because of the cell convention. See
-            // `Rigblock::max_low`.
-            let lo = [
-                block.world_position.x + rigblock.min_high[0],
-                block.world_position.y + rigblock.min_high[1],
-                block.world_position.z + rigblock.min_high[2],
-            ];
-            let hi = [
-                block.world_position.x + rigblock.max_low[0],
-                block.world_position.y + rigblock.max_low[1],
-                block.world_position.z + rigblock.max_low[2],
-            ];
-            let candidate = Bounds { min: lo, max: hi };
-            out = Some(match out {
-                None => candidate,
-                Some(previous) => previous.union(candidate),
-            });
+            // `continue`, not `?`. A `?` here would abandon the ENTIRE bounds
+            // because one part lacked geometry, reporting a creature as
+            // unframeable when in fact every other part was fine. One part with no
+            // geometry must not erase the others' extent.
+            let Some(geometry) = part.geometry.as_ref() else {
+                continue;
+            };
+            let mut local: Option<Bounds> = None;
+            for position in geometry.positions.iter() {
+                let point = [
+                    block.world_position.x + position[0],
+                    block.world_position.y + position[1],
+                    block.world_position.z + position[2],
+                ];
+                local = Some(match local {
+                    None => Bounds {
+                        min: point,
+                        max: point,
+                    },
+                    Some(previous) => previous.union(Bounds {
+                        min: point,
+                        max: point,
+                    }),
+                });
+            }
+            if let Some(local) = local {
+                out = Some(match out {
+                    None => local,
+                    Some(previous) => previous.union(local),
+                });
+            }
         }
         out
     }

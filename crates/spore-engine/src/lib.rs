@@ -13,6 +13,14 @@
 //!     -> convert       vertex buffers, normal and tangent policy (no GPU)
 //!     -> loader        Assets<Mesh> handles, entity spawn      (Bevy)
 //!     -> bevy_render   wgpu -> Vulkan / Metal / DX12
+//!
+//!   and, for a creator document, one more branch that converges on the same
+//!   two runtime modules:
+//!
+//!     -> spore_creator_core  <sporemodel> XML -> CreatorDocument  (no Bevy)
+//!     -> spore_morphology    block -> part -> Projection          (no Bevy)
+//!     -> creator             one entity per resolved block        (Bevy)
+//!     -> loader/convert      the same mesh conversion, reused
 //! ```
 //!
 //! The split is the architecture, not an accident of file layout.
@@ -49,6 +57,9 @@
 //! * `--record T:G:I --record T:G:I ...` -- many real Spore records in one
 //!   scene, laid out from their own bounds.
 //! * `--creature K --part K ...` -- one creature from one or more records.
+//! * `--creator T:G:I` -- one `<sporemodel>` document, staged as a composition:
+//!   one entity per resolved block, parented as the document nests, with every
+//!   unresolved block reported by name.
 //! * `--info` -- decode and report, then exit. Headless.
 //!
 //! # What is deliberately absent
@@ -64,6 +75,7 @@
 
 pub mod cli;
 pub mod convert;
+pub mod creator;
 pub mod domain;
 pub mod loader;
 pub mod scene;
@@ -72,6 +84,7 @@ pub mod texture;
 #[cfg(feature = "brp")]
 pub mod brp;
 
+pub use creator::{CreatorDecoded, CreatorPlugin, StagedCreator};
 pub use loader::{SceneOutcome, SporeAssetPlugin, WorldResources};
 pub use scene::ScenePlugin;
 
@@ -81,7 +94,7 @@ use bevy::pbr::StandardMaterial;
 use bevy::prelude::*;
 use bevy::window::{PresentMode, WindowResolution};
 
-use cli::{LaunchRequest, SceneRequest, WindowOptions};
+use cli::{CreatorRequest, LaunchRequest, SceneRequest, WindowOptions};
 use loader::{
     CameraFraming, LoadedScene, NormalMapPolicy, PrepareOutcome, DEFAULT_VERTICAL_FOV_DEGREES,
 };
@@ -97,6 +110,7 @@ pub fn main() -> std::process::ExitCode {
         }
         Ok(LaunchRequest::Placeholder(window)) => run_placeholder(window),
         Ok(LaunchRequest::Scene(scene)) => run_scene(scene),
+        Ok(LaunchRequest::Creator(creator)) => run_creator(creator),
         Err(error) => {
             eprintln!("openspore: {error}\n");
             eprint!("{}", cli::usage());
@@ -220,6 +234,105 @@ fn run_scene(scene: SceneRequest) -> std::process::ExitCode {
             std::process::ExitCode::FAILURE
         }
     }
+}
+
+/// Stages one creator document: decode outside Bevy, then either report and exit
+/// or open a window on the projection.
+///
+/// The ordering is the same as [`run_scene`]'s and for the same reason: decoding
+/// is I/O with nothing to do with rendering, so a missing package, an unknown
+/// record type and a document that will not parse all become visible **before** a
+/// window costs anything. `--info` therefore never constructs an `App` at all.
+fn run_creator(request: CreatorRequest) -> std::process::ExitCode {
+    info!(
+        "openspore: creator mode, document={}, scale={}",
+        request.document.as_str(),
+        request.scale
+    );
+
+    let decoded = prepare_creator(&request);
+    for line in decoded.report_lines() {
+        println!("{line}");
+    }
+    let CreatorDecoded::Ready(stage) = decoded else {
+        return std::process::ExitCode::from(cli::EXIT_ASSET as u8);
+    };
+
+    // The save happens before the `--info` exit, because a headless save is the
+    // whole reason the flag exists: it is how "project, save, reload, project
+    // again" gets run against real data.
+    if let Some(path) = &request.save_to {
+        if let Err(error) = creator::save_document(path, &stage.document) {
+            eprintln!("openspore: {error}");
+            return std::process::ExitCode::from(cli::EXIT_ASSET as u8);
+        }
+        println!("OPENSPORE-CREATOR-SAVE v1 path={}", path.display());
+    }
+
+    if request.info_only {
+        return std::process::ExitCode::SUCCESS;
+    }
+
+    let exit = build_creator_app(request.window.clone(), *stage, request).run();
+    match exit {
+        AppExit::Success => std::process::ExitCode::SUCCESS,
+        AppExit::Error(cause) => {
+            error!("render loop exited with an error: {cause}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+/// Decodes a creator request without touching Bevy, the GPU, or a window.
+///
+/// The twin of [`prepare`], and it obeys the same rule: the packages are opened
+/// here, the document is parsed, resolved and projected here, and the app is only
+/// assembled from data that already exists.
+pub fn prepare_creator(request: &CreatorRequest) -> CreatorDecoded {
+    let source = match request.document.to_document_source() {
+        Ok(source) => source,
+        Err(reason) => return CreatorDecoded::Failed(reason),
+    };
+    match creator::load_creator(&source, &request.packages) {
+        Ok(stage) => CreatorDecoded::Ready(Box::new(stage)),
+        Err(error) => CreatorDecoded::Failed(error.to_string()),
+    }
+}
+
+/// Assembles the app that shows one projected creator document.
+///
+/// Three resources and two plugins, in this order:
+///
+/// 1. the projection, which [`CreatorPlugin`]'s `Startup` system spawns from;
+/// 2. the runtime state, so the very first `Update` already has a complete row to
+///    report -- and so an agent that polls before the spawn sees `scene_stable:
+///    false` rather than a missing resource;
+/// 3. the camera framing, which the `PostStartup` system reads, and only when the
+///    projection actually resolved something.
+///
+/// [`ScenePlugin`] still owns the camera. This function spawns none.
+pub fn build_creator_app(
+    window: WindowOptions,
+    stage: creator::CreatorStage,
+    request: CreatorRequest,
+) -> App {
+    let selected = request.select;
+    let state = stage.runtime_state(selected);
+    let framing = stage.camera_framing();
+
+    let mut app = base_app(window);
+    app.insert_resource(StagedCreator {
+        stage,
+        selected,
+        scale: request.scale,
+    });
+    app.insert_resource(state);
+    if let Some(framing) = framing {
+        app.insert_resource(framing);
+    }
+    app.add_plugins((ScenePlugin, CreatorPlugin));
+    app.add_systems(Update, exit_on_escape);
+    app
 }
 
 /// Assembles the placeholder app.

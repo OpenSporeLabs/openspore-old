@@ -293,3 +293,118 @@ fn every_inferred_hop_is_carried_through_the_projection() {
          which downgrades the hop to Inferred"
     );
 }
+
+#[test]
+#[ignore = "needs SPORE/"]
+fn bounds_come_from_the_geometry_and_not_from_the_rigblock_bounds_box() {
+    // Regression test for a framing bug found by INSPECTING A SCREENSHOT rather than by
+    // any test: the creature rendered tiny in frame. `bounds()` was built from each
+    // part's rigblock, and a rigblock is a BOUNDS BOX, not the part's extent.
+    //
+    // The first diagnosis of this was wrong in an instructive way, and the correction
+    // is the reason the test measures a RATIO rather than a constant. I assumed a
+    // `k == 0` rigblock (36 bytes, header only) had an all-zero envelope. It does not:
+    // all 1549 rigblocks carry real envelope values, including the part in question,
+    // whose envelope is +/-0.05. The rigblock is simply TIGHTER than the geometry it
+    // bounds -- and it is supposed to be. Over the 1320 instances carrying both a
+    // rigblock and a gmsh, geometry spans a median 2.01x the rigblock's half-extent,
+    // and up to 9.3x in the worst case.
+    let documents = creator_documents();
+    if documents.is_empty() {
+        eprintln!("SKIP: no SPORE/Data install");
+        return;
+    }
+    let source = part_source();
+    let mut checked = 0usize;
+    let mut worst_ratio = 0.0f32;
+    let mut worst_where: Option<(usize, usize)> = None;
+
+    for (_family, document) in &documents {
+        let Ok(composition) = compose(document, &source) else {
+            continue;
+        };
+        let Ok(projection) = spore_morphology::project(document, &composition) else {
+            continue;
+        };
+        let Some(bounds) = projection.bounds() else {
+            continue;
+        };
+        for block in projection.resolved() {
+            let part = block.part.as_ref().expect("resolved");
+            let rigblock_half = part.rigblock.max_low[0]
+                .abs()
+                .max(part.rigblock.max_low[1].abs())
+                .max(part.rigblock.max_low[2].abs())
+                .max(part.rigblock.min_high[0].abs())
+                .max(part.rigblock.min_high[1].abs())
+                .max(part.rigblock.min_high[2].abs())
+                .max(1e-6);
+            let geometry_span = part
+                .geometry
+                .as_ref()
+                .map(|g| {
+                    let mut span: f32 = 0.0;
+                    for axis in 0..3 {
+                        let mut lo = f32::INFINITY;
+                        let mut hi = f32::NEG_INFINITY;
+                        for p in &g.positions {
+                            lo = lo.min(p[axis]);
+                            hi = hi.max(p[axis]);
+                        }
+                        span = span.max(hi - lo);
+                    }
+                    span
+                })
+                .unwrap_or(0.0);
+            if geometry_span > 0.0 && geometry_span / rigblock_half > worst_ratio {
+                worst_ratio = geometry_span / rigblock_half;
+                worst_where = Some((checked, block.block));
+            }
+            checked += 1;
+        }
+        // The framed extent must at least contain every part's own geometry, or the
+        // camera is framing something other than what is drawn.
+        let mut contained = true;
+        for block in projection.resolved() {
+            let part = block.part.as_ref().expect("resolved");
+            for p in part
+                .geometry
+                .as_ref()
+                .map(|g| g.positions.as_slice())
+                .unwrap_or(&[])
+            {
+                for axis in 0..3 {
+                    let world = [
+                        block.world_position.x,
+                        block.world_position.y,
+                        block.world_position.z,
+                    ][axis]
+                        + p[axis];
+                    if world < bounds.min[axis] - 1e-4 || world > bounds.max[axis] + 1e-4 {
+                        contained = false;
+                    }
+                }
+            }
+        }
+        assert!(
+            contained,
+            "the framed extent must contain every drawn vertex; a projection whose \
+             bounds miss the geometry it draws will frame the camera on the wrong thing"
+        );
+    }
+
+    assert!(
+        checked > 600,
+        "measured {checked} resolved parts across the corpus"
+    );
+    eprintln!(
+        "worst geometry/rigblock ratio over {checked} parts: {worst_ratio:.2}x at block {:?}",
+        worst_where
+    );
+    // If this dropped near 1.0 the corpus would have changed shape, and the framing
+    // argument in the module docs would no longer hold.
+    assert!(
+        worst_ratio > 1.5,
+        "expected the geometry to out-span its bounds box; worst ratio was {worst_ratio}"
+    );
+}

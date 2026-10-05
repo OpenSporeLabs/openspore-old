@@ -190,6 +190,14 @@ impl NormalMapPolicy {
 /// A resource rather than a closure added by the caller: it makes the framing
 /// step a named system a test can drive, instead of a per-app closure no test
 /// can reach.
+///
+/// **Not** `Reflect`, deliberately, and reading it over BRP therefore returns `null`
+/// whether or not it is in the world. That was misread during this work as "the
+/// resource was never inserted" and nearly sent me to fix a framing system that was
+/// fine. A `null` from BRP means "not registered for reflection", never "absent from
+/// the world" -- the same trap as Bevy's own `Transform`, which is invisible to BRP
+/// because `bevy_transform` contains zero `register_type` calls in 0.19.1. Reflecting
+/// this type would make it readable but is not required by anything, so it stays off.
 #[derive(Resource, Debug, Clone, Copy)]
 pub struct CameraFraming {
     /// The box to frame.
@@ -645,32 +653,8 @@ pub fn spawn_scene(
                     .instances()
                     .first()
                     .map_or_else(Transform::default, |instance| {
-                        let translation = Vec3::from(instance.placement.translation);
-                        // The rotation is read off the orientation rather than assumed
-                        // to be a Y rotation. A creator block's `<orientation>` is a
-                        // row-major 3x3 and is not Y-only, so `as_y_rotation` returns
-                        // `None` for it and this falls back to the matrix -- which is
-                        // the case that would silently have produced an upright part
-                        // before. The Y branch stays because every hand-authored
-                        // placement still uses it.
-                        let rotation = match instance.placement.orientation {
-                            Orientation::YRotation(degrees) => {
-                                Quat::from_rotation_y(degrees.to_radians())
-                            }
-                            Orientation::General(m) => {
-                                let [r00, r01, r02, r10, r11, r12, r20, r21, r22] = m.to_array();
-                                // Quat::from_mat3 takes a COLUMN-major basis in
-                                // glam's convention, while the creator format is
-                                // row-major, so the transpose happens here, once,
-                                // explicitly. Getting this wrong mirrors the part
-                                // rather than rotating it, which renders plausibly.
-                                Quat::from_mat3(&bevy::math::Mat3::from_cols_array(&[
-                                    r00, r10, r20, r01, r11, r21, r02, r12, r22,
-                                ]))
-                            }
-                        };
-                        Transform::from_translation(translation)
-                            .with_rotation(rotation)
+                        Transform::from_translation(Vec3::from(instance.placement.translation))
+                            .with_rotation(orientation_to_quat(instance.placement.orientation))
                             .with_scale(Vec3::splat(instance.placement.scale))
                     }),
                 SceneObjectMarker {
@@ -919,6 +903,37 @@ pub fn frame_camera(
         Transform::from_translation(center + direction * distance).looking_at(center, Vec3::Y);
 }
 
+/// Turns an [`Orientation`] into the quaternion a `Transform` carries.
+///
+/// # The transpose, once, in one place
+///
+/// `Quat::from_mat3` takes a **column-major** basis in glam's convention, while
+/// the creator save format spells `<orientation>` as three **rows**. So the
+/// transpose happens here, explicitly, and this is the only function in the crate
+/// that does it.
+///
+/// It is a function rather than an inline match because two callers now need it —
+/// the record path above and the creator projection in [`crate::creator`] — and a
+/// second copy of a transpose is a second answer to "which way does a rotation
+/// face". Getting it backwards mirrors a part instead of rotating it, which
+/// renders plausibly and is exactly the kind of defect a screenshot cannot catch.
+///
+/// The `YRotation` branch stays because every hand-authored placement still uses
+/// it, and because it is a *stronger* claim than the matrix: it says the author
+/// wrote a Y rotation. Collapsing a `General` to one would throw away exactly the
+/// information a creator block carries.
+pub fn orientation_to_quat(orientation: Orientation) -> Quat {
+    match orientation {
+        Orientation::YRotation(degrees) => Quat::from_rotation_y(degrees.to_radians()),
+        Orientation::General(m) => {
+            let [r00, r01, r02, r10, r11, r12, r20, r21, r22] = m.to_array();
+            Quat::from_mat3(&bevy::math::Mat3::from_cols_array(&[
+                r00, r10, r20, r01, r11, r21, r02, r12, r22,
+            ]))
+        }
+    }
+}
+
 /// Turns a loader failure into something a person can act on.
 pub fn describe(error: &AssetError) -> String {
     match error {
@@ -1137,6 +1152,47 @@ mod tests {
         let mut transform = Transform::default();
         frame_camera(&mut transform, ([0.0; 3], [0.0; 3]), 60.0);
         assert!(transform.translation.is_finite());
+    }
+
+    #[test]
+    fn the_row_major_transpose_is_the_only_place_a_rotation_is_built() {
+        // A right-handed 90-degree rotation about +Z, written ROW-major as the
+        // creator format spells it: R_z(90) applied to +X is +Y, so row 0 is
+        // (0,-1,0). A matrix whose transpose has the same property is a rotation
+        // by -90, and building the quaternion from it would silently un-rotate
+        // every part in the corpus.
+        let row_major = spore_core::Matrix3 {
+            row0: [0.0, -1.0, 0.0],
+            row1: [1.0, 0.0, 0.0],
+            row2: [0.0, 0.0, 1.0],
+        };
+        let rotation = orientation_to_quat(Orientation::General(row_major));
+        let axis = Vec3::X;
+        let expected = axis.rotate_z(core::f32::consts::FRAC_PI_2);
+        assert!(
+            (rotation * axis - expected).length() < 1e-5,
+            "+X must map to {expected:?}, not {:?}; a rotation built without the transpose \
+             mirrors the part rather than rotating it",
+            rotation * axis
+        );
+        // And the basis is orthonormal, so `from_mat3` had a real rotation to read.
+        assert!(rotation.is_normalized());
+    }
+
+    #[test]
+    fn a_y_rotation_orientation_is_not_narrowed_through_the_matrix() {
+        // The `YRotation` arm is a stronger claim, not a fallback, and it must stay
+        // reachable: `as_y_rotation` on the *matrix* would accept this, and the
+        // 0-degree case is exactly where a `-sin(0.0) = -0.0` bit comparison goes
+        // wrong. See `spore_core::Orientation::is_y_rotation`.
+        let zero = orientation_to_quat(Orientation::YRotation(0.0));
+        assert_eq!(zero, Quat::IDENTITY);
+        let quarter = orientation_to_quat(Orientation::YRotation(90.0));
+        assert!(
+            (quarter * Vec3::Z - Vec3::X).length() < 1e-5,
+            "right-handed +90 about Y takes +Z to +X, got {:?}",
+            quarter * Vec3::Z
+        );
     }
 
     #[test]

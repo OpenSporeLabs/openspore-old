@@ -78,3 +78,8 @@ tools/mcp/cache/
 
 # --- Ghidra/community analysis exports (durable, git-ignored) ---
 .spore-analysis/
+
+# Launch logs carry absolute paths and machine-specific timestamps; the evidence a
+# run establishes is the structured JSON and the screenshot, both committed under
+# work/experiments/. The log itself is kept locally at /tmp/opencode/.
+work/experiments/*/launch.log

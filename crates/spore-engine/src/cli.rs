@@ -50,8 +50,82 @@ pub enum LaunchRequest {
     /// Load Spore records and show them.
     Scene(SceneRequest),
 
+    /// Load one `<sporemodel>` creator document and stage its projection.
+    ///
+    /// A **separate** mode rather than a flag on [`SceneRequest`], because the two
+    /// stage different things: a scene is a list of *records* placed by hand, and
+    /// a creator document is a *composition* of parts whose transforms come from
+    /// the document. One of them can fail partially and must say so per block; the
+    /// other fails whole. Mixing them would give a caller two completeness
+    /// vocabularies and no way to tell which applied.
+    Creator(CreatorRequest),
+
     /// Print the usage text and exit successfully.
     Help,
+}
+
+/// A request to stage one creator document.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreatorRequest {
+    /// Packages in resolution order. Earlier wins.
+    ///
+    /// A part spans two of them -- the rigblock bounds live in
+    /// `Spore_Game.package`, the `prop` pointer and the `0x40606000` pair in
+    /// `Spore_Graphics.package` -- so a source holding only one resolves nothing
+    /// and looks like a resolver bug. Name both.
+    pub packages: Vec<PathBuf>,
+    /// The document to stage.
+    pub document: CreatorSource,
+    /// Where to write the document as `spore-creator-doc/1`.
+    ///
+    /// Orthogonal to `--info`: a headless run that saves is the whole point of the
+    /// flag, so the file is written before the early exit.
+    pub save_to: Option<PathBuf>,
+    /// The block to mark as selected, or `None`.
+    pub select: Option<usize>,
+    /// A world-space uniform scale applied to the whole creature.
+    pub scale: f32,
+    /// Window sizing and title.
+    pub window: WindowOptions,
+    /// Print what was loaded and exit without opening a window.
+    pub info_only: bool,
+}
+
+/// Which creator document to stage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CreatorSource {
+    /// A `<sporemodel>` record in one of `--package`.
+    ///
+    /// The authoring family is derived from the record's own type word, not from a
+    /// flag: a document's grammar is family-specific, so a wrong guess parses into
+    /// the wrong shape rather than failing.
+    Record(ResourceKey),
+    /// A `spore-creator-doc/1` file, as written by `--creator-save`.
+    SavedFile(PathBuf),
+}
+
+impl CreatorSource {
+    /// A one-word label for a report line.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Record(_) => "record",
+            Self::SavedFile(_) => "saved-file",
+        }
+    }
+
+    /// The engine-level source this request means.
+    ///
+    /// `DocumentSource::for_record` refuses a type id that is not one of the six
+    /// authoring families, so an unknown `--creator` value fails as a *data* error
+    /// with the type word in the message rather than as a usage error.
+    pub fn to_document_source(&self) -> Result<crate::creator::DocumentSource, String> {
+        match self {
+            Self::Record(key) => {
+                crate::creator::DocumentSource::for_record(*key).map_err(|error| error.to_string())
+            }
+            Self::SavedFile(path) => Ok(crate::creator::DocumentSource::SavedFile(path.clone())),
+        }
+    }
 }
 
 /// Window sizing and title.
@@ -307,6 +381,20 @@ pub enum CliError {
     OrphanPart,
     /// `--sporemodel` was given more than once.
     RepeatedSporemodel,
+    /// A creator flag was used with a mode that cannot honour it.
+    CreatorModeConflict {
+        /// The creator flag that was given.
+        flag: &'static str,
+        /// The flag or mode it conflicts with, named so the fix is in the message.
+        other: &'static str,
+    },
+    /// A creator-only flag was given without `--creator` or `--creator-doc`.
+    OrphanCreatorFlag {
+        /// The flag as the user typed it.
+        flag: String,
+        /// What it needs.
+        needs: &'static str,
+    },
 }
 
 impl std::fmt::Display for CliError {
@@ -332,6 +420,15 @@ impl std::fmt::Display for CliError {
                 "`--sporemodel` may be given once: it names the colour source for the whole scene, \
                  and a second value would silently win by flag order"
             ),
+            Self::CreatorModeConflict { flag, other } => write!(
+                f,
+                "`{flag}` cannot be combined with `{other}`: a creator document is staged on \
+                 its own, with its own completeness report, and merging the two would leave a \
+                 caller unable to tell which one it got"
+            ),
+            Self::OrphanCreatorFlag { flag, needs } => {
+                write!(f, "`{flag}` needs {needs}")
+            }
         }
     }
 }
@@ -399,6 +496,32 @@ pub fn usage() -> String {
          \x20   --placeholder        Show the built-in mesh with no game data at all\n\
          \x20   -h, --help           Print this text\n\
          \n\
+         CREATOR MODE -- one <sporemodel> document, staged as a composition:\n\
+         \x20   --creator <T:G:I>    The creator document record to stage, e.g.\n\
+         \x20                       0x2b978c46:0x40626200:0x05e3df13. The authoring family\n\
+         \x20                       (crt/cll/vcl/ufo/bld/flr) is read from the record's\n\
+         \x20                       own type id; a type id this build does not know is\n\
+         \x20                       refused rather than guessed. Cannot be combined\n\
+         \x20                       with --record/--preset/--creature/--placeholder,\n\
+         \x20                       which stage records instead.\n\
+         \x20   --creator-doc <PATH> Stage a previously saved creator document\n\
+         \x20                       (spore-creator-doc/1) instead of a record. The\n\
+         \x20                       format carries no type word, so the family is\n\
+         \x20                       reported as `unknown` rather than inferred.\n\
+         \x20   --creator-save <PATH>\n\
+         \x20                       Write the document to PATH as\n\
+         \x20                       spore-creator-doc/1. Written even with --info.\n\
+         \x20   --select-block <N>   Mark block N as selected; it is tinted, and the\n\
+         \x20                       selection is readable in the runtime state.\n\
+         \n\
+         A creator part spans TWO packages: the rigblock bounds live in\n\
+         Spore_Game.package and the prop pointer plus the 0x40606000 pair in\n\
+         Spore_Graphics.package, so name both or nothing resolves.\n\
+         \n\
+         Every block is reported. One that did not resolve spawns nothing and\n\
+         is named on its own OPENSPORE-CREATOR-BLOCK line with the stage it\n\
+         stopped at and why, so a partial creature is never a whole one.\n\
+         \n\
          EXIT CODES:\n\
          \x20   0  ok            2  bad command line ({EXIT_USAGE})   3  asset unavailable ({EXIT_ASSET})\n",
         gap = DEFAULT_GAP,
@@ -429,6 +552,9 @@ fn parse_vec(args: &[String]) -> Result<LaunchRequest, CliError> {
     let mut layout = Layout::Row;
     let mut spacing = DEFAULT_GAP;
     let mut flip_normal_y = false;
+    let mut creator: Option<CreatorSource> = None;
+    let mut creator_save: Option<PathBuf> = None;
+    let mut select_block: Option<usize> = None;
 
     let mut index = 0usize;
     while index < args.len() {
@@ -558,6 +684,41 @@ fn parse_vec(args: &[String]) -> Result<LaunchRequest, CliError> {
             "--info" => info_only = true,
             "--texture" => textured = true,
             "--flip-normal-y" => flip_normal_y = true,
+            "--creator" => {
+                // One value for the whole run, like `--sporemodel`: two creator
+                // documents on one stage would need a completeness report per
+                // document, and there is exactly one projection.
+                let raw = value_for("--creator")?;
+                if creator.is_some() {
+                    return Err(CliError::CreatorModeConflict {
+                        flag: "--creator",
+                        other: "--creator",
+                    });
+                }
+                creator = Some(CreatorSource::Record(parse_key("--creator", &raw)?));
+            }
+            "--creator-doc" => {
+                let raw = value_for("--creator-doc")?;
+                if creator.is_some() {
+                    return Err(CliError::CreatorModeConflict {
+                        flag: "--creator-doc",
+                        other: "--creator",
+                    });
+                }
+                creator = Some(CreatorSource::SavedFile(PathBuf::from(raw)));
+            }
+            "--creator-save" => {
+                creator_save = Some(PathBuf::from(value_for("--creator-save")?));
+            }
+            "--select-block" => {
+                let raw = value_for("--select-block")?;
+                let parsed: usize = raw.parse().map_err(|_| CliError::BadValue {
+                    flag: "--select-block".into(),
+                    value: raw.clone(),
+                    expected: "a block index",
+                })?;
+                select_block = Some(parsed);
+            }
             "--assumed-texture-type" => {
                 let raw = value_for("--assumed-texture-type")?;
                 // `spore_core::parse_id`, not `u32::from_str`: the latter rejects
@@ -575,6 +736,12 @@ fn parse_vec(args: &[String]) -> Result<LaunchRequest, CliError> {
     }
 
     if !objects.is_empty() {
+        if let Some(creator_flag) = creator_flag_of(&creator) {
+            return Err(CliError::CreatorModeConflict {
+                flag: creator_flag,
+                other: "--record",
+            });
+        }
         if window.title == WindowOptions::default().title {
             window.title = format!("OpenSpore - {} object(s)", objects.len());
         }
@@ -597,9 +764,52 @@ fn parse_vec(args: &[String]) -> Result<LaunchRequest, CliError> {
     // but not what to show. Guessing a "nice" record here would hide a typo
     // behind a plausible picture, so it is a usage error.
     if placeholder {
+        if let Some(creator_flag) = creator_flag_of(&creator) {
+            return Err(CliError::CreatorModeConflict {
+                flag: creator_flag,
+                other: "--placeholder",
+            });
+        }
         return Ok(LaunchRequest::Placeholder(window));
     }
+    if let Some(document) = creator {
+        if window.title == WindowOptions::default().title {
+            window.title = "OpenSpore - creator".to_owned();
+        }
+        return Ok(LaunchRequest::Creator(CreatorRequest {
+            packages,
+            document,
+            save_to: creator_save,
+            select: select_block,
+            scale,
+            window,
+            info_only,
+        }));
+    }
+    // A creator-only flag with no creator document is a typo, not a default: the
+    // block it names has no meaning without the document it belongs to.
+    if creator_save.is_some() {
+        return Err(CliError::OrphanCreatorFlag {
+            flag: "--creator-save".into(),
+            needs: "--creator <T:G:I> or --creator-doc <PATH>",
+        });
+    }
+    if select_block.is_some() {
+        return Err(CliError::OrphanCreatorFlag {
+            flag: "--select-block".into(),
+            needs: "--creator <T:G:I> or --creator-doc <PATH>",
+        });
+    }
     Err(CliError::NoRecordRequested)
+}
+
+/// The flag a creator source came from, for a conflict message that names it.
+fn creator_flag_of(creator: &Option<CreatorSource>) -> Option<&'static str> {
+    match creator {
+        Some(CreatorSource::Record(_)) => Some("--creator"),
+        Some(CreatorSource::SavedFile(_)) => Some("--creator-doc"),
+        None => None,
+    }
 }
 
 fn parse_key(flag: &str, raw: &str) -> Result<ResourceKey, CliError> {

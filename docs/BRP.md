@@ -42,7 +42,8 @@ one version, no duplicates.
 | File | Change |
 |---|---|
 | `crates/spore-engine/Cargo.toml` | new `brp` feature; `bevy_brp_extras` as an **optional** dep |
-| `crates/spore-engine/src/brp.rs` | **new** — the isolated bridge module |
+| `crates/spore-engine/src/brp.rs` | **new** — the isolated bridge module; later extended with `register_openspore_types` |
+| `crates/spore-engine/src/creator.rs` | `Reflect` derives on the creator runtime state and block marker, so they are visible to the bridge |
 | `crates/spore-engine/src/lib.rs` | `pub mod brp` (cfg-gated) + a 3-line `brp::add(&mut app)` in `base_app` |
 | `tools/brp/mcp_call.py` | **new** — minimal stdio MCP client used by the smoke test |
 | `tools/brp/smoke.sh` | **new** — the reproducible smoke test |
@@ -54,7 +55,10 @@ That is the whole footprint. In particular:
 
 * **No domain crate gained a dependency.** `spore-core` … `spore-morphology`
   are untouched; the load-bearing "everything above `loader` is Bevy-free"
-  invariant is intact.
+  invariant is intact. The creator types that carry `Reflect` live in
+  `spore-engine`, which is the Bevy crate by definition — `Reflect` is a
+  `bevy_reflect` derive, and putting it on a domain type would make the
+  Bevy-free layer depend on Bevy.
 * **The default build is byte-identical in dependency terms.**
   `cargo tree -p spore-engine -e normal | grep -c brp` → `0`.
 
@@ -69,11 +73,11 @@ never uses. A feature removes it from the graph entirely, so
 
 ### Why `base_app` and not per-mode
 
-`--placeholder` and `--record …` are separate launch paths. Adding the plugin
-in the shared assembly point means every windowed mode is reachable identically
-— an agent does not have to know which mode it launched. `--info` still never
-gets there: that path returns before an `App` is constructed, so the headless
-CI gate cannot accidentally open a listener.
+`--placeholder`, `--record …` and `--creator …` are separate launch paths. Adding
+the plugin in the shared assembly point means every windowed mode is reachable
+identically — an agent does not have to know which mode it launched. `--info`
+still never gets there: that path returns before an `App` is constructed, so the
+headless CI gate cannot accidentally open a listener.
 
 ### Port selection
 
@@ -95,6 +99,12 @@ cargo run -p spore-engine --features brp -- --placeholder
 # …or the real vertical slice
 cargo run -p spore-engine --features brp -- \
     --preset documented-asset --package SPORE/Data/Spore_Content.package
+
+# …or a whole creator document, which is the mode that has runtime state to read
+cargo run -p spore-engine --features brp -- \
+    --creator 0x2b978c46:0x40626200:0x05e3df13 \
+    --package SPORE/Data/Spore_Game.package \
+    --package SPORE/Data/Spore_Graphics.package
 ```
 
 Optional: `BRP_EXTRAS_PORT=9000` moves the listener.
@@ -125,6 +135,89 @@ components and resources), `rpc.discover`, and the hierarchy and event tools
 `bevy_brp_mcp` adds the agent-facing wrappers — `brp_launch`, `brp_list_bevy`,
 `world_find_entities_by_name`, `world_get_components_watch`, `read_log`,
 `brp_type_guide` — plus `brp_list_agent_tools` for app-published methods.
+
+---
+
+## What an agent can read
+
+### The types that are registered, and the ones that cannot be
+
+`brp.rs` is the only module in the workspace that talks to Bevy's
+`AppTypeRegistry`, and it registers **OpenSpore-owned** types only:
+
+| type | what it answers |
+|---|---|
+| `creator::CreatorRuntimeState` (resource) | the whole creator scene: document identity and family, block / resolved / unresolved / **visible** counts, selection, vertex / triangle / bone totals, `max_depth`, package count, `scene_stable`, `frame`, and `blocks[]` — one row per authored block |
+| `creator::CreatorBlockState` | a per-block row: parent index, depth, `<blockid>`, the `rw4` / `gmsh` keys, counts, weakest evidence grade, and `stop_stage` / `stop_reason` for a block that did not resolve |
+| `creator::CreatorBlockMarker` (component) | the entity side: which block this entity is, its parent and depth, and whether it is the selection |
+| `creator::CreatorRootMarker` (component) | the one entity carrying the creature's world transform |
+| `brp::BrpProbe` (resource) | the live counter this integration was built around |
+
+`blocks[]` is the reason `CreatorRuntimeState` is worth reading at all. A block
+that failed to resolve **spawns nothing** — there is no empty mesh standing in for
+it — so an agent looking at entities alone would see a smaller creature and no
+explanation. The row is the explanation, and it is there whether or not the block
+reached the screen.
+
+### The reflection trap, restated because it is still the trap
+
+**In Bevy 0.19 only asset types register themselves.** `bevy_transform`,
+`bevy_camera` and `bevy_mesh` contain **zero** `register_type` calls, so
+`Transform`, `GlobalTransform`, `Visibility` and `Name` are invisible to BRP. A
+`world.query` for one of them fails with
+
+```
+Component ... isn't registered or used in the world
+```
+
+and under `strict: false` it fails **silently as zero rows**, which reads exactly
+like "the bridge is broken". It is not. On a live `openspore`,
+`registry.schema` returns 112 types and every one is an asset or an asset handle.
+
+So this integration does **not** try to register Bevy's types, and there is no way
+to: it would mean upstream crates' decisions becoming this crate's dependency
+graph. **A connected bridge and an inspectable app are different claims**, and the
+second one is satisfied by types OpenSpore owns. The consequence is that a block's
+*position* is not readable per entity over BRP — read `world_position` from
+`CreatorRuntimeState.blocks` instead, which is the same value and is stated.
+
+### Names
+
+The creator path sets `Name`s: `creator.root` and `creator.block.<index>`. This is
+only about **addressability** — `world_find_entities_by_name` returned 0 against
+241 live entities before this, because OpenSpore set none. A `Name` is not
+reflected, so it cannot be *read* as component data; use
+`CreatorBlockMarker.block` for that.
+
+### Readiness: poll, do not sleep
+
+`CreatorRuntimeState.scene_stable` is `false` until the spawn system has run, and
+`frame` counts `Update`s. An agent should poll both rather than
+`sleep 2 and hope`:
+
+```
+1. brp_launch --features brp -- --creator 0x2b978c46:0x40626200:0x05e3df13 ...
+2. poll world.get on CreatorRuntimeState until scene_stable == true and frame > 0
+3. read the counts; a resolved_count below block_count is a partial creature, and
+   blocks[] names every block that is missing
+4. brp_extras/screenshot
+5. mutate CreatorRuntimeState.selected_block to move the selection
+6. brp_extras/shutdown
+```
+
+Step 5 is a real capability rather than a demo: the resource is `Reflect`, so
+BRP can write `selected_block` and the next frame's spawn colours the block. (The
+spawn reads the selection once, at `Startup`; re-tinting after a mutation is not
+wired up yet — see *Limitations*.)
+
+### Non-BRP modes
+
+`LoadedScene`, `WorldResources`, `NormalMapPolicy` and `CameraFraming` are **not**
+registered. They belong to the record-staging path, they hold Bevy asset handles
+and `Arc`s, and reflecting them would mean `Reflect` derives on the Bevy-free
+domain layer for the benefit of a debug bridge. The creator state was reflected
+because it is plain data with no handles, and because a partial creature has to be
+reportable.
 
 ---
 
@@ -202,13 +295,22 @@ Recorded honestly; see `docs/BRP-SMOKE.md` for the transcript.
   when `brp` is on. `base_app` needs a window, and per the trap already
   documented in `AGENTS.md`, "the app assembles" is not a headless-testable
   claim. The smoke test is the check.
-* **The useful follow-up is reflection, not more tooling.** Registering
-  OpenSpore's real runtime state (`LoadedScene`, `WorldResources`,
-  `NormalMapPolicy`, `CameraFraming`) and giving spawned entities `Name`s is
-  what turns this from "the bridge connects" into "the bridge can see and drive
-  OpenSpore". It needs `Reflect` derives on domain types, which is a design
-  decision about the Bevy-free domain layer and so was left alone here. The
-  measurement behind that recommendation is in `docs/BRP-SMOKE.md`.
+* **Reflection now covers the creator path, and only the creator path.**
+  `CreatorRuntimeState`, `CreatorBlockState`, `CreatorBlockMarker` and
+  `CreatorRootMarker` are registered, and creator entities carry `Name`s — see
+  *What an agent can read*. The record-staging types (`LoadedScene`,
+  `WorldResources`, `NormalMapPolicy`, `CameraFraming`) are still not registered,
+  deliberately: they hold asset handles and `Arc`s, and reflecting them would put
+  `Reflect` on the Bevy-free domain layer for the benefit of a debug bridge.
+* **Moving the selection does not re-tint an already-spawned creature.** The
+  spawn system reads `selected` once, in `Startup`. A BRP write to
+  `CreatorRuntimeState.selected_block` updates the reported selection but not the
+  already-created material. Making the tint follow the selection is a small change
+  (a system that rewrites `MeshMaterial3d` for the marked entity); it is not done.
+* **Per-entity world transforms are still not readable.** `Transform` and
+  `GlobalTransform` are unregistered in Bevy 0.19 and cannot be registered from
+  here, so an agent reads positions from `CreatorRuntimeState.blocks` rather than
+  from each entity's `GlobalTransform`.
 * **Moving the integration to a separate workspace** would stop
   `bevy_brp_extras`'s `=0.25.9` pin from moving `image`/`moxcms` in this
   lockfile. See the section above.
