@@ -31,6 +31,11 @@ spore-assets = { workspace = true }
 spore-gmdl = { workspace = true }
 spore-texture = { workspace = true }
 spore-material = { workspace = true }
+# The authoring source of truth. `spore-engine` is the runtime projection of a
+# `CreatorDocument`, so it reads that document's own types rather than restating
+# them. The dependency runs one way only: creator-core is Bevy-free and does not
+# know this crate exists.
+spore-creator-core = { workspace = true }
 bevy = { workspace = true }
 # Only ever reached through the `brp` feature above. 0.22.8 is the release that
 # targets Bevy 0.19 (see extras/README.md compatibility table); 0.23.x is still

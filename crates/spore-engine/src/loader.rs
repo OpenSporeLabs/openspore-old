@@ -40,7 +40,7 @@ use spore_core::ResourceKey;
 
 use crate::convert::{self, NormalMode};
 use crate::domain::materials::{MaterialRoute, MeshMaterialPlan, ModelMaterials};
-use crate::domain::model::{DecodeStatus, ModelDefinition, ModelInstance};
+use crate::domain::model::{DecodeStatus, ModelDefinition, ModelInstance, Orientation};
 use crate::domain::paint::{self, PaintBinding};
 use crate::domain::scene::{Layout, ObjectExtent, Scene};
 use crate::domain::world::ResourceWorld;
@@ -645,10 +645,32 @@ pub fn spawn_scene(
                     .instances()
                     .first()
                     .map_or_else(Transform::default, |instance| {
-                        Transform::from_translation(Vec3::from(instance.placement.translation))
-                            .with_rotation(Quat::from_rotation_y(
-                                instance.placement.rotation_y_degrees.to_radians(),
-                            ))
+                        let translation = Vec3::from(instance.placement.translation);
+                        // The rotation is read off the orientation rather than assumed
+                        // to be a Y rotation. A creator block's `<orientation>` is a
+                        // row-major 3x3 and is not Y-only, so `as_y_rotation` returns
+                        // `None` for it and this falls back to the matrix -- which is
+                        // the case that would silently have produced an upright part
+                        // before. The Y branch stays because every hand-authored
+                        // placement still uses it.
+                        let rotation = match instance.placement.orientation {
+                            Orientation::YRotation(degrees) => {
+                                Quat::from_rotation_y(degrees.to_radians())
+                            }
+                            Orientation::General(m) => {
+                                let [r00, r01, r02, r10, r11, r12, r20, r21, r22] = m.to_array();
+                                // Quat::from_mat3 takes a COLUMN-major basis in
+                                // glam's convention, while the creator format is
+                                // row-major, so the transpose happens here, once,
+                                // explicitly. Getting this wrong mirrors the part
+                                // rather than rotating it, which renders plausibly.
+                                Quat::from_mat3(&bevy::math::Mat3::from_cols_array(&[
+                                    r00, r10, r20, r01, r11, r21, r02, r12, r22,
+                                ]))
+                            }
+                        };
+                        Transform::from_translation(translation)
+                            .with_rotation(rotation)
                             .with_scale(Vec3::splat(instance.placement.scale))
                     }),
                 SceneObjectMarker {

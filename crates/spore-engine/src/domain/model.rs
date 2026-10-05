@@ -227,17 +227,207 @@ impl ModelDefinition {
     }
 }
 
+/// How a placement's orientation is spelled.
+///
+/// This is an enum rather than a bare `Matrix3` because the two spellings carry
+/// different amounts of truth, and collapsing them loses the difference in both
+/// directions:
+///
+/// * `YRotation` says the orientation *is* a rotation about one axis. A caller that
+///   picks it is making a claim.
+/// * `General` says a row-major 3x3 must survive verbatim, which is what a creator
+///   block's `<orientation>` actually is.
+///
+/// The failure this prevents is a general orientation silently degraded to a Y
+/// rotation, or a Y rotation widened into a matrix that happens to be one. The
+/// first loses orientation; the second invents it. [`Orientation::as_y_rotation`]
+/// returning `None` for a genuinely non-Y matrix is what keeps them apart.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Orientation {
+    /// A rotation about +Y, in degrees. What every hand-authored placement means.
+    YRotation(f32),
+    /// A row-major 3x3, exactly as the creator save format spells it.
+    ///
+    /// Row-major: `row[i][j]` multiplies `basis[j]`. Three rows of three numbers,
+    /// unchanged.
+    General(spore_creator_core::document::Matrix3),
+}
+
+impl Default for Orientation {
+    /// Identity as a Y rotation of zero.
+    ///
+    /// Defaulting to `General(IDENTITY)` would be numerically identical and
+    /// structurally misleading: it would make an unspecified orientation look like
+    /// a deliberately chosen matrix.
+    fn default() -> Self {
+        Self::YRotation(0.0)
+    }
+}
+
+impl Orientation {
+    /// The row-major 3x3 this orientation denotes.
+    pub fn as_matrix(&self) -> spore_creator_core::document::Matrix3 {
+        match self {
+            Self::YRotation(degrees) => y_rotation_matrix(*degrees),
+            Self::General(m) => *m,
+        }
+    }
+
+    /// Reads the orientation out of a creator block's transform.
+    ///
+    /// Always `General`. A creator block's `<orientation>` is a row-major 3x3, and
+    /// narrowing it would discard information the document demonstrably carries.
+    /// The Y-only spelling is for hand-authored placements, not for decoding.
+    pub fn from_transform(transform: &spore_creator_core::document::BlockTransform) -> Self {
+        Self::General(transform.orientation)
+    }
+
+    /// Whether this orientation is exactly a rotation about +Y.
+    ///
+    /// Tested on the matrix, not the variant, so a `General` that happens to *be* a
+    /// Y rotation reports `true` and can be reported as one without lying. Bit
+    /// comparisons throughout, so `-0.0 != 0.0` and no denormal passes as exact.
+    ///
+    /// A zero angle is the interesting case: the identity is a Y rotation about any
+    /// axis, so `row0[2]` and `row2[0]` are both zero and the "is it non-zero" test
+    /// cannot see it. Identity is therefore handled explicitly rather than by
+    /// falling out of the general test.
+    pub fn is_y_rotation(&self) -> bool {
+        let m = self.as_matrix();
+        // NUMERIC equality, deliberately, unlike `CreatorDocument`'s bitwise
+        // comparison. Those answer different questions: for an authored document,
+        // `-0.0` vs `0.0` is an authoring distinction worth preserving byte for
+        // byte. Here the matrix came out of a sine and a cosine, where
+        // `-sin(0.0)` is `-0.0` and denotes exactly the same rotation as `0.0`.
+        // Comparing bits rejected a legitimate zero-degree rotation, which is a
+        // false negative that reads as "not a Y rotation" -- and would have made a
+        // hand-authored zero rotation behave differently from an equivalent
+        // decoded one.
+        let zero = |v: f32| v == 0.0;
+        let one = |v: f32| v == 1.0;
+        let is_identity = one(m.row0[0])
+            && zero(m.row0[1])
+            && zero(m.row0[2])
+            && zero(m.row1[0])
+            && one(m.row1[1])
+            && zero(m.row1[2])
+            && zero(m.row2[0])
+            && zero(m.row2[1])
+            && one(m.row2[2]);
+        if is_identity {
+            return true;
+        }
+        zero(m.row0[1])
+            && m.row0[2] != 0.0
+            && zero(m.row1[0])
+            && one(m.row1[1])
+            && zero(m.row1[2])
+            && m.row2[0] != 0.0
+            && zero(m.row2[1])
+            && m.row0[0].is_finite()
+            && m.row0[2].is_finite()
+    }
+
+    /// The Y angle in degrees, or `None` when this is not a Y rotation.
+    ///
+    /// Returns `None` rather than a best-effort angle: reporting a Y component for
+    /// a general orientation is how a tilted creature ends up upright and looks
+    /// merely miscalibrated instead of wrong.
+    pub fn as_y_rotation(&self) -> Option<f32> {
+        if !self.is_y_rotation() {
+            return None;
+        }
+        let m = self.as_matrix();
+        if m.row0[0] == 1.0 {
+            // cos == 1 forces sin == 0 for any real angle, so this is the identity
+            // and the angle is exactly zero rather than merely near it.
+            return Some(0.0);
+        }
+        // sin is row0[2] and cos is row0[0] in `y_rotation_matrix`. Using -row2[0]
+        // here would ALSO be sin, which silently yields atan2(sin, sin) -- a
+        // constant 45 degrees for every quarter turn, and the kind of bug that
+        // looks like a plausible angle.
+        Some(m.row0[2].atan2(m.row0[0]).to_degrees())
+    }
+
+    /// How far this matrix is from being a proper rotation, as a max-abs error.
+    ///
+    /// Zero for an orthonormal, right-handed matrix. **Measured, not assumed.** The
+    /// game's creator writes these matrices so they should be orthonormal, but a
+    /// shear or a hidden scale smuggled into the orientation still produces
+    /// something that looks like a matrix and renders as a wrong transform, so the
+    /// caller gets to see the number instead of trusting it.
+    pub fn orthonormality_error(&self) -> f32 {
+        let m = self.as_matrix();
+        let mut worst = 0.0f32;
+        for i in 0..3 {
+            for j in 0..3 {
+                // R^T R must be the identity.
+                // R^T R must be the identity. Zipping the two columns is the point:
+                // `col_i . col_j` over all three rows IS the (i, j) entry of R^T R,
+                // and spelling it as a zip makes it impossible to transpose by
+                // accident, which is the mistake that mirrors a part instead of
+                // rotating it.
+                let rows = [m.row0, m.row1, m.row2];
+                let dot = rows.iter().map(|row| row[i] * row[j]).sum::<f32>();
+                let want = if i == j { 1.0 } else { 0.0 };
+                worst = worst.max((dot - want).abs());
+            }
+        }
+        // The determinant must be +1. A -1 is a reflection, which is a different
+        // thing from a rotation and would mirror the model.
+        let det = m.row0[0] * (m.row1[1] * m.row2[2] - m.row1[2] * m.row2[1])
+            - m.row0[1] * (m.row1[0] * m.row2[2] - m.row1[2] * m.row2[0])
+            + m.row0[2] * (m.row1[0] * m.row2[1] - m.row1[1] * m.row2[0]);
+        worst.max((det - 1.0).abs())
+    }
+}
+
+/// The row-major matrix for a rotation of `degrees` about +Y.
+///
+/// Written out rather than composed from quaternion helpers so the nine stored
+/// numbers are the nine numbers a creator document would contain, and so this
+/// function is usable from a headless test with no renderer in the graph.
+fn y_rotation_matrix(degrees: f32) -> spore_creator_core::document::Matrix3 {
+    let radians = degrees.to_radians();
+    let (sin, cos) = radians.sin_cos();
+    spore_creator_core::document::Matrix3 {
+        row0: [cos, 0.0, sin],
+        row1: [0.0, 1.0, 0.0],
+        row2: [-sin, 0.0, cos],
+    }
+}
+
+impl From<f32> for Orientation {
+    fn from(degrees: f32) -> Self {
+        Self::YRotation(degrees)
+    }
+}
+
+impl From<spore_creator_core::document::Matrix3> for Orientation {
+    fn from(m: spore_creator_core::document::Matrix3) -> Self {
+        Self::General(m)
+    }
+}
+
 /// Where one model instance sits in the world.
 ///
-/// Plain numbers, not `bevy::math::TransformV3`, because this is the domain and
-/// the domain does not depend on the renderer. The conversion happens once, in
+/// Plain numbers, not `bevy::math::Transform`, because this is the domain and the
+/// domain does not depend on the renderer. The conversion happens once, in
 /// [`crate::loader`].
+///
+/// `orientation` replaces a bare `rotation_y_degrees` field. The old field could
+/// not express a creator block's `<orientation>`, which the save format spells as a
+/// row-major 3x3 and which is **not** a Y rotation in general — collapsing it would
+/// have quietly moved parts. `Orientation::YRotation` keeps every existing
+/// hand-authored placement working and readable, and `Placement::rotation_y_degrees`
+/// is retained as the accessor for code that genuinely only wants the angle.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Placement {
     /// World translation.
     pub translation: [f32; 3],
-    /// Rotation about +Y, in degrees.
-    pub rotation_y_degrees: f32,
+    /// How the orientation is spelled.
+    pub orientation: Orientation,
     /// Uniform scale.
     pub scale: f32,
 }
@@ -246,7 +436,7 @@ impl Default for Placement {
     fn default() -> Self {
         Self {
             translation: [0.0; 3],
-            rotation_y_degrees: 0.0,
+            orientation: Orientation::default(),
             scale: 1.0,
         }
     }
@@ -261,11 +451,41 @@ impl Placement {
         }
     }
 
+    /// A placement rotated `degrees` about +Y at `translation`.
+    ///
+    /// The constructor for the case that genuinely is a Y rotation, so a caller
+    /// saying "rotate this by 30 degrees" produces `YRotation(30.0)` rather than a
+    /// matrix that would compare unequal to one built the other way.
+    pub fn rotated_y(translation: [f32; 3], degrees: f32) -> Self {
+        Self {
+            translation,
+            orientation: Orientation::YRotation(degrees),
+            scale: 1.0,
+        }
+    }
+
+    /// A placement carrying `orientation` verbatim at `translation`.
+    pub fn oriented(translation: [f32; 3], orientation: Orientation) -> Self {
+        Self {
+            translation,
+            orientation,
+            scale: 1.0,
+        }
+    }
+
+    /// The Y angle in degrees, when this placement is a Y rotation.
+    ///
+    /// `None` for a general orientation. See [`Orientation::as_y_rotation`] for why
+    /// there is deliberately no fallback number here.
+    pub fn rotation_y_degrees(&self) -> Option<f32> {
+        self.orientation.as_y_rotation()
+    }
+
     /// The translation the model must be lifted by so its lowest point sits on
     /// `floor_y`, given its own bounds.
     ///
-    /// Returns `None` for absent bounds rather than zero: a model with no
-    /// meshes has no floor to sit on.
+    /// Returns `None` for absent bounds rather than zero: a model with no meshes has
+    /// no floor to sit on.
     pub fn lifted_onto(&self, floor_y: f32, bounds: Bounds) -> Option<[f32; 3]> {
         let (lo, _hi) = bounds?;
         let mut translation = self.translation;
@@ -460,5 +680,158 @@ mod tests {
         assert_eq!(instance.label, None);
         // Nothing derives one: DBPF has no string table.
         assert_eq!(instance.key, key);
+    }
+}
+
+#[cfg(test)]
+mod orientation_tests {
+    use super::*;
+    use spore_creator_core::document::Matrix3;
+
+    fn matrix(rows: [[f32; 3]; 3]) -> Matrix3 {
+        Matrix3 {
+            row0: rows[0],
+            row1: rows[1],
+            row2: rows[2],
+        }
+    }
+
+    #[test]
+    fn a_default_orientation_is_a_zero_y_rotation_and_not_a_matrix() {
+        // Structurally, not numerically: both denote the identity, so only the
+        // variant can tell an unspecified orientation from a chosen one.
+        assert_eq!(Orientation::default(), Orientation::YRotation(0.0));
+        assert_ne!(
+            Orientation::default(),
+            Orientation::General(Matrix3::IDENTITY),
+            "defaulting to a matrix would make an unspecified orientation look chosen"
+        );
+    }
+
+    #[test]
+    fn the_identity_counts_as_a_y_rotation_which_a_nonzero_test_would_miss() {
+        // The identity has both off-diagonal terms zero, so a "is the sin term
+        // non-zero" test cannot see it. It is still a Y rotation about any axis.
+        assert!(Orientation::General(Matrix3::IDENTITY).is_y_rotation());
+        assert_eq!(
+            Orientation::General(Matrix3::IDENTITY).as_y_rotation(),
+            Some(0.0)
+        );
+    }
+
+    #[test]
+    fn a_general_orientation_reports_no_y_angle_rather_than_a_best_effort_one() {
+        // A rotation about X by 30 degrees. Reporting its Y component (0.0 here)
+        // would make a tilted part look merely miscalibrated instead of wrong.
+        let m = matrix([
+            [1.0, 0.0, 0.0],
+            [0.0, 0.866_025_4, -0.5],
+            [0.0, 0.5, 0.866_025_4],
+        ]);
+        let o = Orientation::General(m);
+        assert!(!o.is_y_rotation());
+        assert_eq!(o.as_y_rotation(), None);
+    }
+
+    #[test]
+    fn a_y_rotation_survives_the_round_trip_through_the_matrix() {
+        for degrees in [0.0f32, 1.0, 30.0, 90.0, 179.0, -45.0, 360.0] {
+            let o = Orientation::YRotation(degrees);
+            assert!(
+                o.is_y_rotation(),
+                "{degrees} degrees is a Y rotation by construction and must be \
+                 recognised as one"
+            );
+            let back = o.as_y_rotation().expect("is_y_rotation said yes");
+            let expected = degrees.rem_euclid(360.0);
+            // Angles are circular, so the error is the SHORT way round. Comparing
+            // plain subtraction would make 0 and 360 look maximally different.
+            let raw = back - expected;
+            let delta = raw.abs().min((raw.abs() - 360.0).abs());
+            assert!(
+                delta < 1e-3,
+                "{degrees} degrees came back as {back}, expected {expected}, \
+                 circular error {delta}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_y_rotation_matrix_is_orthonormal_and_right_handed() {
+        for degrees in [0.0f32, 17.0, 90.0, 223.0] {
+            let o = Orientation::YRotation(degrees);
+            assert!(
+                o.orthonormality_error() < 1e-6,
+                "{} degrees gave error {}",
+                degrees,
+                o.orthonormality_error()
+            );
+        }
+    }
+
+    #[test]
+    fn a_creator_orientation_survives_verbatim_through_the_placement() {
+        // The reason Orientation exists: a creator block's <orientation> is a
+        // row-major 3x3 and is not a Y rotation in general. A rotation about X by
+        // 40 degrees, which no Y rotation can denote.
+        let (s, c) = 40.0f32.to_radians().sin_cos();
+        let m = matrix([[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]]);
+        let placement = Placement::oriented([1.0, 2.0, 3.0], Orientation::General(m));
+        assert_eq!(
+            placement.orientation.as_matrix(),
+            m,
+            "nine numbers, unchanged"
+        );
+        assert_eq!(placement.rotation_y_degrees(), None);
+        assert_eq!(placement.translation, [1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn a_sheared_orientation_reports_its_error_instead_of_looking_like_a_matrix() {
+        // A shear is a valid-looking 3x3 and renders as a wrong transform. The
+        // caller gets to see that rather than trusting the shape.
+        let sheared = matrix([[1.0, 0.0, 0.0], [0.5, 1.0, 0.0], [0.0, 0.0, 1.0]]);
+        let o = Orientation::General(sheared);
+        assert!(
+            o.orthonormality_error() > 1e-3,
+            "a shear must not read as clean"
+        );
+    }
+
+    #[test]
+    fn a_reflection_reports_an_error_because_it_mirrors_rather_than_rotates() {
+        // Determinant -1 with orthonormal rows: a mirror, not a rotation.
+        let mirrored = matrix([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, -1.0]]);
+        let o = Orientation::General(mirrored);
+        assert!(
+            (o.orthonormality_error() - 2.0).abs() < 1e-6,
+            "det -1 must read as 2.0 away from a rotation, got {}",
+            o.orthonormality_error()
+        );
+    }
+
+    #[test]
+    fn from_transform_always_yields_the_general_spelling() {
+        // A creator transform carries a 3x3 by definition, so decoding must never
+        // narrow it. If this ever returns YRotation the decoder started guessing.
+        let transform = spore_creator_core::document::BlockTransform {
+            orientation: Matrix3::IDENTITY,
+            ..Default::default()
+        };
+        assert!(matches!(
+            Orientation::from_transform(&transform),
+            Orientation::General(_)
+        ));
+    }
+
+    #[test]
+    fn rotated_y_and_a_matching_matrix_agree_on_the_denoted_transform() {
+        // Two spellings of the same orientation must denote the same matrix, or the
+        // enum is leaking a distinction the renderer can observe.
+        for degrees in [0.0f32, 30.0, 90.0, -120.0] {
+            let a = Placement::rotated_y([0.0; 3], degrees);
+            let b = Placement::oriented([0.0; 3], Orientation::General(a.orientation.as_matrix()));
+            assert_eq!(a.orientation.as_matrix(), b.orientation.as_matrix());
+        }
     }
 }

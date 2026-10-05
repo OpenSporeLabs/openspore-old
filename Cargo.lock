@@ -4342,6 +4342,7 @@ dependencies = [
  "bevy_brp_extras",
  "spore-assets",
  "spore-core",
+ "spore-creator-core",
  "spore-gmdl",
  "spore-material",
  "spore-texture",
@@ -4353,6 +4354,7 @@ version = "0.1.0"
 dependencies = [
  "spore-core",
  "spore-dbpf",
+ "spore-rigblock",
  "spore-rw4",
  "thiserror 2.0.21",
 ]
