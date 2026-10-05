@@ -15,6 +15,7 @@
 pub mod picking;
 pub mod plugin;
 pub mod session;
+pub mod thumbnails;
 pub mod ui;
 
 pub use session::{CreatorSession, SessionError};
