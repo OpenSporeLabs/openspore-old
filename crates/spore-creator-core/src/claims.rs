@@ -27,6 +27,26 @@
 //! 3. **What the `<weight channel>` words name.** 14 distinct values; no
 //!    registry, no enum, no decoder. `ChannelWeight::channel` is a `u32` and
 //!    stays one.
+//!
+//! ## Claims that constrain the authoring operations
+//!
+//! Three more are recorded for the same reason — not because they are
+//! incidental, but because they are what stops [`crate::edit`] from doing the
+//! obvious thing and being wrong:
+//!
+//! 4. **`reparent_transform_consequence`.** A reparent moves the edge and
+//!    rewrites no transform, because `transform_frame` above is open. If the
+//!    game composes a block's `<position>` from its parent, then reparenting
+//!    moves the part in world space and the correct implementation must
+//!    re-express the child's position; we do not know which it is.
+//! 5. **`replace_symmetric_handedness`.** Nothing in the corpus shows the same
+//!    placement holding two different `<blockid>` values, so we do not know
+//!    whether swapping a part on one half of a mirrored pair must break the
+//!    mirror relation. `replace_block` leaves it alone and lets `validate`
+//!    report anything odd.
+//! 6. **`paintregion_meaning` / `paintid_meaning`, again.** `set_paint` stores
+//!    what it is given and validates neither the values nor their order,
+//!    because there is no registry to validate them against.
 
 /// A subject this crate has looked for and not found.
 ///
@@ -52,6 +72,18 @@ pub const CLAIMS: &[Claim] = &[
         level: spore_core::EvidenceLevel::Unknown,
         searched: "all 680 blocks across 68 documents: one <position> per block, no frame marker element",
         would_settle: "one Wine trace of a known <blockid> showing whether the game composes or reads it absolutely",
+    },
+    Claim {
+        subject: "reparent_transform_consequence",
+        level: spore_core::EvidenceLevel::Unknown,
+        searched: "no creator session observed and no two corpus documents differing only by a moved edge; 601 edges over 68 documents, none with a before/after pair",
+        would_settle: "a Wine trace of one drag, or two saved documents of the same creature differing only in one parent link",
+    },
+    Claim {
+        subject: "replace_symmetric_handedness",
+        level: spore_core::EvidenceLevel::Unknown,
+        searched: "84 reciprocal <symmetric> relations; no rigblock record declares handedness, and the corpus never shows the same placement with two different <blockid> values",
+        would_settle: "decoding Editors::EditorRigblock's side information, or a creator session that swaps a part on one half of a mirrored pair",
     },
     Claim {
         subject: "paintregion_meaning",

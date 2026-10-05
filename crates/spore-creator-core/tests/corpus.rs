@@ -19,7 +19,11 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use spore_creator_core::{sporemodel::Family, validate, CreatorDocument};
+use spore_creator_core::sporemodel::Family;
+use spore_creator_core::{
+    validate, Block, BlockId, BlockIndex, BlockTransform, CreatorDocument, IndexRemap, Matrix3,
+    OnLastChild, PaintRegion, Remap, Severity, UnitRgb, ValidationIssue,
+};
 use spore_dbpf::extract_record;
 
 /// Where the game install lives, relative to the repository root.
@@ -62,6 +66,92 @@ macro_rules! corpus_or_skip {
             None => return,
         }
     };
+}
+
+/// The `Error`-severity issues a document carries. The authoring ops are only
+/// allowed to be *neutral* on this list: an op that removes an error is as much
+/// a silent repair as one that adds one.
+fn errors(document: &CreatorDocument) -> Vec<ValidationIssue> {
+    validate(document, None)
+        .into_iter()
+        .filter(|issue| issue.severity == Severity::Error)
+        .collect()
+}
+
+/// Total `<childid>` edges in a document.
+fn edge_count(document: &CreatorDocument) -> usize {
+    document
+        .blocks
+        .iter()
+        .map(|block| block.child_indices().len())
+        .sum()
+}
+
+/// Every block in `index`'s subtree, `index` included.
+fn subtree(document: &CreatorDocument, index: BlockIndex) -> Vec<BlockIndex> {
+    let mut out = vec![index];
+    let mut cursor = 0;
+    while cursor < out.len() {
+        let parent = out[cursor];
+        cursor += 1;
+        for &child in document.blocks[parent].child_indices() {
+            if child < document.blocks.len() && !out.contains(&child) {
+                out.push(child);
+            }
+        }
+    }
+    out
+}
+
+/// What a surviving block must look like after a removal: the original, with
+/// every index-valued reference carried by the remap.
+///
+/// This is the invariant that matters, and it is stronger than "the array
+/// compacted": a removal that forgot to shift an edge above the hole would leave
+/// a valid-looking forest that had silently re-parented itself, and only this
+/// projection catches it.
+///
+/// Two references do not survive the map and are handled as the op documents
+/// they are: a child entry naming the removed block is **dropped** from its
+/// parent's list, and a `<symmetric>` naming it is **cleared**. A leftover of
+/// either kind is exactly what the error check below is looking for.
+///
+/// `on_last_child` is needed because the two policies produce genuinely
+/// different documents: a parent that loses its only child is left with
+/// `Some(vec![])` or with `None`, and the projection has to know which one it is
+/// looking at or it would "fail" both of them.
+fn project_block(remap: &IndexRemap, block: &Block, on_last_child: OnLastChild) -> Block {
+    let mut projected = block.clone();
+    if let Some(children) = &block.children {
+        let mapped: Vec<BlockIndex> = children
+            .iter()
+            .filter_map(|&child| match remap.map(child) {
+                Remap::Moved(index) => Some(index),
+                Remap::Removed => None,
+            })
+            .collect();
+        projected.children = if mapped.is_empty() && on_last_child == OnLastChild::OmitElement {
+            None
+        } else {
+            Some(mapped)
+        };
+    }
+    if let Some(partner) = block.symmetric {
+        projected.symmetric = match remap.map(partner) {
+            Remap::Moved(index) => Some(index),
+            Remap::Removed => None,
+        };
+    }
+    projected
+}
+
+/// A real block, stripped of the edges that would refer to a document it was
+/// not authored for — i.e. usable as an input to `add_block`.
+fn detachable(document: &CreatorDocument, index: BlockIndex) -> Block {
+    let mut block = document.blocks[index].clone();
+    block.children = None;
+    block.symmetric = None;
+    block
 }
 
 #[test]
@@ -363,4 +453,455 @@ fn every_block_id_pair_resolves_to_a_rigblock_group_family() {
 #[test]
 fn fixtures_are_synthetic_and_live_beside_this_file() {
     let _unused: Option<PathBuf> = None;
+}
+
+// ---------------------------------------------------------------------------
+// Authoring operations over the real corpus
+//
+// Every test here decodes the real 68 documents, applies one op, and asserts a
+// graph invariant that the op is *obliged* to keep: no dangling edge, no cycle,
+// in-degree at most 1, and an exact edge-count delta. The edge delta is the
+// assertion that matters, because a compaction that forgot to shift an edge
+// still leaves a valid-looking forest — it just quietly re-parents the creature.
+//
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "needs the game install; no asset byte is committed"]
+fn adding_a_block_to_every_real_document_appends_and_moves_no_edge() {
+    let documents = corpus_or_skip!();
+    for (family, document) in &documents {
+        let before = document.clone();
+        let before_edges = edge_count(&before);
+        let mut edited = before.clone();
+
+        let added = edited
+            .add_block(detachable(&before, 0), before.roots().first().copied())
+            .expect("a real block is addable");
+        assert_eq!(
+            added,
+            before.len(),
+            "{} appended at the end, never inserted",
+            family.name()
+        );
+
+        // Every surviving block is byte-identical, so no index moved.
+        for (index, block) in before.blocks.iter().enumerate() {
+            let mut expected = block.clone();
+            if Some(index) == before.roots().first().copied() {
+                let mut children = block.child_indices().to_vec();
+                children.push(added);
+                expected.children = Some(children);
+            }
+            assert_eq!(
+                edited.blocks[index],
+                expected,
+                "{} block {index} must not move",
+                family.name()
+            );
+        }
+        assert_eq!(edited.len(), before.len() + 1);
+        assert_eq!(edge_count(&edited), before_edges + 1);
+        assert!(errors(&edited).is_empty(), "{}", family.name());
+    }
+}
+
+#[test]
+#[ignore = "needs the game install; no asset byte is committed"]
+fn removing_a_block_from_every_real_document_gives_the_exact_edge_delta() {
+    let documents = corpus_or_skip!();
+    let mut removed_total = 0usize;
+
+    // Both last-child policies are exercised over the whole corpus, because
+    // they leave genuinely different documents and only one of them matches the
+    // shape the corpus uses for its 160 leaves.
+    for on_last_child in [OnLastChild::OmitElement, OnLastChild::KeepWrittenList] {
+        for (family, document) in &documents {
+            for victim in 0..document.len() {
+                let before = document.clone();
+                let before_edges = edge_count(&before);
+                let in_degree = before
+                    .blocks
+                    .iter()
+                    .filter(|block| block.child_indices().contains(&victim))
+                    .count();
+                let out_degree = before.blocks[victim].child_indices().len();
+                let survivors = before.len() - 1;
+
+                let mut edited = before.clone();
+                let remap = edited
+                    .remove_block(victim, on_last_child)
+                    .expect("every corpus index exists");
+
+                // The exact delta: the removed block's own edges and the edges
+                // that named it both disappear, and nothing else changes.
+                assert_eq!(
+                    edge_count(&edited),
+                    before_edges - in_degree - out_degree,
+                    "{} removing {victim}: {in_degree} in, {out_degree} out, {on_last_child:?}",
+                    family.name()
+                );
+                assert_eq!(edited.len(), survivors);
+                assert!(errors(&edited).is_empty(), "{} at {victim}", family.name());
+
+                // Explicitly: no edge and no mirror relation names a slot that is
+                // gone. `errors()` reports those as `child_index_out_of_range`
+                // and `symmetric_out_of_range`; naming the condition here is
+                // what makes the intent legible.
+                for (index, block) in edited.blocks.iter().enumerate() {
+                    for &child in block.child_indices() {
+                        assert!(
+                            child < survivors,
+                            "{} edge {index} -> {child} dangles after removing {victim}",
+                            family.name()
+                        );
+                    }
+                    if let Some(partner) = block.symmetric {
+                        assert!(
+                            partner < survivors,
+                            "{} block {index} mirrors a block that is gone",
+                            family.name()
+                        );
+                    }
+                }
+
+                // The remap is complete and correct, checked value by value:
+                // every surviving block equals the original with each
+                // index-valued reference carried by the remap. So "the remap is
+                // structurally fine" and "the remap means the right thing" are
+                // one assertion, and a forgotten shift above the hole fails it.
+                assert_eq!(remap.len(), before.len(), "no gaps in the remap");
+                assert_eq!(remap.removed(), victim);
+                for old in 0..before.len() {
+                    match remap.map(old) {
+                        Remap::Moved(new) => {
+                            assert_eq!(new, old - usize::from(old > victim));
+                            assert_eq!(
+                                edited.blocks[new],
+                                project_block(&remap, &before.blocks[old], on_last_child),
+                                "{} block {old} must survive at {new} with every reference \\
+                                 carried by the remap",
+                                family.name()
+                            );
+                        }
+                        Remap::Removed => assert_eq!(old, victim, "only the victim is gone"),
+                    }
+                }
+                assert_eq!(
+                    remap.severed_symmetry().len(),
+                    before
+                        .blocks
+                        .iter()
+                        .filter(|block| block.symmetric == Some(victim))
+                        .count(),
+                    "{} every cleared mirror relation is reported, not lost",
+                    family.name()
+                );
+                removed_total += 1;
+            }
+        }
+    }
+    assert_eq!(
+        removed_total, 1360,
+        "680 blocks removed once per last-child policy"
+    );
+}
+
+#[test]
+#[ignore = "needs the game install; no asset byte is committed"]
+fn a_reparent_of_a_real_subtree_keeps_the_edge_count_the_forest_and_the_transforms() {
+    let documents = corpus_or_skip!();
+    let mut moved = 0usize;
+
+    for (family, document) in &documents {
+        let roots = document.roots();
+        let Some(&new_parent) = roots.last() else {
+            continue;
+        };
+
+        // Find a block that has a parent and is not an ancestor of the intended
+        // destination, so the move is a genuine re-parent and not a cycle.
+        let candidate = document
+            .blocks
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| document.parent_of(*index).is_some())
+            .map(|(index, _)| index)
+            .find(|&index| {
+                index != new_parent
+                    && !subtree(document, index).contains(&new_parent)
+                    && document.parent_of(index) != Some(new_parent)
+            });
+        let Some(candidate) = candidate else {
+            continue;
+        };
+
+        let before = document.clone();
+        let before_edges = edge_count(&before);
+        let transform_before: BTreeMap<BlockIndex, BlockTransform> = subtree(&before, candidate)
+            .into_iter()
+            .map(|index| (index, before.blocks[index].transform))
+            .collect();
+
+        let mut edited = before.clone();
+        edited
+            .reparent_block(candidate, Some(new_parent), OnLastChild::OmitElement)
+            .expect("the destination is not inside the moved subtree");
+
+        assert_eq!(
+            edge_count(&edited),
+            before_edges,
+            "{} a move replaces one edge, it does not add one",
+            family.name()
+        );
+        assert!(errors(&edited).is_empty(), "{} {family:?}", family.name());
+        assert_eq!(
+            edited.parent_of(candidate),
+            Some(new_parent),
+            "{} the edge landed where it was asked to",
+            family.name()
+        );
+
+        // Every transform in the moved subtree is bit-for-bit what it was: the
+        // frame question is open, so this op moves the edge and nothing else.
+        let after_subtree = subtree(&edited, candidate);
+        assert_eq!(
+            after_subtree.len(),
+            transform_before.len(),
+            "the subtree is intact"
+        );
+        for index in after_subtree {
+            assert_eq!(
+                edited.blocks[index].transform,
+                transform_before[&index],
+                "{} block {index} transform must be untouched",
+                family.name()
+            );
+        }
+        moved += 1;
+    }
+    assert!(
+        moved >= 60,
+        "most documents have a movable block, got {moved}"
+    );
+}
+
+#[test]
+#[ignore = "needs the game install; no asset byte is committed"]
+fn replacing_the_part_of_a_real_block_changes_one_word_and_nothing_else() {
+    let documents = corpus_or_skip!();
+    let mut replaced = 0usize;
+
+    for (family, document) in &documents {
+        for index in 0..document.len() {
+            let original = document.blocks[index]
+                .block_id
+                .expect("every corpus block has one");
+            // A different part that is still a rigblock group family.
+            let replacement = BlockId::new(original.group_id, original.instance_id ^ 0x5a5a_5a5a);
+            let before = document.blocks[index].clone();
+
+            let mut edited = document.clone();
+            edited
+                .replace_block(index, replacement)
+                .expect("every corpus index exists");
+
+            let after = &edited.blocks[index];
+            assert_eq!(after.block_id, Some(replacement));
+            assert_eq!(
+                after.transform,
+                before.transform,
+                "{} {index}",
+                family.name()
+            );
+            assert_eq!(after.children, before.children, "{} {index}", family.name());
+            assert_eq!(
+                after.symmetric,
+                before.symmetric,
+                "{} {index}",
+                family.name()
+            );
+            assert_eq!(after.snapped, before.snapped, "{} {index}", family.name());
+            assert_eq!(after.paint, before.paint, "{} {index}", family.name());
+            assert_eq!(after.handles, before.handles, "{} {index}", family.name());
+            assert_eq!(after.limb, before.limb, "{} {index}", family.name());
+            assert_eq!(
+                after.user_orientation,
+                before.user_orientation,
+                "{} {index}",
+                family.name()
+            );
+            assert_eq!(after.bbox, before.bbox, "{} {index}", family.name());
+            assert_eq!(edge_count(&edited), edge_count(document));
+            assert!(errors(&edited).is_empty(), "{} {index}", family.name());
+            replaced += 1;
+        }
+    }
+    assert_eq!(replaced, 680, "680 blocks, each with its part swapped once");
+}
+
+#[test]
+#[ignore = "needs the game install; no asset byte is committed"]
+fn a_transform_can_be_rewritten_on_every_real_block_without_touching_the_graph() {
+    let documents = corpus_or_skip!();
+    let replacement = BlockTransform {
+        position: spore_creator_core::Vec3 {
+            x: 1.0,
+            y: 2.0,
+            z: 3.0,
+        },
+        scale: 0.28,
+        orientation: Matrix3::IDENTITY,
+        triangle_direction: None,
+        triangle_pick_origin: None,
+    };
+
+    for (family, document) in &documents {
+        let mut edited = document.clone();
+        let before_edges = edge_count(&edited);
+        for index in 0..edited.len() {
+            edited
+                .set_block_transform(index, replacement)
+                .expect("every corpus index exists");
+            assert_eq!(edited.blocks[index].transform, replacement);
+        }
+        assert_eq!(edge_count(&edited), before_edges, "{}", family.name());
+        assert!(errors(&edited).is_empty(), "{}", family.name());
+    }
+}
+
+#[test]
+#[ignore = "needs the game install; no asset byte is committed"]
+fn paint_is_stored_on_a_creature_and_reported_rather_than_refused_or_dropped() {
+    let documents = corpus_or_skip!();
+    let region = PaintRegion {
+        region: 5,
+        paint_id: 0xf596_7f30,
+        color1: UnitRgb::new(0.0, 0.25, 1.0).expect("the test colour is in range"),
+        color2: UnitRgb::new(1.0, 0.5, 0.0).expect("the test colour is in range"),
+    };
+
+    let mut creatures_painted = 0usize;
+    for (family, document) in &documents {
+        let mut edited = document.clone();
+        for index in 0..edited.len() {
+            if edited.blocks[index].paint.is_some() {
+                continue;
+            }
+            edited
+                .set_paint(index, Some(vec![region]))
+                .expect("every corpus index exists");
+        }
+        let painted = edited
+            .blocks
+            .iter()
+            .filter(|block| block.paint.is_some())
+            .count();
+        assert!(painted > 0, "{}", family.name());
+        assert_eq!(painted, edited.len(), "{}", family.name());
+
+        // The op cannot know the family, so validate reports what the op must
+        // not: paint on a creature is kept and warned about, never removed.
+        if *family == Family::Creature {
+            creatures_painted += 1;
+            let issues = validate(&edited, Some(*family));
+            assert!(
+                issues
+                    .iter()
+                    .any(|issue| issue.code == "paint_in_a_family_without_paint"),
+                "{} {family:?}",
+                family.name()
+            );
+            assert!(
+                issues
+                    .iter()
+                    .all(|issue| issue.severity == Severity::Warning),
+                "paint on a creature is a warning, so the document still loads"
+            );
+        }
+        assert!(errors(&edited).is_empty(), "{}", family.name());
+    }
+    assert_eq!(
+        creatures_painted, 47,
+        "all 47 creature documents are exercised"
+    );
+}
+
+#[test]
+#[ignore = "needs the game install; no asset byte is committed"]
+fn a_full_authoring_session_over_the_corpus_returns_every_document_to_its_shape() {
+    let documents = corpus_or_skip!();
+
+    for (family, document) in &documents {
+        let baseline = errors(document);
+        assert!(baseline.is_empty(), "{} starts clean", family.name());
+        let before_blocks = document.len();
+        let before_edges = edge_count(document);
+        let before_roots = document.roots();
+
+        let mut edited = document.clone();
+
+        // Add a two-block limb on the first root, swap one of its parts, write a
+        // transform, then detach it and delete both blocks again.
+        let root = edited.roots()[0];
+        let outer = edited
+            .add_block(detachable(&edited, root), Some(root))
+            .expect("added");
+        let inner = edited
+            .add_block(detachable(&edited, outer), Some(outer))
+            .expect("added");
+        edited
+            .replace_block(inner, BlockId::new(0x4062_6000, 0x1234_5678))
+            .expect("replaced");
+        edited
+            .set_block_transform(
+                inner,
+                BlockTransform {
+                    position: spore_creator_core::Vec3 {
+                        x: 0.5,
+                        y: -0.25,
+                        z: 2.0,
+                    },
+                    scale: 1.5,
+                    orientation: Matrix3::IDENTITY,
+                    triangle_direction: None,
+                    triangle_pick_origin: None,
+                },
+            )
+            .expect("transform written");
+        edited
+            .set_paint(inner, Some(Vec::new()))
+            .expect("an empty paint list was written");
+        edited
+            .reparent_block(inner, Some(root), OnLastChild::OmitElement)
+            .expect("reparented");
+
+        // Two adds, then the detach moves one edge rather than adding it, and
+        // `outer` loses the only child it ever had.
+        assert_eq!(edited.len(), before_blocks + 2);
+        assert_eq!(edge_count(&edited), before_edges + 2);
+        assert_eq!(edited.parent_of(inner), Some(root));
+        assert_eq!(
+            edited.blocks[outer].children, None,
+            "the empty list was dropped"
+        );
+        assert!(errors(&edited).is_empty(), "{}", family.name());
+
+        let first = edited
+            .remove_block(inner, OnLastChild::OmitElement)
+            .expect("removed");
+        assert_eq!(first.map(inner), Remap::Removed);
+        assert!(errors(&edited).is_empty(), "{}", family.name());
+
+        let second = edited
+            .remove_block(outer, OnLastChild::OmitElement)
+            .expect("removed");
+        assert_eq!(second.map(second.removed()), Remap::Removed);
+
+        // Back to exactly where it started: same blocks, same edges, same roots.
+        assert_eq!(edited.len(), before_blocks, "{}", family.name());
+        assert_eq!(edge_count(&edited), before_edges, "{}", family.name());
+        assert_eq!(edited.roots(), before_roots, "{}", family.name());
+        assert!(errors(&edited).is_empty(), "{}", family.name());
+    }
 }

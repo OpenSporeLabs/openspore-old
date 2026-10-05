@@ -50,6 +50,7 @@
 pub mod claims;
 pub mod color;
 pub mod document;
+pub mod edit;
 pub mod error;
 pub mod sporemodel;
 pub mod validate;
@@ -60,6 +61,7 @@ pub use document::{
     Block, BlockId, BlockIndex, BlockTransform, ChannelWeight, CreatorDocument, DocumentProperties,
     Matrix3, PaintRegion, Vec3,
 };
-pub use error::{CreatorError, Result};
+pub use edit::{IndexRemap, OnLastChild, Remap};
+pub use error::{CreatorError, EditError, EditResult, Result};
 pub use sporemodel::{parse_sporemodel, Family};
 pub use validate::{validate, Severity, ValidationIssue};

@@ -386,6 +386,7 @@ crates/spore-creator-core/     docs-only + stdlib + spore-core.  No Bevy, no GPU
   src/sporemodel.rs            the corpus `<sporemodel>` decoder
   src/resolve.rs               blockid -> geometry, the failable resolver
   src/validate.rs              structural checks
+  src/edit.rs                  the six authoring operations + the index-space remap
   src/history.rs               undo/redo
   src/codec.rs                 our own save format
   src/claims.rs                what we do NOT know
@@ -529,6 +530,81 @@ Adopted from `05-serialization.md`, which corrected two of my premises:
   whole-array snapshots, because block order is the index space.
 - Document and history serialise to **two files**, so undoing cannot change the
   document's bytes.
+
+### 5.1 The six authoring operations, and the index-space policy
+
+`src/edit.rs`. Six methods on `CreatorDocument`, each of which either does what
+it says or returns a typed `EditError` and leaves the document **byte-identical**.
+There is no repair path, no clamping, and no `MaybeUninit`-shaped hole: an editor
+that silently fixes a bad request cannot answer the only question an undo stack
+and a corpus test both need answered, which is what the tool actually did.
+
+| op | signature | policy |
+|---|---|---|
+| add | `add_block(&mut self, Block, Option<BlockIndex>) -> EditResult<BlockIndex>` | **appends**; index is `blocks.len()` |
+| remove | `remove_block(&mut self, BlockIndex, OnLastChild) -> EditResult<IndexRemap>` | **compacts** + full remap |
+| replace | `replace_block(&mut self, BlockIndex, BlockId) -> EditResult<()>` | one field, everything else bit-for-bit |
+| reparent | `reparent_block(&mut self, BlockIndex, Option<BlockIndex>, OnLastChild) -> EditResult<()>` | moves the edge; refuses a cycle |
+| transform | `set_block_transform(&mut self, BlockIndex, BlockTransform) -> EditResult<()>` | whole transform, never derived |
+| paint | `set_paint(&mut self, BlockIndex, Option<Vec<PaintRegion>>) -> EditResult<()>` | `None` omits, `Some(vec![])` writes |
+
+**The index-space policy: a complete remap, not a tombstone.** F14 makes block
+order *be* the index space and reordering not a valid edit, so removal renumbers
+everything after the hole. `remove_block` compacts the array, rewrites **every**
+index-valued reference in the document — each `<childid>` naming the removed
+block is dropped, each `<childid>` *above* it shifts down by one, each
+`<symmetric>` naming it is cleared and each above it shifts — and returns an
+`IndexRemap` with an entry for **every** index of the pre-removal document, so
+the remap cannot have a gap. `Remap::Moved(n)` and `Remap::Removed` are two
+answers rather than an index and a sentinel, because "this names nothing now"
+must never be spelled as a number.
+
+A tombstone (a dead slot, nothing shifts) was **not** chosen, and the difference
+is pinned by a test rather than left to prose. Three reasons: it needs a second
+meaning for a slot `Block` does not have, which leaks into `roots()`,
+`parent_of()` and `validate` — the query layer shared with the decoder; it
+produces a `<blockref>` with no `<blockid>`, a shape the corpus never shows, so
+the eventual writer would need a second answer; and it moves the cost instead of
+removing it, because every caller-held index would still need to know which slots
+are dead. `add_block` needs no remap precisely because it appends: insertion at a
+slot *is* an ordering change, so `insert_at` does not exist and its absence is
+the policy.
+
+**The two `None`/`Some` edges stay distinct, in the signature rather than in a
+default.** Exactly one op may create a `<childlist>` — `add_block`, always with
+at least one child in it. Exactly one thing empties one — a removal or a
+reparent — and because the corpus expresses "leaf" by *omitting* the element
+(160 of 680), both take an explicit `OnLastChild` (`KeepWrittenList` → the
+`Some(vec![])` shape `validate` reports as `empty_child_list`; `OmitElement` →
+the corpus's leaf shape). `set_paint` takes `Option` for the same reason.
+
+**What the ops refuse to do.** They do not touch a transform on a reparent:
+whether `<position>` is parent-local or absolute is still the open
+`transform_frame` question, so a rescale would be an answer invented in a
+function with no evidence for one (`reparent_transform_consequence` in
+`claims.rs`). They do not repair — pre-existing problems are `validate`'s to
+report. They do not re-derive `symmetric`; reciprocity is a check, not a
+rewrite, and the one place removal *must* touch it (a partner pointing at a block
+that no longer exists) clears the reference and **reports which blocks it
+cleared** via `IndexRemap::severed_symmetry`. And a reparent **moves** a block
+that already has a parent rather than refusing: max in-degree is 1 corpus-wide,
+so the old edge is removed and the new one added in one call and the invariant
+never transiently breaks.
+
+`EditError` lives beside `CreatorError` in `error.rs` and is a **separate type**:
+a decode failure is a finding about bytes on disk, an edit refusal is a finding
+about what the caller asked for, and they must not share a `Display`.
+
+**Measured over the real corpus** (68 documents, 680 blocks, `cargo test -p
+spore-creator-core --release -- --ignored`): all 680 blocks are removed once per
+`OnLastChild` policy (1360 removals), and each is checked for the exact edge
+delta, a complete remap, and that every surviving block equals the original with
+each reference carried by the remap. All 680 have their part swapped with the
+other nine fields asserted equal; all 680 have their transform rewritten; every
+document has a block appended and a subtree reparented; and a full
+add → replace → transform → paint → reparent → remove session returns all 68
+documents to their original block count, edge count and root set. Zero
+`Severity::Error` issues after any op.
 
 ---
 

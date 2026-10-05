@@ -42,7 +42,8 @@ ends at pixels:
                 spore-core
                      |
             spore-creator-core    the authoring model: <sporemodel> documents,
-                     ^             part blocks, transforms, paint, validation
+                     ^             part blocks, transforms, paint, validation,
+                     |             and the six authoring operations (src/edit.rs)
                      |
              (projection lives in spore-engine, never here)
 ```
