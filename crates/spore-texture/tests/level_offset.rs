@@ -359,8 +359,21 @@ fn the_offset_reads_no_envelope_word_this_crate_has_no_meaning_for() {
         .map(|mip| level_offset(frame, width, height, mip, mips).expect("a declared level"))
         .collect();
 
+    let baseline = decode_raster(&base).expect("the unperturbed record decodes");
+
     // `field_10` (0x10) and `field_1c` (0x1c) are pure header words for the block
-    // formats. Perturbing either must leave every offset untouched.
+    // formats. Perturbing either must leave every decoded offset untouched.
+    //
+    // The first version of this arm asserted that `level_offset(...)` returned the
+    // same value after mutating `bytes`. That could not fail: `level_offset` takes
+    // a fourcc and two dimensions and **no record bytes at all**, so every one of
+    // those assertions was `f(args) == f(args)` over loop-invariant arguments, and
+    // `bytes` was mutated and dropped. It was nonetheless cited as proof in a
+    // commit message and in `claims.rs` that these fields cannot move an offset.
+    //
+    // The fact is true, and it is now tested through `decode_raster`, which is the
+    // only function that ever sees the bytes. If a future change derived placement
+    // from either word, the decoded offsets would move and this fails.
     for (at, word, what) in [
         (
             0x10usize,
@@ -372,14 +385,29 @@ fn the_offset_reads_no_envelope_word_this_crate_has_no_meaning_for() {
         for value in word {
             let mut bytes = base.clone();
             bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
-            for (mip, expected) in offsets.iter().enumerate() {
-                assert_eq!(
-                    level_offset(frame, width, height, mip as u32, mips),
-                    Ok(*expected),
-                    "{what} = 0x{value:08x} moved the offset of level {mip}: the placement is \
-                     derived from a word with no established meaning"
-                );
-            }
+            // Whole-image equality rather than an offset comparison: `MipImage`
+            // carries no offset, and this is the stronger claim anyway. If either
+            // word ever fed placement, every level after it would be read from a
+            // different position and the pixels would differ -- or the record would
+            // stop decoding. Both are caught.
+            let image = decode_raster(&bytes).unwrap_or_else(|error| {
+                panic!("{what} = 0x{value:08x} made the record undecodable: {error}")
+            });
+            // `layers`, not the whole `RasterImage`: the envelope CARRIES these two
+            // words, so comparing whole images would fail on the perturbation itself
+            // and prove nothing. The claim is that the decoded texels -- and hence
+            // where each level was read from -- do not move.
+            assert_eq!(
+                image.layers, baseline.layers,
+                "{what} = 0x{value:08x} changed the decoded texels: the placement is \
+                 derived from a word with no established meaning"
+            );
+            assert_eq!(
+                image.layers[0].len(),
+                offsets.len(),
+                "{what} = 0x{value:08x} changed how many levels were decoded, so the \
+                 declared chain and the walked chain disagree",
+            );
         }
     }
 

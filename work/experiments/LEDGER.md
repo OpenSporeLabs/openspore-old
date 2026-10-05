@@ -36,9 +36,10 @@ shows.
 
 **Fixed along the way.** `Projection::bounds()` was built from each part's **rigblock**,
 which is a *bounds box* — a tight box marking where a part may be placed — not the part's
-extent. Measured over the 1320 instances carrying both a rigblock and a `gmsh`, geometry
-spans a median **2.01x** the rigblock half-extent, worst case **13.2x** among the 678
-composed parts. It now uses the decoded geometry, which is what actually gets drawn.
+extent. It now uses the decoded geometry, which is what actually gets drawn. (This entry
+originally carried a "median 2.01x over 1320 instances" measurement. It came from a
+throwaway script, no committed artifact reproduces it, and it was **wrong** — see the
+correction at the end of this entry. The fix stands; that number does not.)
 
 **Not isolated.** Making `bounds()` correct did **not** fix the framing, so the camera
 still appears not to be moving. The remaining suspect is
@@ -77,11 +78,15 @@ the second time it was in this repository's own documentation. Two more things
 made it stick:
 
 1. **The nearest plausible bug got the credit.** The rigblock-as-bounds-box bug
-   was REAL and worth fixing (geometry spans a median 2.01x the rigblock
-   half-extent), but for this creature the world-position spread dominates the
-   box, so fixing it moved the camera distance by about 6%. It was not the cause
-   of the symptom that prompted the search. Attributing a symptom to the nearest
-   plausible cause is how a real bug hides an unrelated one.
+   was REAL and worth fixing, but it was not the cause of the symptom that
+   prompted the search. Fixing it moved that creature's framing distance from
+   0.9818 to 1.2133 — **+23.6%**, not the ~6% first claimed here — and neither
+   number is printed by any committed artifact, so both were memories. The old
+   box did not even have the shape the explanation assumed: its X extent was
+   *negative* (−0.033 to +0.017), so "the world-position spread dominates the box"
+   never described it. Attributing a symptom to the nearest plausible cause is how
+   a real bug hides an unrelated one — and the confident percentage attached to it
+   is what made the wrong story survive review.
 2. **The 2% estimate was arithmetic on the wrong premise.** `0.7 / 34` is only
    meaningful if the camera is at 34. At the real distance of 1.21 the same
    creature occupies roughly 30% of frame height.

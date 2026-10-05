@@ -1538,6 +1538,35 @@ fn the_camera_lands_where_the_framing_closed_form_predicts() {
         framing.bounds,
         framing.vertical_fov_degrees,
     );
+    assert_camera_looks_at_centre(&transform, &framing.bounds, "the hermetic fixture");
+}
+
+/// The camera must LOOK at the centre of the framed box, not merely sit at the
+/// right distance.
+///
+/// `frame_camera` writes two things: a translation and a rotation. Every test that
+/// read only `.translation` was blind to the second -- and swapping the up vector
+/// from `Vec3::Y` to `Vec3::X` was tried against them and passed, because the
+/// position is bit-identical either way. A camera that frames a creature perfectly
+/// and then looks at the ceiling is the same class of defect as one that frames
+/// nothing, so the look-at is asserted rather than assumed.
+///
+/// Bevy's camera looks down its local -Z, so `forward()` is the view direction.
+fn assert_camera_looks_at_centre(transform: &Transform, bounds: &([f32; 3], [f32; 3]), who: &str) {
+    let (lo, hi) = bounds;
+    let centre = Vec3::new(
+        (lo[0] + hi[0]) * 0.5,
+        (lo[1] + hi[1]) * 0.5,
+        (lo[2] + hi[2]) * 0.5,
+    );
+    let wanted = (centre - transform.translation).normalize();
+    let actual = transform.forward();
+    assert!(
+        actual.dot(wanted) > 1.0 - 1e-4,
+        "{who}: camera at {:?} faces {actual:?} but the box centre is {centre:?}, so it \
+         would frame empty space",
+        transform.translation
+    );
 }
 
 /// Where the camera must be for a given box and field of view.
@@ -1661,11 +1690,17 @@ fn an_unresolved_projection_publishes_no_framing_and_no_camera_distance() {
 /// arithmetic on a synthetic fixture; this is what says the arithmetic survives
 /// **real** geometry, real scales and real authored transforms, rather than one
 /// tidy three-block document. Measured over the real corpus: 47 creature
-/// documents, 0 with resolved blocks but no framing, and distances spanning 0.47
-/// to 23.6 across three orders of magnitude of creature size.
+/// documents, all 47 framing, distances spanning **0.43 to 130.45** -- a ~300x
+/// range in creature size.
 ///
 /// The spread is the interesting half. A single constant, or a bounds source that
 /// happens to be right for a unit-sized fixture, cannot produce that range.
+///
+/// This test also builds an app per document and checks where the camera
+/// ACTUALLY landed. The previous version never constructed an app, never queried a
+/// `Transform` and never touched a camera, so despite its name it proved only that
+/// no real document produced a degenerate bounds box. If `loader::frame_camera`
+/// were deleted outright it would still have passed. Found by review.
 #[test]
 #[ignore = "needs SPORE/"]
 fn every_real_creature_document_frames_from_its_own_measured_extent() {
@@ -1742,24 +1777,70 @@ fn every_real_creature_document_frames_from_its_own_measured_extent() {
             "{key} resolved {resolved} blocks but framed a zero-radius box, which \
              puts the camera at the centre"
         );
+
+        // And the camera really lands where that derivation says. Without this the
+        // test never builds an app, so `frame_camera` could be deleted outright and
+        // the test would still pass -- which is exactly what it did before.
+        let mut app = creator_app(stage, None, 1.0);
+        app.update();
+        app.update();
+        let expected = expected_camera(&framing.bounds, framing.vertical_fov_degrees);
+        let mut query = query_of::<&mut Transform, With<MainCamera>>(&mut app);
+        let translation = query
+            .single(app.world_mut())
+            .expect("one camera")
+            .translation;
+        drop(query);
+        assert!(
+            (translation - Vec3::new(0.0, 6.0, 34.0)).length() > 1.0,
+            "{key} left the camera at ScenePlugin's parking spot {translation:?}"
+        );
+        assert!(
+            translation.distance(expected) < 1e-3,
+            "{key}: camera at {translation:?}, closed form says {expected:?} for bounds \
+             {lo:?}..{hi:?}"
+        );
+        // The POSITION is only half of what frame_camera writes. Changing its up
+        // vector from Y to X aims the camera at nothing, and a test that reads only
+        // `.translation` cannot tell: the position is bit-identical either way. That
+        // mutation was tried against this test and passed it, so the look-at is
+        // asserted separately.
+        let bounds = framing.bounds;
+        let mut view = query_of::<&mut Transform, With<MainCamera>>(&mut app);
+        let transform = *view.single(app.world_mut()).expect("one camera");
+        drop(view);
+        assert_camera_looks_at_centre(&transform, &bounds, &format!("{key}"));
         distances.push(distance);
     }
 
     assert_eq!(documents, 47, "the real corpus has 47 creature documents");
+    // `.is_empty()`, NOT `!...is_empty()`. The first version of this assertion
+    // passed *precisely when the defect it names was present*: `A || B` is
+    // satisfied by a non-empty `resolved_without_framing`, so a corpus of
+    // documents that resolved blocks and framed nothing would have reported
+    // success while printing its own failure list in the message. Found by
+    // review, not by any run -- the corpus happens to be clean, so the
+    // inverted arm was never the one taken.
     assert!(
-        !resolved_without_framing.is_empty() || framed == documents,
+        resolved_without_framing.is_empty(),
         "every creature document that resolved must produce a framing; \
          these resolved but framed nothing: {resolved_without_framing:?}"
     );
-    assert!(framed > 0, "at least one real creature must frame");
+    assert_eq!(framed, documents, "every creature document must frame");
 
     let smallest = distances.iter().cloned().fold(f32::INFINITY, f32::min);
     let largest = distances.iter().cloned().fold(0.0f32, f32::max);
+    let ratio = largest / smallest;
+    // 250, not 20. The printed range is ~300x and the point of the assertion is
+    // that the range CANNOT quietly collapse -- a 21x floor would have sat under a
+    // published "300x" claim and let exactly that collapse through. The two numbers
+    // that disagreed (0.47..23.6 here, 0.43..130.45 in the commit) are now one: this
+    // test prints them and asserts against the same figure the message quotes.
     assert!(
-        largest / smallest > 20.0,
-        "framing distances span only {smallest}..{largest}; a framing that cannot \
-         handle three orders of magnitude of creature size is not robust, and a \
-         constant would pass a weaker version of this"
+        largest / smallest > 250.0,
+        "framing distances span only {smallest}..{largest}, a {ratio:.0}x range; the \
+         published claim is a 300x range, so a collapse toward a single scale is \
+         exactly what must not pass unnoticed"
     );
     println!(
         "framed {framed}/{documents} creature documents; distance {smallest:.2}..{largest:.2}"

@@ -219,21 +219,42 @@ impl Projection {
     ///
     /// Built from each part's **decoded geometry**, placed at the block's world
     /// position. NOT from the rigblock envelope, which was the obvious choice and is
-    /// wrong for a third of the parts: a `k == 0` rigblock is a 36-byte header with
-    /// **no cells**, so its envelope is identically zero and contributes a degenerate
-    /// point. Real creature parts hit this — the six blocks of
-    /// `0x2b978c46:0x40626200:0x05e3df13` share one `k == 0` rigblock, and framing on
-    /// it collapsed the camera onto the 0.36-unit authored position span while the
-    /// geometry is far larger. The geometry is the thing that will be drawn, so the
-    /// geometry is what bounds the drawing.
-    ///
-    /// Orientation is **not** applied to the corner offsets. This is an axis-aligned
-    /// extent for framing a camera, not an oriented box, and rotating the corners of
-    /// a box and re-taking the axis-aligned bounds of the result would be a second,
-    /// subtly different answer. Stated rather than implied.
-    ///
     /// `None` is a real answer. "No geometry" is not "geometry at the origin", and a
     /// creature that failed to compose must not be framed as though it succeeded.
+    ///
+    /// # Why geometry and not the rigblock
+    ///
+    /// A rigblock is a **placement-allowance box** -- it marks where a part may be
+    /// put -- not the part's extent, so it is the wrong input for framing what is
+    /// drawn. That is the whole reason this reads `geometry.positions`.
+    ///
+    /// An earlier version of this comment justified the change with a specific and
+    /// **false** claim: that a `k == 0` rigblock is "a 36-byte header with no cells,
+    /// so its envelope is identically zero and contributes a degenerate point". A
+    /// review measured it against the record this comment cited
+    /// (`0x2b978c46:0x40626200:0x05e3df13`) and found:
+    ///
+    /// ```text
+    /// block 0 rigblock  levels = 0
+    ///                  min_high = [ 0.01655769,  0.057751544, 0.00017166184]
+    ///                  max_low  = [-0.01655769, -0.057751544, -0.037069116]
+    ///                  cells    = 0
+    /// ```
+    ///
+    /// So there is no zero envelope and no degenerate point: `Rigblock::envelope()`
+    /// returns `None` when there are no cells, and the *header* floats that the old
+    /// `bounds()` actually read carry real values. `cc20c3a`'s commit message says
+    /// exactly this ("I assumed ... an all-zero envelope. It does not"); the comment
+    /// it shipped contradicted its own message.
+    ///
+    /// There is also no single ratio between the two, so none is quoted here. Four
+    /// readings of "how big is the rigblock" disagree, and at the median axis the
+    /// geometry can be **ten times smaller** than the rigblock rather than larger.
+    /// `catalog::RigblockBounds` carries the readings by name; see
+    /// `tests/catalog_corpus.rs` for the census and `work/experiments/LEDGER.md` for
+    /// the correction of the "median 2.01x" figure that used to stand here.
+    ///
+    ///
     pub fn bounds(&self) -> Option<Bounds> {
         let mut out: Option<Bounds> = None;
         for block in self.resolved() {

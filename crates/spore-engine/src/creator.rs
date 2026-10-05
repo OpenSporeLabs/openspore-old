@@ -331,7 +331,6 @@ impl CreatorStage {
             framed_extent: None,
             camera_position: None,
             camera_distance_to_centre: None,
-            world_transform_applies_orientation: false,
             blocks: self
                 .projection
                 .blocks()
@@ -422,6 +421,32 @@ pub struct StagedCreator {
     pub scale: f32,
 }
 
+impl CreatorRuntimeState {
+    /// Whether [`spore_morphology::Projection::bounds`] applies a part's
+    /// orientation and scale to its geometry.
+    ///
+    /// **It does not.** `bounds` adds `world_position` to each of a part's
+    /// *untransformed* geometry positions, so a rotated or non-unit-scaled part
+    /// contributes a box that does not match what is drawn. Correct for this
+    /// corpus, which is authored at small near-axis scales; wrong in general.
+    ///
+    /// # Why a `const` and not a per-frame field
+    ///
+    /// This was a `bool` on the struct below, assigned `false` in one place and
+    /// read nowhere. A reviewer caught what that costs. The field's name said "the
+    /// drawn geometry", which is **false**: the spawned `Transform` does apply
+    /// `local_orientation` and `local_scale`, and Bevy composes them through
+    /// parenting, so the creature on screen *is* oriented. A BRP reader seeing
+    /// `world_transform_applies_orientation: false` would conclude it was not.
+    ///
+    /// So two things change: the name now says **bounds**, and a property of the
+    /// code is a `const` rather than a value that can go stale. Fixing `bounds`
+    /// means changing this line, and the compiler then names every reader that
+    /// assumed the old answer. A per-frame field would have said `false` forever
+    /// and taught nobody anything -- and, worse, taught them something false.
+    pub const BOUNDS_APPLY_ORIENTATION: bool = false;
+}
+
 /// Everything an agent can ask about a staged creator scene.
 ///
 /// Reflected so BRP can read it. It holds OpenSpore-owned plain data only --
@@ -480,8 +505,8 @@ pub struct CreatorRuntimeState {
     /// The extent the framing resource asked to fit, as `(x, y, z)`.
     ///
     /// `None` when there was no framing resource. This is the box the creature's
-    /// geometry was measured into, which is not the same thing as what is drawn
-    /// unless [`Self::world_transform_applies_orientation`] is also true.
+    /// geometry was measured into, which is not necessarily the box that is drawn
+    /// -- see [`CreatorRuntimeState::BOUNDS_APPLY_ORIENTATION`].
     pub framed_extent: Option<[f32; 3]>,
     /// The camera's measured world position, read back out of the scene.
     ///
@@ -501,16 +526,6 @@ pub struct CreatorRuntimeState {
     /// reads as a very large distance and a framed one as a small one, derived
     /// from the creature's own measured extent rather than from any constant.
     pub camera_distance_to_centre: Option<f32>,
-    /// Whether the projection's `world_orientation` is applied to the drawn
-    /// geometry.
-    ///
-    /// `false` today, and recorded rather than hidden: `Projection::bounds` adds a
-    /// part's world position to its **untransformed** geometry positions, so a
-    /// rotated or scaled part contributes a box that does not match what is drawn.
-    /// It is correct for the corpus, which is authored at small uniform scales
-    /// near the axis, and wrong in general. `false` here is the honest reading, and
-    /// it is what a future fix must flip.
-    pub world_transform_applies_orientation: bool,
     /// One row per authored block, in document order.
     ///
     /// **Including the unresolved ones.** An agent can therefore enumerate a

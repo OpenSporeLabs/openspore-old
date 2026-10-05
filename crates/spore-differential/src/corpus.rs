@@ -76,6 +76,23 @@ impl fmt::Display for LocatedRecord {
 pub struct Corpus {
     packages: Vec<LocatedPackage>,
     records: Vec<LocatedRecord>,
+    /// The staging directory this corpus copied its fixtures into, if any.
+    ///
+    /// Owned so it can be removed on drop. Per-call staging is what fixed the
+    /// concurrency race, but it also meant every call created a directory that
+    /// nothing ever deleted: a reviewer measured 12 accumulated directories on a
+    /// machine that had run the suite a handful of times. Bounded and small, and
+    /// still a leak -- a test helper that leaves files in `/tmp` on every run is
+    /// the same defect class as one that leaves them on failure.
+    staging: Option<PathBuf>,
+}
+
+impl Drop for Corpus {
+    fn drop(&mut self) {
+        if let Some(staging) = self.staging.take() {
+            let _ = std::fs::remove_dir_all(&staging);
+        }
+    }
 }
 
 impl Corpus {
@@ -107,6 +124,7 @@ impl Corpus {
         Self {
             packages,
             records: Vec::new(),
+            staging: None,
         }
     }
 
@@ -116,6 +134,7 @@ impl Corpus {
         Self {
             packages: scan_packages(directory),
             records: Vec::new(),
+            staging: None,
         }
     }
 
@@ -190,6 +209,7 @@ impl Corpus {
                 size_bytes: size_of(&staging.join("mini_package.package"))?,
             }],
             records,
+            staging: Some(staging),
         })
     }
 
