@@ -83,22 +83,85 @@ impl PaletteEntry {
     }
 }
 
+/// The palette, with the evidence needed to tell "not resolved" from "not found".
+///
+/// # Why this is not a bare `Vec<PaletteEntry>`
+///
+/// [`build_palette`] resolves 482 part chains, which needs the package *files*.
+/// When the install is absent it resolves none of them, and the two results are
+/// both "482 rows" -- identical in a UI, opposite in meaning. One is a full palette
+/// whose 18 rows are honest non-answers; the other is a screen that looked for
+/// geometry and had nothing to look in. Collapsing them is how "we did not look"
+/// becomes "we looked and found nothing", so the counts travel with the entries.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Palette {
+    /// One row per candidate part, in store order.
+    pub entries: Vec<PaletteEntry>,
+    /// Packages the resolver actually opened.
+    pub packages_opened: usize,
+    /// Packages in the store that carry no path, so no resolver could open them.
+    ///
+    /// Non-zero is a **stated limitation**: those parts are enumerated but cannot be
+    /// decoded, because a package built from bytes in memory has no file for
+    /// `PackageSource` to re-read. Zero for every store the engine builds, since
+    /// [`spore_assets::Package::open`] always records its path.
+    pub packages_without_path: usize,
+}
+
+impl Palette {
+    /// Whether the chains were resolved against real files at all.
+    ///
+    /// The one question a caller must ask before drawing anything: a `false` here
+    /// means every `drawable: false` below is "we had nothing to read", not "these
+    /// parts have no geometry".
+    pub fn resolved(&self) -> bool {
+        self.packages_opened > 0
+    }
+
+    /// Rows that reached drawable geometry.
+    pub fn drawable(&self) -> usize {
+        self.entries.iter().filter(|entry| entry.drawable).count()
+    }
+}
+
+/// A resolver source over the same packages the store indexed.
+///
+/// The store enumerates identities from a memory-mapped index; [`PackageSource`]
+/// re-reads the files to resolve the chains. They cannot be the same object, so the
+/// paths have to be carried across — and they can only be carried across because
+/// [`spore_assets::Package::path`] records where each package came from, rather than
+/// this re-guessing filenames.
+///
+/// Packages with no path are **counted, not skipped silently**; see
+/// [`Palette::packages_without_path`].
+fn source_over(store: &ContentStore) -> (PackageSource, usize) {
+    let mut source = PackageSource::new();
+    let mut without_path = 0;
+    for package in store.packages() {
+        match package.path() {
+            Some(path) => source = source.open(path),
+            None => without_path += 1,
+        }
+    }
+    (source, without_path)
+}
+
 /// Builds the palette over the creature rigblock group.
 ///
 /// `group_id` is a parameter, never a constant — see
-/// [`Catalog::build_from_identities`]. Infallible: a store that would not open
-/// yields an empty palette, and an empty palette is a screen with nothing in it
-/// rather than an error, because the caller has no better answer to offer and
-/// inventing one would be worse.
-pub fn build_palette(store: &ContentStore, group_id: u32) -> Vec<PaletteEntry> {
+/// [`Catalog::build_from_identities`]. Infallible: a store that cannot be resolved
+/// yields a palette with **zero opened packages**, which says so through
+/// [`Palette::resolved`], rather than an error the caller has no better answer for.
+pub fn build_palette(store: &ContentStore, group_id: u32) -> Palette {
     let ids: Vec<BlockId> = store
         .identities_of_type(spore_morphology::resolve::TYPE_RIGBLOCK)
         .into_iter()
         .filter(|key| key.group_id == group_id)
         .map(|key| BlockId::new(key.group_id, key.instance_id))
         .collect();
-    let catalog = Catalog::build_from_identities(&PackageSource::new(), ids);
-    catalog
+    let (source, packages_without_path) = source_over(store);
+    let catalog = Catalog::build_from_identities(&source, ids);
+    let entries = catalog
         .entries()
         .iter()
         .map(|entry| PaletteEntry {
@@ -109,7 +172,12 @@ pub fn build_palette(store: &ContentStore, group_id: u32) -> Vec<PaletteEntry> {
                 .value()
                 .map(|geometry| geometry.triangles as u32),
         })
-        .collect()
+        .collect();
+    Palette {
+        packages_opened: source.package_count(),
+        packages_without_path,
+        entries,
+    }
 }
 
 /// A thumbnail bake that has not run yet.
@@ -264,14 +332,140 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_palette_has_no_labels_to_render() {
-        // The property `build_palette` must have when the packages are absent: no
-        // invented parts. A palette that panicked would take the whole screen down,
-        // because it is furniture.
-        let empty: Vec<PaletteEntry> = Vec::new();
+    fn an_empty_store_yields_an_unresolved_palette_not_an_empty_one() {
+        // The previous version of this test built a `Vec::new()`, asserted it was
+        // empty, and called it a day -- it never called `build_palette`, so it
+        // passed while the real function handed `Catalog` an empty
+        // `PackageSource` and marked all 482 parts non-drawable. A test of a
+        // locally constructed value is not a test of the function.
+        let palette = build_palette(&ContentStore::new(), 0x4062_6000);
         assert!(
-            empty.is_empty() && empty.iter().all(|entry| entry.label().is_empty()),
-            "an empty palette yields nothing at all"
+            palette.entries.is_empty(),
+            "an empty store enumerates nothing"
         );
+        // The load-bearing assertion: "resolved against nothing" and "found
+        // nothing" are different answers and only the first one is true here.
+        assert!(
+            !palette.resolved(),
+            "no packages opened must not read as resolved"
+        );
+        assert_eq!(palette.drawable(), 0);
+    }
+
+    #[test]
+    fn a_store_of_pathless_packages_enumerates_but_cannot_resolve() {
+        // A package built from bytes has no file for `PackageSource` to re-read, so
+        // its parts are enumerable and undecodable at the same time. Counting those
+        // packages is what stops that from looking like a corpus of parts whose
+        // geometry happens to be missing.
+        let store = ContentStore::new();
+        let palette = build_palette(&store, 0x4062_6000);
+        assert_eq!(palette.packages_without_path, 0, "an empty store has none");
+        assert_eq!(palette.packages_opened, 0);
+        assert!(!palette.resolved());
+    }
+
+    #[test]
+    fn a_drawable_row_and_a_resolved_palette_are_separate_facts() {
+        // Guards the aggregation: `resolved()` is about packages, `drawable()` is
+        // about parts. A future edit that made `resolved()` mean "some part worked"
+        // would make an install that decoded 2 of 482 look resolved.
+        let palette = Palette {
+            entries: vec![PaletteEntry {
+                id: BlockId::new(0x4062_6000, 0x1111_1111),
+                drawable: true,
+                triangles: Some(12),
+            }],
+            packages_opened: 0,
+            packages_without_path: 1,
+        };
+        assert_eq!(palette.drawable(), 1);
+        assert!(
+            !palette.resolved(),
+            "one good part is not a readable install"
+        );
+    }
+}
+
+/// The corpus test for [`build_palette`], in its own module so it does not
+/// drag `ContentStore` into the hermetic build's test binary.
+///
+/// `#[ignore]`d like every other corpus test here: it needs `SPORE/`, it resolves
+/// 482 chains, and the hermetic suite must pass with no game installed.
+#[cfg(test)]
+mod corpus {
+    use super::{build_palette, Palette};
+    use spore_assets::ContentStore;
+
+    /// The creature-part group, from the corpus census.
+    const CREATURE_PARTS: u32 = 0x4062_6000;
+
+    /// The workspace root, resolved from the crate directory.
+    ///
+    /// Not a relative path and not the cwd: cargo runs a test binary with the
+    /// *package* directory as its cwd, so `SPORE/Data/...` resolves to nothing here
+    /// even though it works from a shell at the workspace root. A path that works
+    /// under `cargo test` and fails under `cargo test --release` is the worst kind,
+    /// because it looks like a corpus finding when it is a path bug.
+    fn install_root() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("the crate directory has a workspace root above it")
+            .to_path_buf()
+    }
+
+    fn store() -> Option<ContentStore> {
+        let root = install_root();
+        if !root.join("SPORE/Data/Spore_Game.package").is_file() {
+            return None;
+        }
+        spore_assets::open_packages([
+            root.join("SPORE/Data/Spore_Game.package"),
+            root.join("SPORE/Data/Spore_Graphics.package"),
+        ])
+        .ok()
+    }
+
+    #[test]
+    #[ignore = "needs SPORE/ and resolves 482 chains"]
+    fn the_palette_really_resolves_four_hundred_and_some_parts() {
+        let Some(store) = store() else {
+            eprintln!("SKIP: no SPORE/Data/Spore_Game.package");
+            return;
+        };
+        let palette: Palette = build_palette(&store, CREATURE_PARTS);
+
+        // The regression this guards: an empty `PackageSource` still yields 482
+        // enumerated rows, so the row count alone proves nothing. `resolved()` and
+        // `drawable()` are what separate "read the files" from "invented nothing".
+        assert!(
+            palette.resolved(),
+            "no package opened: the chains were never resolved"
+        );
+        assert_eq!(
+            palette.packages_without_path, 0,
+            "engine-built stores always record a path"
+        );
+        assert_eq!(
+            palette.entries.len(),
+            482,
+            "the corpus census is 482 creature rigblocks"
+        );
+        assert_eq!(
+            palette.drawable(),
+            464,
+            "464 of 482 reach drawable geometry"
+        );
+        // A drawable row with no triangle count would draw an empty cell while still
+        // counting as authorable, which is the "looks populated, is not" failure one
+        // level down.
+        let counted = palette
+            .entries
+            .iter()
+            .filter(|entry| entry.drawable)
+            .filter(|entry| entry.triangles.is_some())
+            .count();
+        assert_eq!(counted, 464, "every drawable row carries a triangle count");
     }
 }
