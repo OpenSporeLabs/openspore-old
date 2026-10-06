@@ -37,6 +37,7 @@
 //! guess about whether the world is stale.
 
 use bevy::prelude::*;
+use bevy::ui::ui_transform::UiGlobalTransform;
 
 use crate::creator::{
     spawn_projection_skin, CreatorRootMarker, CreatorRuntimeState, DocumentSource,
@@ -212,6 +213,15 @@ pub struct LastPick {
     /// stops scrolling the catalog from resizing the creature -- so this is a
     /// measurement, not an error counter.
     pub wheel_rejected_outside_viewport: u32,
+    /// The geometry of the last wheel guard evaluation, as it saw it.
+    ///
+    /// Present because the guard's correctness cannot be read off its own counter: a
+    /// rejection counter of zero is right when the cursor is over the viewport and
+    /// also right when the cursor never moved at all, and those two are the whole
+    /// difference between a working guard and a broken input bridge. The four numbers
+    /// are the inputs and the output, so the test can be redone by hand against real
+    /// values instead of argued about.
+    pub wheel_probe: Option<WheelProbe>,
     /// Selection requests that the document refused, ever.
     ///
     /// A refusal is not an error state to clear; it is a count. A UI that silently
@@ -514,7 +524,11 @@ fn pick_under_cursor(
     // and re-deriving it for a narrower viewport is a separate piece of work --
     // so the panel genuinely overlaps the 3D view, and without this guard every
     // button press would also select whatever part happens to be behind it.
-    if !cursor_over_viewport(cursor, viewports) {
+    //
+    // The scaling factor comes from the SAME camera the ray is built from, so the
+    // guard and the ray cannot disagree about which space the cursor is in.
+    let scale = camera.target_scaling_factor().unwrap_or(1.0);
+    if !cursor_over_viewport(cursor, scale, viewports) {
         *rejected += 1;
         return (None, 0);
     }
@@ -585,31 +599,71 @@ fn pick_under_cursor(
 /// [`LastPick::rejected_outside_viewport`] and
 /// [`LastPick::wheel_rejected_outside_viewport`]. A non-zero rejection count with
 /// clicks that plainly landed inside is this bug and nothing else.
-fn cursor_over_viewport(cursor: Vec2, viewports: &ViewportNodes) -> bool {
-    let Some((node, node_transform)) = viewports.iter().next() else {
+/// # The two things this got wrong, both found by measuring instead of reading
+///
+/// 1. The query asked for [`bevy::prelude::GlobalTransform`]. A Bevy 0.19 UI node
+///    does not carry that; it carries [`UiGlobalTransform`]. So the query matched
+///    **no node ever**, and the guard fell through its no-opinion branch and
+///    accepted every input.
+/// 2. With the right component it still would not have worked on a scaled display:
+///    [`ComputedNode::size`] and [`UiGlobalTransform`] are in **physical** pixels
+///    while [`bevy::window::Window::cursor_position`] is in **logical** ones.
+///
+/// # Both handed to Bevy, because Bevy already answers this question correctly
+///
+/// [`ComputedNode::contains_point`] is the same test the UI picking backend runs,
+/// against the same signed-distance function the renderer draws rounded rectangles
+/// with. It inverts the node's own transform, so it is right about rotation and
+/// scale, and right about border radius. A hand-rolled `abs(local) <= half` is not:
+/// it silently assumes an axis-aligned, unrotated, square-cornered node, which is
+/// true today and wrong the first time a node is animated.
+///
+/// The logical-to-physical conversion is the one line Bevy's own backend runs
+/// (`picking_backend.rs`): multiply by the camera's target scaling factor. Guessing
+/// a scale factor, or assuming 1.0 because the development machine reports 1.0, is
+/// how a guard works on the author's screen and fails on the user's.
+fn cursor_over_viewport(cursor: Vec2, scale: f32, viewports: &ViewportNodes) -> bool {
+    let Some((node, transform)) = viewports.iter().next() else {
         return true;
     };
-    let translation = node_transform.translation();
-    cursor_in_rect(
-        cursor,
-        Vec2::new(translation.x, translation.y),
-        node.size * 0.5,
-    )
+    node.contains_point(*transform, cursor * scale)
 }
 
-/// Whether a cursor lies inside an axis-aligned rect given its centre and half-size.
+/// The same comparison as [`cursor_over_viewport`], keeping the numbers it used.
 ///
-/// # Why the edges are inclusive, and why the test pins them
+/// Split out so the wheel can publish what it compared. Returning only a `bool` from
+/// a guard nobody can see inside is how "the guard passed" and "the guard matched no
+/// node" stayed the same observation.
+fn viewport_probe(cursor: Vec2, scale: f32, viewports: &ViewportNodes) -> WheelProbe {
+    let point = pointer_in_node_space(cursor, scale);
+    let Some((node, transform)) = viewports.iter().next() else {
+        return WheelProbe {
+            cursor_logical: [cursor.x, cursor.y],
+            point_physical: [point.x, point.y],
+            scale,
+            node_size: [0.0, 0.0],
+            inside: true,
+            had_node: false,
+        };
+    };
+    WheelProbe {
+        cursor_logical: [cursor.x, cursor.y],
+        point_physical: [point.x, point.y],
+        scale,
+        node_size: [node.size.x, node.size.y],
+        inside: node.contains_point(*transform, point),
+        had_node: true,
+    }
+}
+
+/// Logical cursor -> the physical-pixel space a [`ComputedNode`] is measured in.
 ///
-/// A UI node's rect *is* its half-size box, so a cursor exactly on the boundary is
-/// over the viewport. Both `<` and `<=` here pass every "obviously inside" and every
-/// "obviously outside" case, which means a flipped comparison survives a casual
-/// check and only shows up as a one-pixel dead edge. So the tests below assert the
-/// boundary explicitly in both directions and assert the two axes independently: a
-/// rect test that checked only `x` would pass every point off to the side.
-fn cursor_in_rect(cursor: Vec2, centre: Vec2, half: Vec2) -> bool {
-    let local = cursor - centre;
-    local.x.abs() <= half.x && local.y.abs() <= half.y
+/// One function, because the click path and the wheel path must not disagree about
+/// which space a cursor is in; a guard that measures the wheel in logical units and
+/// the click in physical ones accepts in one place and refuses in the other, with no
+/// way to tell from the counters which is which.
+fn pointer_in_node_space(cursor: Vec2, scale: f32) -> Vec2 {
+    cursor * scale
 }
 
 /// An agent- or keyboard-issued selection, applied to the real document.
@@ -696,7 +750,7 @@ pub fn select_block_from_outside(state: &mut CreatorEditorState, block: Option<u
 type ViewportNodes<'w, 's> = Query<
     'w,
     's,
-    (&'static ComputedNode, &'static GlobalTransform),
+    (&'static ComputedNode, &'static UiGlobalTransform),
     (With<CreatorUiPart>, With<Viewport>),
 >;
 
@@ -744,6 +798,7 @@ fn wheel_scales_selection(
     wheel: Res<bevy::input::mouse::AccumulatedMouseScroll>,
     keys: Res<ButtonInput<KeyCode>>,
     windows: Query<&Window>,
+    cameras: Query<&Camera, With<MainCamera>>,
     viewports: ViewportNodes,
     mut state: ResMut<CreatorEditorState>,
     mut last_pick: ResMut<LastPick>,
@@ -757,11 +812,19 @@ fn wheel_scales_selection(
     };
     // The wheel is not only a scale control: it is also how a grid pages. A cursor
     // over the panel must not resize the creature, so this shares the click path's
-    // guard instead of re-deriving the viewport rect.
+    // guard instead of re-deriving the viewport rect -- including the camera, so the
+    // scaling factor is the same one the picker's ray would use.
     let Some(cursor) = windows.iter().find_map(Window::cursor_position) else {
         return;
     };
-    if !cursor_over_viewport(cursor, &viewports) {
+    let scale = cameras
+        .iter()
+        .next()
+        .and_then(|camera| camera.target_scaling_factor())
+        .unwrap_or(1.0);
+    let probe = viewport_probe(cursor, scale, &viewports);
+    last_pick.wheel_probe = Some(probe);
+    if !probe.inside {
         last_pick.wheel_rejected_outside_viewport += 1;
         return;
     }
@@ -851,6 +914,34 @@ pub fn apply_initial_selection(
     session.select(select).map_err(|error| error.to_string())
 }
 
+/// What the wheel guard saw on its last evaluation.
+///
+/// The inputs and the verdict, in the units the guard actually compared, so the
+/// comparison can be repeated from the outside without trusting the verdict. It
+/// exists because the guard's correctness cannot be read off its own counter: a
+/// rejection count of zero is right when the cursor is over the viewport, and also
+/// right when the cursor never moved, and also right when the guard is matching no
+/// node at all. Those three were indistinguishable until this was published, and the
+/// third is the one that was true.
+#[derive(Reflect, Debug, Clone, Copy, PartialEq)]
+pub struct WheelProbe {
+    /// The cursor, in `Window::cursor_position` (logical) units.
+    pub cursor_logical: [f32; 2],
+    /// The same point after conversion, in `ComputedNode` (physical) units.
+    pub point_physical: [f32; 2],
+    /// The camera's target scaling factor -- the multiplier between the two.
+    pub scale: f32,
+    /// The viewport node's measured size, in physical units.
+    pub node_size: [f32; 2],
+    /// Whether the guard accepted the point.
+    pub inside: bool,
+    /// Whether a viewport node existed to compare against at all.
+    ///
+    /// `false` means the guard **did not run**: it took its no-opinion branch and
+    /// accepted everything, which is indistinguishable from a pass unless stated.
+    pub had_node: bool,
+}
+
 /// The normal-mode constant, re-exported so a caller building an editor app
 /// cannot spell it differently from the spawn system.
 pub use crate::loader::NORMAL_MODE as EDITOR_NORMAL_MODE;
@@ -875,77 +966,29 @@ impl CreatorEditorState {
 
 #[cfg(test)]
 mod tests {
-    use super::cursor_in_rect;
-
-    /// The rect both callers share: a viewport node centred at the window centre.
-    fn rect() -> (bevy::math::Vec2, bevy::math::Vec2) {
-        (
-            bevy::math::Vec2::new(640.0, 360.0),
-            bevy::math::Vec2::new(384.0, 360.0),
-        )
-    }
+    use super::pointer_in_node_space;
 
     #[test]
-    fn cursor_at_the_centre_is_inside() {
-        let (centre, half) = rect();
-        assert!(cursor_in_rect(centre, centre, half));
-    }
-
-    #[test]
-    fn every_edge_is_inclusive_in_both_directions() {
-        let (centre, half) = rect();
-        for point in [
-            centre + bevy::math::Vec2::new(half.x, 0.0),
-            centre - bevy::math::Vec2::new(half.x, 0.0),
-            centre + bevy::math::Vec2::new(0.0, half.y),
-            centre - bevy::math::Vec2::new(0.0, half.y),
-            centre + half,
-            centre - half,
-        ] {
-            assert!(
-                cursor_in_rect(point, centre, half),
-                "edge {point:?} must count as inside"
-            );
-        }
-    }
-
-    #[test]
-    fn one_pixel_past_an_edge_is_outside() {
-        let (centre, half) = rect();
-        for point in [
-            centre + bevy::math::Vec2::new(half.x + 1.0, 0.0),
-            centre - bevy::math::Vec2::new(half.x + 1.0, 0.0),
-            centre + bevy::math::Vec2::new(0.0, half.y + 1.0),
-            centre - bevy::math::Vec2::new(0.0, half.y + 1.0),
-        ] {
-            assert!(
-                !cursor_in_rect(point, centre, half),
-                "one pixel past {point:?} must be outside"
-            );
-        }
-    }
-
-    #[test]
-    fn the_two_axes_are_tested_independently() {
-        // A rect test that only checked one axis would pass every one of these.
-        let (centre, half) = rect();
-        let well_inside_x = centre + bevy::math::Vec2::new(0.0, half.y + 50.0);
-        assert!(!cursor_in_rect(well_inside_x, centre, half));
-        let well_inside_y = centre + bevy::math::Vec2::new(half.x + 50.0, 0.0);
-        assert!(!cursor_in_rect(well_inside_y, centre, half));
-    }
-
-    #[test]
-    fn a_degenerate_rect_accepts_only_its_own_point() {
-        // Guards the opposite defect: a half-size of zero must not turn into an
-        // "everything is inside" answer through a division or a sign slip.
-        let centre = bevy::math::Vec2::new(10.0, 10.0);
-        let zero = bevy::math::Vec2::ZERO;
-        assert!(cursor_in_rect(centre, centre, zero));
-        assert!(!cursor_in_rect(
-            centre + bevy::math::Vec2::new(0.5, 0.0),
-            centre,
-            zero
-        ));
+    fn the_cursors_own_units_are_logical_and_the_nodes_are_physical() {
+        // The conversion Bevy's own picking backend runs
+        // (`picking_backend.rs`: `pointer_position * target_scaling_factor`). A
+        // scale of 1.0 is this machine's, which is precisely why assuming it is the
+        // bug: the conversion is invisible here and load bearing everywhere else.
+        let cursor = bevy::math::Vec2::new(300.0, 400.0);
+        assert_eq!(
+            pointer_in_node_space(cursor, 1.0),
+            cursor,
+            "at scale 1 the two spaces coincide"
+        );
+        assert_eq!(
+            pointer_in_node_space(cursor, 2.0),
+            bevy::math::Vec2::new(600.0, 800.0),
+            "a HiDPI target doubles every cursor coordinate"
+        );
+        // Both axes, because a half-applied conversion passes on a square display.
+        assert_eq!(
+            pointer_in_node_space(bevy::math::Vec2::new(11.0, 23.0), 1.5),
+            bevy::math::Vec2::new(16.5, 34.5)
+        );
     }
 }

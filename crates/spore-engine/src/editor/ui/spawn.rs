@@ -513,6 +513,19 @@ fn spawn_section_bar(commands: &mut Commands, parent: Entity, index: usize, open
 /// Its background is [`layout::viewport_background`] — transparent, because the
 /// creature renders through it — and it carries the border rather than the split
 /// row, so the hairline belongs to the thing it outlines.
+/// The viewport's 3D window, and the one node the input guards measure against.
+///
+/// # The `Viewport` marker is load bearing, not documentation
+///
+/// [`crate::editor::plugin::Viewport`] is a separate component from the
+/// [`CreatorUiPart::Viewport`] variant on the next line, and the input guards query
+/// for **the marker**: `With<CreatorUiPart>, With<Viewport>`. For a while the marker
+/// was declared and used as a filter but never inserted, so the query matched
+/// nothing and the guards silently degraded to "no node, so no opinion, so accept".
+/// A click on the panel and a scroll on the catalog both reached the creature, and
+/// the counters stayed at zero — which read as "the guard passed" when the guard had
+/// never run. Keep the two in step: the variant says what the node **is**, the marker
+/// says what can **find** it.
 pub fn spawn_viewport(commands: &mut Commands, parent: Entity) -> Entity {
     commands
         .spawn((
@@ -521,6 +534,7 @@ pub fn spawn_viewport(commands: &mut Commands, parent: Entity) -> Entity {
             layout::viewport_border_color(),
             ChildOf(parent),
             CreatorUiPart::Viewport,
+            crate::editor::plugin::Viewport,
             Name::new("creator-ui-viewport"),
         ))
         .id()

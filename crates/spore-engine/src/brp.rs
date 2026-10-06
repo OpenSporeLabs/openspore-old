@@ -135,6 +135,10 @@ fn register_openspore_types(app: &mut App) {
     // one channel built to answer it. Registered here rather than unconditionally
     // so the hermetic test build gains no registry entries.
     app.register_type::<crate::editor::plugin::LastPick>();
+    // The probe is a field of LastPick, and an unregistered type is invisible to
+    // BRP's reflection: the field would come back omitted or empty, which is the
+    // "bridge is broken" symptom for a value that is perfectly fine.
+    app.register_type::<crate::editor::plugin::WheelProbe>();
     app.register_type::<crate::editor::plugin::CreatorSelectionCommand>();
     app.register_type::<crate::creator::CreatorRootMarker>();
 }

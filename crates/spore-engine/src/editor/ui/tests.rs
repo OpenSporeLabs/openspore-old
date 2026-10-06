@@ -695,6 +695,57 @@ fn the_hud_is_pinned_to_the_viewport_and_not_the_window() {
 }
 
 #[test]
+fn the_viewport_node_carries_the_marker_the_input_guards_query() {
+    // The regression this asserts: `Viewport` was declared in the editor plugin and
+    // used as a query filter, but never inserted on any entity. The guards
+    // (`read_viewport_click`, `wheel_scales_selection`) therefore matched no node,
+    // fell through their "no node, no opinion" branch, and accepted everything --
+    // so a click on the panel and a scroll on the catalog both reached the creature
+    // while their rejection counters stayed at zero, which reads exactly like a
+    // guard that passed.
+    //
+    // Asserting the ENUM variant is not enough: it was always present, and it is a
+    // different component from the one the query filters on. The claim is about
+    // findability, so it is tested by querying exactly as the guard does.
+    let mut world = default_world();
+    let viewport = one_part(&mut world, CreatorUiPart::Viewport);
+
+    assert!(
+        world
+            .get::<crate::editor::plugin::Viewport>(viewport)
+            .is_some(),
+        "the viewport entity must carry the `Viewport` marker component, because \
+         that -- not the enum variant -- is what the guards filter on"
+    );
+
+    // And the reverse direction: the query the guard runs must now find it, and find
+    // exactly the viewport rather than some other UI part.
+    let mut guarded =
+        world.query_filtered::<Entity, bevy::prelude::With<crate::editor::plugin::Viewport>>();
+    let found: Vec<Entity> = guarded.iter(&world).collect();
+    assert_eq!(
+        found,
+        vec![viewport],
+        "the guard's query must match the viewport and nothing else"
+    );
+}
+
+#[test]
+fn no_other_ui_node_claims_the_viewport_marker() {
+    // The guard takes `viewports.iter().next()`, so a second marked node would make
+    // the guard silently measure whichever the archetype order happened to yield.
+    // One marker, one meaning.
+    let mut world = default_world();
+    let mut marked =
+        world.query_filtered::<Entity, bevy::prelude::With<crate::editor::plugin::Viewport>>();
+    let count = marked.iter(&world).count();
+    assert_eq!(
+        count, 1,
+        "exactly one node may carry the marker, found {count}"
+    );
+}
+
+#[test]
 fn the_root_has_exactly_two_children_the_split_and_the_bottom_bar() {
     let mut world = default_world();
     let root = one_part(&mut world, CreatorUiPart::Root);
