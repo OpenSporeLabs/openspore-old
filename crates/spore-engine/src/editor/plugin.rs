@@ -76,7 +76,10 @@ impl Plugin for CreatorEditorPlugin {
             // editor does not add `CreatorPlugin`: it spawns the creature itself,
             // and two owners of one entity kind is how this crate once got
             // "Camera order ambiguities" and a framing bug's clothes.
-            .add_systems(PostStartup, (frame_editor_camera, ui::font::apply))
+            .add_systems(
+                PostStartup,
+                (remove_debug_ground, frame_editor_camera, ui::font::apply),
+            )
             .add_systems(
                 Update,
                 (
@@ -204,17 +207,34 @@ pub struct LastPick {
 /// The creature is **not** spawned here: [`spawn_or_respawn_creature`] owns
 /// that, and having two owners is how a respawn ends up spawning the creature
 /// twice.
-fn spawn_creator_screen(
-    mut commands: Commands,
-    state: Res<CreatorEditorState>,
-    ground: Query<Entity, With<GroundPlane>>,
-) {
+fn spawn_creator_screen(mut commands: Commands, state: Res<CreatorEditorState>) {
     spawn_creator_ui(&mut commands, &state.view);
-    // The debug ground plane is opaque and 400x400 at y = -0.01, so it buries any
-    // creature whose centre sits below that -- and `0x135ff098` centres at
-    // y = -0.529. Every symptom said the model was fine: ten blocks resolved, ten
-    // visible, a valid framing. The screen was a grey floor. See
-    // `scene::GroundPlane`.
+}
+
+/// Removes the debug ground plane.
+///
+/// # `PostStartup`, and that is the whole content of this note
+///
+/// The first version of this ran in `Startup`, alongside `ScenePlugin`'s own world
+/// spawn, and it did nothing. Those two systems take disjoint parameters, so Bevy
+/// runs them **in parallel** -- and `Commands::spawn` is deferred, so the query for
+/// `GroundPlane` executed before the plane existed to be found. The removal
+/// "succeeded" silently, every frame, forever.
+///
+/// `PostStartup` is the first schedule in which every `Startup` spawn has been
+/// applied, which is the only reason a query can see anything that `Startup`
+/// spawned. A system that needs to observe startup output has to run after
+/// startup.
+///
+/// # Why it matters beyond tidiness
+///
+/// The plane is opaque, 400x400, at `y = -0.01`. `0x135ff098` is a 10-deep spine
+/// whose centre sits at `y = -0.529`, so the plane sat between the camera (at
+/// `y = +0.137`) and the creature. Every counter said the model was fine -- ten
+/// blocks resolved, ten visible, a valid framing at distance 1.589 -- and the screen
+/// was a grey floor. Nothing rendered *because it was all correctly there and then
+/// covered up*, which is the hardest class of bug to spot from inside the model.
+fn remove_debug_ground(mut commands: Commands, mut ground: Query<Entity, With<GroundPlane>>) {
     for entity in ground.iter() {
         commands.entity(entity).despawn();
     }
