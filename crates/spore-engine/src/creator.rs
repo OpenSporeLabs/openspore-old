@@ -331,6 +331,12 @@ impl CreatorStage {
             framed_extent: None,
             camera_position: None,
             camera_distance_to_centre: None,
+            viewport_available: false,
+            viewport_physical_position: Some([0, 0]),
+            viewport_physical_size: Some([0, 0]),
+            viewport_scale_factor: 1.0,
+            viewport_camera_position: None,
+            viewport_camera_distance_to_centre: None,
             skin: crate::editor::skin::SkinPalette::from_document(&self.document)
                 .map(|palette| palette.describe())
                 .unwrap_or_else(|| "no <skincolor*> in this document".to_owned()),
@@ -556,6 +562,33 @@ pub struct CreatorRuntimeState {
     /// failure it did not see on screen, which is the entire point: the entity
     /// does not exist, but the reason does.
     pub blocks: Vec<CreatorBlockState>,
+    /// Whether a laid-out UI node has been measured for the 3D viewport yet.
+    ///
+    /// `false` during the first frames, which is normal and is not an error. It is
+    /// emphatically not "the viewport is the whole window": that substitution is
+    /// the defect this exists to make visible, and a reader that assumed it would
+    /// conclude the creature is centred in a region it is not.
+    pub viewport_available: bool,
+    /// The 3D viewport rectangle's physical top-left, as the camera was given it.
+    pub viewport_physical_position: Option<[u32; 2]>,
+    /// The 3D viewport rectangle's physical size, as the camera was given it.
+    pub viewport_physical_size: Option<[u32; 2]>,
+    /// The logical-to-physical factor that rectangle was measured under.
+    pub viewport_scale_factor: f32,
+    /// The creature camera's world position, read back out of the scene.
+    ///
+    /// Separate from [`Self::camera_position`] because in the editor the two
+    /// describe different cameras: `camera_position` is the full-window UI camera,
+    /// which is deliberately never moved, and this is the one the creature is
+    /// rendered through and framed on. Overwriting the shared field would have
+    /// quietly redefined it for the viewer too.
+    pub viewport_camera_position: Option<[f32; 3]>,
+    /// How far the creature camera sits from the centre of the framed box.
+    ///
+    /// The same quantity as [`Self::camera_distance_to_centre`], over the same
+    /// centre, so the two are comparable numbers rather than two definitions of
+    /// "framed".
+    pub viewport_camera_distance_to_centre: Option<f32>,
 }
 
 /// One authored block's row in [`CreatorRuntimeState::blocks`].

@@ -139,6 +139,12 @@ fn register_openspore_types(app: &mut App) {
     // BRP's reflection: the field would come back omitted or empty, which is the
     // "bridge is broken" symptom for a value that is perfectly fine.
     app.register_type::<crate::editor::plugin::WheelProbe>();
+    // The click path's coordinate-mapping probe, and the rectangle both probes are
+    // measured against. An unregistered type is invisible to BRP's reflection: the
+    // field comes back omitted or empty, which is the "bridge is broken" symptom
+    // for a value that is perfectly fine.
+    app.register_type::<crate::editor::plugin::PickProbe>();
+    app.register_type::<crate::editor::viewport::CreatorViewport>();
     app.register_type::<crate::editor::plugin::CreatorSelectionCommand>();
     app.register_type::<crate::creator::CreatorRootMarker>();
 }

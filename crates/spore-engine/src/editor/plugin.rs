@@ -47,6 +47,7 @@ use crate::editor::session::CreatorSession;
 use crate::editor::skin::SkinPalette;
 use crate::editor::ui;
 use crate::editor::ui::spawn::{spawn_creator_ui, CreatorUiPart, CreatorUiView};
+use crate::editor::viewport::{CreatorViewport, CreatorViewportCamera};
 use crate::scene::{GroundPlane, MainCamera, OnStage};
 use std::num::NonZeroUsize;
 
@@ -66,6 +67,7 @@ pub struct CreatorEditorRequest {
 impl Plugin for CreatorEditorPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(Startup, spawn_creator_screen)
+            .add_systems(Startup, spawn_viewport_camera)
             .add_systems(
                 Startup,
                 |mut commands: Commands, mut fonts: ResMut<Assets<Font>>| {
@@ -73,28 +75,208 @@ impl Plugin for CreatorEditorPlugin {
                     commands.insert_resource(coverage);
                 },
             )
-            // The framing lives here rather than in `CreatorPlugin` because the
-            // editor does not add `CreatorPlugin`: it spawns the creature itself,
-            // and two owners of one entity kind is how this crate once got
-            // "Camera order ambiguities" and a framing bug's clothes.
             .add_systems(
                 PostStartup,
-                (remove_debug_ground, frame_editor_camera, ui::font::apply),
+                (
+                    claim_ui_camera,
+                    remove_debug_ground,
+                    frame_editor_camera,
+                    ui::font::apply,
+                ),
             )
             .add_systems(
                 Update,
                 (
                     spawn_or_respawn_creature,
+                    // Right after the spawn: the content and the rectangle both
+                    // describe what is on screen this frame, and both are one
+                    // frame stale if they wait. `.chain()` below makes the order
+                    // explicit rather than leaving it to the scheduler.
+                    tag_viewport_content,
+                    sync_creator_viewport,
                     frame_editor_camera_after_an_edit,
                     apply_selection_command,
                     read_viewport_click,
                     wheel_scales_selection,
                     refresh_view_model,
                     crate::creator::tick_creator_runtime,
+                    publish_viewport_state,
                 )
                     .chain(),
-            );
+            )
+            .init_resource::<CreatorViewport>();
     }
+}
+
+/// Spawns the camera the creature is rendered through.
+///
+/// # Why there are two cameras, when "one owner per entity kind" is this crate's rule
+///
+/// [`crate::editor::viewport`] explains the whole story; the short version is that
+/// `bevy_ui` lays the interface out against `camera.physical_viewport_size()`, so
+/// a camera with a sub-rect `Viewport` also *shrinks the UI* into that sub-rect.
+/// Measured on Bevy 0.19.1: a `Val::Percent(60)` node is 768 wide with no viewport
+/// and 461 wide once the viewport is 768 wide. Giving the single UI camera the
+/// creature's rectangle therefore collapses the whole screen, and deriving that
+/// rectangle from the laid-out node makes it a shrinking regress.
+///
+/// So the rule is kept rather than broken: `ScenePlugin` still owns exactly one
+/// [`MainCamera`], and it stays full-window and owns the UI. This is a *second*
+/// camera with a different marker, spawned by the editor, which owns the
+/// rectangle. One rectangle, two cameras, no feedback loop.
+///
+/// Deliberately **not** marked [`MainCamera`]: every `MainCamera` query in this
+/// crate is `.single()`- or count-based, so a second marked camera would make all
+/// of them ambiguous at once.
+fn spawn_viewport_camera(mut commands: Commands) {
+    commands.spawn(crate::editor::viewport::viewport_camera_bundle(None));
+}
+
+/// Marks the existing [`MainCamera`] as the camera the UI is laid out against.
+///
+/// Load bearing and easy to miss. `DefaultUiCamera` picks the **highest-order**
+/// camera targeting the primary window when none is marked — and the viewport
+/// camera deliberately has a higher order. Without this marker `bevy_ui` silently
+/// re-targets the interface at the 768x665 sub-rect camera and the layout
+/// collapses. Executed on Bevy 0.19.1 to confirm the marker wins over `order`.
+///
+/// `PostStartup` because [`MainCamera`] is spawned by `ScenePlugin` in `Startup`
+/// and `Commands::spawn` is deferred, so a query here is the first one that can
+/// see it.
+fn claim_ui_camera(mut commands: Commands, cameras: Query<Entity, With<MainCamera>>) {
+    for entity in cameras.iter() {
+        commands.entity(entity).insert(bevy::ui::IsDefaultUiCamera);
+    }
+}
+
+/// Puts the creature and the lights on the viewport camera's render layer.
+///
+/// # Why this is needed at all
+///
+/// The viewport camera renders into a sub-rect that the UI camera also draws
+/// into. Without layer separation the creature is drawn twice: once by the UI
+/// camera across the whole window (where the panel covers most of it) and once by
+/// the viewport camera. The second pass happens to overwrite the first at the same
+/// depth, so the *picture* would look right while costing twice the draw calls —
+/// which is exactly the kind of thing that reads as "fine" until the frame time
+/// moves.
+///
+/// The lights must move too, or the creature renders unlit: a directional light on
+/// layer 0 is invisible to a camera restricted to layer 1, and a black creature on
+/// a black background is indistinguishable from a creature that is not there.
+///
+/// [`crate::editor::viewport::CreatorViewport`] notes that `RenderLayers` has no
+/// effect on UI — neither `bevy_ui` nor `bevy_ui_render` mentions it — so
+/// restricting the viewport camera cannot hide the interface.
+///
+/// The creature's entities are new every time the document changes, so this sweeps
+/// every frame: tagging only at spawn time made the creature vanish on the first
+/// edit and reappear on undo, because the replacement entities were never marked.
+fn tag_viewport_content(
+    mut commands: Commands,
+    creatures: Query<Entity, (With<OnStage>, Without<GroundPlane>)>,
+    lights: Query<Entity, With<DirectionalLight>>,
+) {
+    for entity in creatures.iter().chain(lights.iter()) {
+        commands
+            .entity(entity)
+            .insert(bevy::camera::visibility::RenderLayers::layer(1));
+    }
+}
+
+/// Publishes the laid-out UI node as the authoritative [`CreatorViewport`].
+///
+/// # The one writer, and why it runs every frame
+///
+/// The rectangle is derived from [`ComputedNode`] and [`UiGlobalTransform`], which
+/// Taffy rewrites whenever the window resizes or the layout changes. Polling is
+/// cheaper than diffing and cannot miss an update: there is no event to subscribe
+/// to, and a layout that moved the node without a window event is not a thing the
+/// editor can be told about.
+///
+/// Ordering: after [`spawn_or_respawn_creature`] and before
+/// [`frame_editor_camera_after_an_edit`], so the camera is configured against the
+/// rectangle for the content that is actually on screen. It reads the UI node laid
+/// out in the previous frame's `PostUpdate`, which is the only one that exists —
+/// `Commands::spawn` is deferred and layout has not run yet on the first frames.
+fn sync_creator_viewport(
+    viewports: ViewportNodes,
+    mut viewport: ResMut<CreatorViewport>,
+    mut cameras: Query<&mut Camera, With<CreatorViewportCamera>>,
+) {
+    // No node yet means the UI has not laid out. That is an ordinary state on the
+    // first frames, so it leaves the resource `available: false` and the camera's
+    // viewport `None` — which renders full-window, the pre-existing behaviour. It
+    // is deliberately NOT the window rectangle: substituting that would make the
+    // camera frame against, and the guard accept, a region that is not the 3D one.
+    let next = viewports
+        .iter()
+        .next()
+        .map(|(node, transform)| {
+            // The scale factor is the camera's, read from the camera that renders
+            // this node's target -- the same source `bevy_ui`'s own picking backend
+            // uses. Falling back to 1.0 before `camera_system` has run is correct:
+            // that is the factor it would report anyway.
+            let scale = cameras
+                .iter()
+                .next()
+                .and_then(|camera| camera.target_scaling_factor())
+                .unwrap_or(1.0);
+            CreatorViewport::from_node(node, transform, scale)
+        })
+        .unwrap_or_default();
+    if next == *viewport {
+        return;
+    }
+    *viewport = next;
+    // Applied to the camera here rather than at spawn so a window resize moves the
+    // viewport. `camera_system` runs in `PostUpdate` and detects the change via
+    // `computed.old_viewport_size`, so an `Update`-time write lands the same frame.
+    if let Ok(mut camera) = cameras.single_mut() {
+        camera.viewport = next.camera_viewport();
+    }
+}
+
+/// Republishes the viewport's geometry and its camera for BRP.
+///
+/// The four framing fields in [`CreatorRuntimeState`] are written by
+/// [`crate::creator::tick_creator_runtime`] from the [`MainCamera`], which in the
+/// editor is now the *UI* camera and is deliberately never moved. Overwriting them
+/// would break the viewer's meaning of the same fields, so the editor adds its own
+/// rather than repurposing theirs: `camera_position` describes the camera the
+/// creature is seen through, and these describe how that camera is placed.
+///
+/// Runs after `tick_creator_runtime` so it wins, and reports `None` for a camera
+/// that does not exist rather than leaving the previous frame's numbers in place.
+fn publish_viewport_state(
+    viewport: Res<CreatorViewport>,
+    cameras: Query<&Transform, With<CreatorViewportCamera>>,
+    framing: Option<Res<crate::loader::CameraFraming>>,
+    mut runtime: ResMut<CreatorRuntimeState>,
+) {
+    runtime.viewport_available = viewport.available;
+    runtime.viewport_physical_position = Some(viewport.physical_position);
+    runtime.viewport_physical_size = Some(viewport.physical_size);
+    runtime.viewport_scale_factor = viewport.scale_factor;
+
+    let Some(camera) = cameras.iter().next() else {
+        runtime.viewport_camera_position = None;
+        runtime.viewport_camera_distance_to_centre = None;
+        return;
+    };
+    let translation = camera.translation;
+    runtime.viewport_camera_position = Some([translation.x, translation.y, translation.z]);
+    // The same quantity the viewer publishes, over the same centre, so the two
+    // are comparable numbers rather than two definitions of "framed".
+    runtime.viewport_camera_distance_to_centre = framing.map(|framing| {
+        let (lo, hi) = framing.bounds;
+        let centre = Vec3::new(
+            (lo[0] + hi[0]) * 0.5,
+            (lo[1] + hi[1]) * 0.5,
+            (lo[2] + hi[2]) * 0.5,
+        );
+        (translation - centre).length()
+    });
 }
 
 /// The plugin itself. Zero-sized: the request is data on the session, not
@@ -222,6 +404,14 @@ pub struct LastPick {
     /// are the inputs and the output, so the test can be redone by hand against real
     /// values instead of argued about.
     pub wheel_probe: Option<WheelProbe>,
+    /// The coordinate mapping behind the last click, and its verdict.
+    ///
+    /// The click path's equivalent of [`Self::wheel_probe`], and the reason the
+    /// viewport contract is checkable at all from outside the app: it carries the
+    /// cursor, the rectangle it was tested against, the resulting NDC, and whether
+    /// the ray was actually built. A selection that did not change is otherwise
+    /// indistinguishable from a click that never reached the picker.
+    pub pick_probe: Option<PickProbe>,
     /// Selection requests that the document refused, ever.
     ///
     /// A refusal is not an error state to clear; it is a count. A UI that silently
@@ -346,7 +536,7 @@ fn spawn_or_respawn_creature(
 /// by the viewer's own tick and the editor had no equivalent -- which is the
 /// failure mode this repository's trap list already names.
 fn frame_editor_camera(
-    mut cameras: Query<&mut Transform, With<MainCamera>>,
+    mut cameras: Query<&mut Transform, With<CreatorViewportCamera>>,
     mut state: ResMut<CreatorEditorState>,
 ) {
     let Some(framing) = state.session.stage().camera_framing() else {
@@ -355,6 +545,12 @@ fn frame_editor_camera(
     // No camera yet is a normal, expected state on the first frame, so it is not
     // an error -- and deliberately does NOT set `framed`, so the next attempt
     // happens rather than the session believing it framed a creature it never saw.
+    //
+    // Framed on the VIEWPORT camera, not on `MainCamera`: the creature is rendered
+    // by the viewport camera, so framing the other one would point a camera
+    // nothing is drawn through away from the creature while the visible camera sat
+    // at `ScenePlugin`'s parking spot. That is the "framing bug's clothes" this
+    // module's history already records once.
     if let Ok(mut transform) = cameras.single_mut() {
         crate::loader::frame_camera(&mut transform, framing.bounds, framing.vertical_fov_degrees);
         apply_side_on_view(&mut transform, framing.bounds);
@@ -429,7 +625,7 @@ fn apply_side_on_view(transform: &mut Transform, bounds: ([f32; 3], [f32; 3])) {
 /// on edit -- which is defensible while the extent is what decides the framing,
 /// and is the thing to revisit once the camera has user orbit on it.
 fn frame_editor_camera_after_an_edit(
-    cameras: Query<&mut Transform, With<MainCamera>>,
+    cameras: Query<&mut Transform, With<CreatorViewportCamera>>,
     state: ResMut<CreatorEditorState>,
 ) {
     if state.framed && state.built_revision == state.session.revision() {
@@ -442,8 +638,8 @@ fn frame_editor_camera_after_an_edit(
 fn read_viewport_click(
     buttons: Res<ButtonInput<MouseButton>>,
     windows: Query<&Window>,
-    cameras: Query<(&Camera, &GlobalTransform), With<MainCamera>>,
-    viewports: ViewportNodes,
+    cameras: Query<(&Camera, &GlobalTransform), With<CreatorViewportCamera>>,
+    viewport: Res<CreatorViewport>,
     mut state: ResMut<CreatorEditorState>,
     mut last_pick: ResMut<LastPick>,
 ) {
@@ -464,15 +660,16 @@ fn read_viewport_click(
     if let Some(cursor) = windows.iter().find_map(Window::cursor_position) {
         last_pick.last_cursor = Some([cursor.x, cursor.y]);
     }
-    let (block, hits) = pick_under_cursor(
+    let (block, hits, probe) = pick_under_cursor(
         &buttons,
         &windows,
         &cameras,
-        &viewports,
+        &viewport,
         state.session.projection(),
         &mut last_pick.rejected_outside_viewport,
     );
     last_pick.hits = hits;
+    last_pick.pick_probe = probe;
     // Same block clicked twice in a row is not a new event, so re-running the
     // selection would only push another identical row into the history.
     if block.map(|index| index as u32) == last_pick.block && block.is_some() {
@@ -497,162 +694,164 @@ fn read_viewport_click(
 /// The block under the cursor, or `None`.
 ///
 /// Returns `None` for every "not a pick" case alike -- no click, no cursor, no
-/// camera, no viewport node, a click on the panel, a cursor the camera cannot
+/// camera, no laid-out viewport, a click on the panel, a cursor the camera cannot
 /// convert. They are one answer because the caller has one job: decide whether
 /// the selection changed. A caller that needed to tell "missed" from "not a
 /// click" would be building a different feature.
+///
+/// The third value is a [`PickProbe`]: the inputs and the verdict of the
+/// coordinate mapping, so the chain can be checked from outside instead of
+/// inferred from a selection that may or may not have moved.
+///
+/// # The chain, in four steps
+///
+/// ```text
+///   Window::cursor_position        logical px, window top-left, +y down
+///     -> CreatorViewport gate      physical -> logical, reject if outside
+///     -> Camera::viewport_to_world Bevy subtracts the logical viewport min itself
+///     -> picking::pick_all         the unchanged ray/AABB maths
+/// ```
+///
+/// Step three passes the **raw window cursor** through untouched, which is what
+/// upstream does (`bevy_picking-0.19.1/src/backend.rs` feeds
+/// `pointer_loc.position` straight in). It looks like a missing conversion and is
+/// not: `viewport_to_ndc` computes `(position - logical_rect.min) / size`, so
+/// subtracting the offset here as well would double-subtract it and the ray would
+/// come out shifted by the viewport's origin.
 fn pick_under_cursor(
     buttons: &ButtonInput<MouseButton>,
     windows: &Query<&Window>,
-    cameras: &Query<(&Camera, &GlobalTransform), With<MainCamera>>,
-    viewports: &ViewportNodes,
+    cameras: &Query<(&Camera, &GlobalTransform), With<CreatorViewportCamera>>,
+    viewport: &CreatorViewport,
     projection: &spore_morphology::Projection,
     rejected: &mut u32,
-) -> (Option<usize>, u32) {
+) -> (Option<usize>, u32, Option<PickProbe>) {
     if !buttons.just_pressed(MouseButton::Left) {
-        return (None, 0);
+        return (None, 0, None);
     }
     let Some(cursor) = windows.iter().find_map(Window::cursor_position) else {
-        return (None, 0);
+        return (None, 0, None);
     };
     let Some((camera, camera_transform)) = cameras.iter().next() else {
-        return (None, 0);
+        return (None, 0, None);
     };
 
-    // A click on the panel is not a click in the viewport. The camera fills the
-    // whole window -- the framing it has is verified against 47 real documents
-    // and re-deriving it for a narrower viewport is a separate piece of work --
-    // so the panel genuinely overlaps the 3D view, and without this guard every
-    // button press would also select whatever part happens to be behind it.
+    let mut probe = PickProbe {
+        cursor_logical: [cursor.x, cursor.y],
+        ndc: [0.0, 0.0],
+        scale: viewport.scale_factor,
+        rect_position: viewport.physical_position,
+        rect_size: viewport.physical_size,
+        inside: false,
+        had_viewport: viewport.available,
+        mapped: false,
+    };
+
+    // A click on the panel is not a click in the viewport. The gate is the SAME
+    // `CreatorViewport` the camera's viewport was set from, so the region the user
+    // can click and the region the creature is drawn in cannot disagree -- which
+    // is the defect this whole module exists to remove, and which the old code
+    // could not have: it compared the cursor against the UI node while the ray was
+    // built from the camera, and the two were separately derived.
     //
-    // The scaling factor comes from the SAME camera the ray is built from, so the
-    // guard and the ray cannot disagree about which space the cursor is in.
-    let scale = camera.target_scaling_factor().unwrap_or(1.0);
-    if !cursor_over_viewport(cursor, scale, viewports) {
+    // A cursor outside is rejected, never clamped to the edge. Clamping would
+    // fabricate a click on whatever sits against the border.
+    let Some(ndc) = viewport.cursor_to_ndc(cursor) else {
+        probe.inside = false;
         *rejected += 1;
-        return (None, 0);
+        return (None, 0, Some(probe));
+    };
+    probe.inside = true;
+    probe.ndc = [ndc.x, ndc.y];
+
+    // The camera's own viewport is the last thing that could disagree with the
+    // gate, and it is checked rather than trusted: if the sync system has not run,
+    // or has written a different rectangle, the mapping above and the ray below
+    // would be computed against two different frames. That is the one case the old
+    // code refused, and refusing is still right -- but it is now a statement about
+    // a real inconsistency rather than about the camera having a viewport at all.
+    if camera.viewport.as_ref().map(|view| {
+        (
+            [view.physical_position.x, view.physical_position.y],
+            [view.physical_size.x, view.physical_size.y],
+        )
+    }) != Some((viewport.physical_position, viewport.physical_size))
+    {
+        warn!(
+            "camera viewport {:?} disagrees with the measured UI viewport {:?}; \
+             refusing rather than picking against the wrong frame",
+            camera.viewport, viewport
+        );
+        return (None, 0, Some(probe));
     }
 
-    // A window-space cursor is only viewport space when the camera's viewport IS
-    // the window, which is the case here because `ScenePlugin` spawns the one
-    // camera with no explicit viewport. That is an assumption about the scene, so
-    // it is checked rather than trusted: a camera with a viewport that does not
-    // cover the whole target is refused instead of producing a ray from the
-    // wrong origin, which would pick a part somewhere off-screen.
-    let target = camera
-        .physical_target_size()
-        .map(|size| Vec2::new(size.x as f32, size.y as f32))
-        .unwrap_or(Vec2::ZERO);
-    let viewport_position = match camera.viewport.clone() {
-        Some(viewport) => {
-            if Vec2::new(
-                viewport.physical_position.x as f32,
-                viewport.physical_position.y as f32,
-            ) != Vec2::ZERO
-                || Vec2::new(
-                    viewport.physical_size.x as f32,
-                    viewport.physical_size.y as f32,
-                ) != target
-            {
-                warn!("camera viewport does not cover its target; refusing to guess the cursor mapping");
-                return (None, 0);
-            }
-            cursor
-        }
-        None => cursor,
+    let Ok(ray) = camera.viewport_to_world(camera_transform, cursor) else {
+        return (None, 0, Some(probe));
     };
-    let Ok(ray) = camera.viewport_to_world(camera_transform, viewport_position) else {
-        return (None, 0);
-    };
+    probe.mapped = true;
     let hits = picking::pick_all(PickRay::from(ray), projection);
-    (hits.first().map(|hit| hit.block), hits.len() as u32)
+    (
+        hits.first().map(|hit| hit.block),
+        hits.len() as u32,
+        Some(probe),
+    )
 }
 
-/// Whether a window-space cursor sits inside the viewport's UI rect.
+/// The gate's verdict, with every number it compared.
 ///
-/// # One predicate, because two callers need one answer
+/// # One rectangle, one predicate, three consumers
 ///
-/// The click path needs it to refuse a press on the panel, and the wheel needs it
-/// for the same reason with more force: the wheel is also how a thumb grid pages,
-/// so a cursor over the panel that scaled the selected part would make scrolling
-/// the catalog silently resize the creature. Written twice it would be two answers
-/// to one question, and they would drift.
+/// The click gate, the wheel gate and the pick ray all need "is this window-space
+/// cursor inside the Creator viewport?". They used to answer it three different
+/// ways -- the click and the wheel each tested [`bevy_ui::ComputedNode`] and the ray
+/// was built from a camera whose viewport was the whole window. Three rectangles,
+/// and the defect was that the region you could *see* was not the region you could
+/// *click*. All three now read [`CreatorViewport`], so there is no second
+/// reconstruction left to drift.
 ///
-/// # No viewport node means no opinion
+/// This function is a *probe* rather than the predicate itself so the wheel can
+/// publish what it compared. Returning only a `bool` from a guard nobody can see
+/// inside is how `inside: true` with `had_node: false` stayed indistinguishable
+/// from a real pass -- and that pair is exactly what found both bugs in `a780d85`.
 ///
-/// The camera covers the whole window, so when the UI has not laid out yet there is
-/// nothing to contradict. That is an absence of evidence rather than a hit, so it
-/// answers `true` and leaves the caller's own guard (a real click, a real scroll)
-/// to decide whether the input counts. Returning `false` here would instead make
-/// input silently dead during the first frames, which reads exactly like a broken
-/// picker and is not one.
-/// # The shared hazard: PHYSICAL node units against a LOGICAL cursor
+/// # Why not `ComputedNode::contains_point` any more
 ///
-/// [`bevy_ui::ComputedNode::size`] and [`bevy_ui::ui_node::UiGlobalTransform`] are
-/// in **physical** pixels while [`bevy::window::Window::cursor_position`] is in
-/// **logical** ones. On a display where those differ the rect test rejects every
-/// cursor, including ones plainly inside the viewport. This is pre-existing in the
-/// click path and measured there; it is NOT fixed here, because the only machine
-/// available has a scale factor of 1.0 where the two are equal, so a "fix" could
-/// not be shown to fix anything. Widening it to two callers makes the hazard more
-/// load bearing, so it is recorded on both counters instead:
-/// [`LastPick::rejected_outside_viewport`] and
-/// [`LastPick::wheel_rejected_outside_viewport`]. A non-zero rejection count with
-/// clicks that plainly landed inside is this bug and nothing else.
-/// # The two things this got wrong, both found by measuring instead of reading
+/// It is the better test: it inverts the node's transform and runs the same
+/// signed-distance function the renderer draws rounded rectangles with, so it stays
+/// correct under rotation and border radius. It is dropped because it answers a
+/// *different question* -- it tests the UI node, not the viewport rectangle -- and
+/// keeping it would mean the clickable region and the rendered region were derived
+/// separately again, which is the defect.
 ///
-/// 1. The query asked for [`bevy::prelude::GlobalTransform`]. A Bevy 0.19 UI node
-///    does not carry that; it carries [`UiGlobalTransform`]. So the query matched
-///    **no node ever**, and the guard fell through its no-opinion branch and
-///    accepted every input.
-/// 2. With the right component it still would not have worked on a scaled display:
-///    [`ComputedNode::size`] and [`UiGlobalTransform`] are in **physical** pixels
-///    while [`bevy::window::Window::cursor_position`] is in **logical** ones.
+/// The rectangle is exact for this node: `layout::viewport()` sets no
+/// `border_radius` and no rotation, so the axis-aligned rect and the SDF agree.
+/// That is stated rather than assumed, because the day a node is rounded or
+/// animated this predicate becomes approximate and the honest fix is to teach
+/// [`CreatorViewport`] the radius -- not to reintroduce a second geometry path.
 ///
-/// # Both handed to Bevy, because Bevy already answers this question correctly
+/// # No measurement yet is not "inside"
 ///
-/// [`ComputedNode::contains_point`] is the same test the UI picking backend runs,
-/// against the same signed-distance function the renderer draws rounded rectangles
-/// with. It inverts the node's own transform, so it is right about rotation and
-/// scale, and right about border radius. A hand-rolled `abs(local) <= half` is not:
-/// it silently assumes an axis-aligned, unrotated, square-cornered node, which is
-/// true today and wrong the first time a node is animated.
-///
-/// The logical-to-physical conversion is the one line Bevy's own backend runs
-/// (`picking_backend.rs`): multiply by the camera's target scaling factor. Guessing
-/// a scale factor, or assuming 1.0 because the development machine reports 1.0, is
-/// how a guard works on the author's screen and fails on the user's.
-fn cursor_over_viewport(cursor: Vec2, scale: f32, viewports: &ViewportNodes) -> bool {
-    let Some((node, transform)) = viewports.iter().next() else {
-        return true;
-    };
-    node.contains_point(*transform, cursor * scale)
-}
-
-/// The same comparison as [`cursor_over_viewport`], keeping the numbers it used.
-///
-/// Split out so the wheel can publish what it compared. Returning only a `bool` from
-/// a guard nobody can see inside is how "the guard passed" and "the guard matched no
-/// node" stayed the same observation.
-fn viewport_probe(cursor: Vec2, scale: f32, viewports: &ViewportNodes) -> WheelProbe {
+/// When the UI has not laid out, [`CreatorViewport::available`] is `false` and this
+/// reports `inside: false`. The previous code answered `true`, reasoning that an
+/// absent node is "no opinion". That reasoning is what let every panel click through
+/// for the whole of `a780d85`: the guard had no measurement, took the permissive
+/// branch, and reported success. Failing closed for a few frames is visible; failing
+/// open is invisible.
+/// The inputs and the verdict, in the units the gate compared.
+fn viewport_probe(cursor: Vec2, viewport: &CreatorViewport) -> WheelProbe {
+    let scale = viewport.scale_factor;
     let point = pointer_in_node_space(cursor, scale);
-    let Some((node, transform)) = viewports.iter().next() else {
-        return WheelProbe {
-            cursor_logical: [cursor.x, cursor.y],
-            point_physical: [point.x, point.y],
-            scale,
-            node_size: [0.0, 0.0],
-            inside: true,
-            had_node: false,
-        };
-    };
     WheelProbe {
         cursor_logical: [cursor.x, cursor.y],
         point_physical: [point.x, point.y],
         scale,
-        node_size: [node.size.x, node.size.y],
-        inside: node.contains_point(*transform, point),
-        had_node: true,
+        node_size: [
+            viewport.physical_size[0] as f32,
+            viewport.physical_size[1] as f32,
+        ],
+        node_position: viewport.physical_position,
+        inside: viewport.cursor_to_ndc(cursor).is_some(),
+        had_node: viewport.available,
     }
 }
 
@@ -798,8 +997,7 @@ fn wheel_scales_selection(
     wheel: Res<bevy::input::mouse::AccumulatedMouseScroll>,
     keys: Res<ButtonInput<KeyCode>>,
     windows: Query<&Window>,
-    cameras: Query<&Camera, With<MainCamera>>,
-    viewports: ViewportNodes,
+    viewport: Res<CreatorViewport>,
     mut state: ResMut<CreatorEditorState>,
     mut last_pick: ResMut<LastPick>,
 ) {
@@ -812,17 +1010,13 @@ fn wheel_scales_selection(
     };
     // The wheel is not only a scale control: it is also how a grid pages. A cursor
     // over the panel must not resize the creature, so this shares the click path's
-    // guard instead of re-deriving the viewport rect -- including the camera, so the
-    // scaling factor is the same one the picker's ray would use.
+    // guard -- now literally the same call on the same [`CreatorViewport`], so the
+    // two cannot disagree and the scaling factor no longer has to be looked up from
+    // a camera here: the rectangle carries the factor it was measured under.
     let Some(cursor) = windows.iter().find_map(Window::cursor_position) else {
         return;
     };
-    let scale = cameras
-        .iter()
-        .next()
-        .and_then(|camera| camera.target_scaling_factor())
-        .unwrap_or(1.0);
-    let probe = viewport_probe(cursor, scale, &viewports);
+    let probe = viewport_probe(cursor, &viewport);
     last_pick.wheel_probe = Some(probe);
     if !probe.inside {
         last_pick.wheel_rejected_outside_viewport += 1;
@@ -931,8 +1125,15 @@ pub struct WheelProbe {
     pub point_physical: [f32; 2],
     /// The camera's target scaling factor -- the multiplier between the two.
     pub scale: f32,
-    /// The viewport node's measured size, in physical units.
+    /// The viewport rectangle's measured size, in physical units.
     pub node_size: [f32; 2],
+    /// The viewport rectangle's measured top-left, in physical units.
+    ///
+    /// Published because `node_size` alone cannot distinguish "a viewport at the
+    /// window's left edge" from "a viewport starting half way across", and those
+    /// two disagree about where every cursor is. With both numbers the guard's
+    /// verdict can be recomputed by hand instead of believed.
+    pub node_position: [u32; 2],
     /// Whether the guard accepted the point.
     pub inside: bool,
     /// Whether a viewport node existed to compare against at all.
@@ -940,6 +1141,42 @@ pub struct WheelProbe {
     /// `false` means the guard **did not run**: it took its no-opinion branch and
     /// accepted everything, which is indistinguishable from a pass unless stated.
     pub had_node: bool,
+}
+
+/// What the click guard and the cursor mapping saw on the last click.
+///
+/// Published for the same reason as [`WheelProbe`], and it is the one artefact that
+/// makes the whole coordinate chain observable: the cursor as the window reported
+/// it, the rectangle it was tested against, the NDC the mapping produced, and
+/// whether `viewport_to_world` then accepted it. Every step of
+///
+/// ```text
+///   window cursor -> viewport-local -> NDC -> ray -> block
+/// ```
+///
+/// can be recomputed from these eight numbers, which is how the live check proves
+/// the chain rather than asserting that a selection moved.
+#[derive(Reflect, Debug, Clone, Copy, PartialEq)]
+pub struct PickProbe {
+    /// The cursor, in `Window::cursor_position` (logical) units.
+    pub cursor_logical: [f32; 2],
+    /// The NDC the mapping produced. Meaningless when [`Self::inside`] is `false`.
+    pub ndc: [f32; 2],
+    /// The logical-to-physical factor the rectangle was measured under.
+    pub scale: f32,
+    /// The rectangle's physical top-left, as the gate tested it.
+    pub rect_position: [u32; 2],
+    /// The rectangle's physical size, as the gate tested it.
+    pub rect_size: [u32; 2],
+    /// Whether the cursor was inside the rectangle.
+    pub inside: bool,
+    /// Whether a rectangle had been measured at all.
+    ///
+    /// `false` means the guard did not run against a real rectangle, which is
+    /// distinct from a cursor that was measured and found outside.
+    pub had_viewport: bool,
+    /// Whether `viewport_to_world` accepted the cursor and produced a ray.
+    pub mapped: bool,
 }
 
 /// The normal-mode constant, re-exported so a caller building an editor app

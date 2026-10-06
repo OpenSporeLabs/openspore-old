@@ -18,5 +18,6 @@ pub mod session;
 pub mod skin;
 pub mod thumbnails;
 pub mod ui;
+pub mod viewport;
 
 pub use session::{CreatorSession, SessionError};
