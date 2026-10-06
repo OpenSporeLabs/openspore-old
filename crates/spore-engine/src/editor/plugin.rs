@@ -87,6 +87,7 @@ impl Plugin for CreatorEditorPlugin {
                     frame_editor_camera_after_an_edit,
                     apply_selection_command,
                     read_viewport_click,
+                    wheel_scales_selection,
                     refresh_view_model,
                     crate::creator::tick_creator_runtime,
                 )
@@ -194,6 +195,23 @@ pub struct LastPick {
     pub rejected_outside_viewport: u32,
     /// The last cursor position observed, in the window's own units.
     pub last_cursor: Option<[f32; 2]>,
+    /// The scale the last wheel gesture applied, or `None`.
+    pub last_scale: Option<f32>,
+    /// Wheel frames that changed a scale, ever: one history row each.
+    ///
+    /// This is the counter that makes the history granularity an observation
+    /// instead of a claim. If undo needs more presses than this number to get back
+    /// to where the scroll started, something else is writing history; if one press
+    /// undoes a whole flick of several notches, the granularity is not the
+    /// per-frame one documented on [`wheel_scales_selection`] any more.
+    pub scale_applications: u32,
+    /// Wheel frames that carried a real delta but landed outside the viewport.
+    ///
+    /// Non-zero means the cursor was over the panel while the wheel turned. That is
+    /// correct behaviour once the grid pages on the wheel -- it is the thing that
+    /// stops scrolling the catalog from resizing the creature -- so this is a
+    /// measurement, not an error counter.
+    pub wheel_rejected_outside_viewport: u32,
     /// Selection requests that the document refused, ever.
     ///
     /// A refusal is not an error state to clear; it is a count. A UI that silently
@@ -234,7 +252,7 @@ fn spawn_creator_screen(mut commands: Commands, state: Res<CreatorEditorState>) 
 /// blocks resolved, ten visible, a valid framing at distance 1.589 -- and the screen
 /// was a grey floor. Nothing rendered *because it was all correctly there and then
 /// covered up*, which is the hardest class of bug to spot from inside the model.
-fn remove_debug_ground(mut commands: Commands, mut ground: Query<Entity, With<GroundPlane>>) {
+fn remove_debug_ground(mut commands: Commands, ground: Query<Entity, With<GroundPlane>>) {
     for entity in ground.iter() {
         commands.entity(entity).despawn();
     }
@@ -329,8 +347,69 @@ fn frame_editor_camera(
     // happens rather than the session believing it framed a creature it never saw.
     if let Ok(mut transform) = cameras.single_mut() {
         crate::loader::frame_camera(&mut transform, framing.bounds, framing.vertical_fov_degrees);
+        apply_side_on_view(&mut transform, framing.bounds);
         state.framed = true;
     }
+}
+
+/// Swings the camera so it looks ACROSS the creature's longest axis.
+///
+/// # Why, and it is not a nit
+///
+/// [`crate::loader::frame_camera`] uses a fixed 3/4 direction of `(0, 0.42, 0.91)`,
+/// which reads well for a roughly isotropic subject and degenerates for anything
+/// elongated. `0x135ff098` is a **28:1 sliver**: x extent 0.044 against z extent
+/// 1.220. A camera on +Z looks straight down a tapering ten-segment spine, so the
+/// spine reads as a vertical column of unrelated blobs rather than as a spine. The
+/// creature is not wrong and the geometry is not wrong; the viewing axis is.
+///
+/// So the axis is chosen from the subject rather than from a guess about what a
+/// creature looks like: the camera goes perpendicular to whichever world axis the
+/// creature is longest along, which is the only rule that works for an arbitrary
+/// part arrangement.
+///
+/// The first version of this picked the longest axis ITSELF, which is exactly
+/// backwards -- for a Z-spine it put the camera back on +Z and reproduced the
+/// end-on view it was written to fix.
+///
+/// # What it preserves
+///
+/// The centre and the distance stay exactly as [`crate::loader::frame_camera`] set
+/// them; only the direction changes. So the verified framing arithmetic -- the part
+/// that decides whether the creature FITS -- is untouched, and this decides only
+/// whether it is seen from a useful angle.
+fn apply_side_on_view(transform: &mut Transform, bounds: ([f32; 3], [f32; 3])) {
+    let extent = [
+        bounds.1[0] - bounds.0[0],
+        bounds.1[1] - bounds.0[1],
+        bounds.1[2] - bounds.0[2],
+    ];
+    let longest = match extent
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(core::cmp::Ordering::Equal))
+    {
+        Some((axis, _)) => axis,
+        None => return,
+    };
+    let centre = Vec3::new(
+        (bounds.0[0] + bounds.1[0]) * 0.5,
+        (bounds.0[1] + bounds.1[1]) * 0.5,
+        (bounds.0[2] + bounds.1[2]) * 0.5,
+    );
+    // Across = any axis that is NOT the long one, so the long axis runs across the
+    // screen and its length is visible.
+    let across = if longest == 0 { Vec3::Y } else { Vec3::X };
+    // A 3/4 elevation on top, so the subject is never dead-on flat: an
+    // axis-aligned camera makes a symmetric part look symmetric and hides
+    // everything about its shape.
+    let direction = (across * 0.92 + Vec3::new(0.0, 0.42, 0.0)).normalize();
+    // Keep the distance `frame_camera` chose: the framing arithmetic decides
+    // whether the creature FITS and is verified against 47 real documents, so only
+    // the direction changes here and never the distance.
+    let distance = (transform.translation - centre).length().max(1e-3);
+    *transform =
+        Transform::from_translation(centre + direction * distance).looking_at(centre, Vec3::Y);
 }
 
 /// Re-frames after an edit, because a new part changes the extent.
@@ -435,14 +514,9 @@ fn pick_under_cursor(
     // and re-deriving it for a narrower viewport is a separate piece of work --
     // so the panel genuinely overlaps the 3D view, and without this guard every
     // button press would also select whatever part happens to be behind it.
-    if let Some((node, node_transform)) = viewports.iter().next() {
-        let centre = node_transform.translation();
-        let half = node.size * 0.5;
-        let local = cursor - Vec2::new(centre.x, centre.y);
-        if local.x.abs() > half.x || local.y.abs() > half.y {
-            *rejected += 1;
-            return (None, 0);
-        }
+    if !cursor_over_viewport(cursor, viewports) {
+        *rejected += 1;
+        return (None, 0);
     }
 
     // A window-space cursor is only viewport space when the camera's viewport IS
@@ -478,6 +552,64 @@ fn pick_under_cursor(
     };
     let hits = picking::pick_all(PickRay::from(ray), projection);
     (hits.first().map(|hit| hit.block), hits.len() as u32)
+}
+
+/// Whether a window-space cursor sits inside the viewport's UI rect.
+///
+/// # One predicate, because two callers need one answer
+///
+/// The click path needs it to refuse a press on the panel, and the wheel needs it
+/// for the same reason with more force: the wheel is also how a thumb grid pages,
+/// so a cursor over the panel that scaled the selected part would make scrolling
+/// the catalog silently resize the creature. Written twice it would be two answers
+/// to one question, and they would drift.
+///
+/// # No viewport node means no opinion
+///
+/// The camera covers the whole window, so when the UI has not laid out yet there is
+/// nothing to contradict. That is an absence of evidence rather than a hit, so it
+/// answers `true` and leaves the caller's own guard (a real click, a real scroll)
+/// to decide whether the input counts. Returning `false` here would instead make
+/// input silently dead during the first frames, which reads exactly like a broken
+/// picker and is not one.
+/// # The shared hazard: PHYSICAL node units against a LOGICAL cursor
+///
+/// [`bevy_ui::ComputedNode::size`] and [`bevy_ui::ui_node::UiGlobalTransform`] are
+/// in **physical** pixels while [`bevy::window::Window::cursor_position`] is in
+/// **logical** ones. On a display where those differ the rect test rejects every
+/// cursor, including ones plainly inside the viewport. This is pre-existing in the
+/// click path and measured there; it is NOT fixed here, because the only machine
+/// available has a scale factor of 1.0 where the two are equal, so a "fix" could
+/// not be shown to fix anything. Widening it to two callers makes the hazard more
+/// load bearing, so it is recorded on both counters instead:
+/// [`LastPick::rejected_outside_viewport`] and
+/// [`LastPick::wheel_rejected_outside_viewport`]. A non-zero rejection count with
+/// clicks that plainly landed inside is this bug and nothing else.
+fn cursor_over_viewport(cursor: Vec2, viewports: &ViewportNodes) -> bool {
+    let Some((node, node_transform)) = viewports.iter().next() else {
+        return true;
+    };
+    let translation = node_transform.translation();
+    cursor_in_rect(
+        cursor,
+        Vec2::new(translation.x, translation.y),
+        node.size * 0.5,
+    )
+}
+
+/// Whether a cursor lies inside an axis-aligned rect given its centre and half-size.
+///
+/// # Why the edges are inclusive, and why the test pins them
+///
+/// A UI node's rect *is* its half-size box, so a cursor exactly on the boundary is
+/// over the viewport. Both `<` and `<=` here pass every "obviously inside" and every
+/// "obviously outside" case, which means a flipped comparison survives a casual
+/// check and only shows up as a one-pixel dead edge. So the tests below assert the
+/// boundary explicitly in both directions and assert the two axes independently: a
+/// rect test that checked only `x` would pass every point off to the side.
+fn cursor_in_rect(cursor: Vec2, centre: Vec2, half: Vec2) -> bool {
+    let local = cursor - centre;
+    local.x.abs() <= half.x && local.y.abs() <= half.y
 }
 
 /// An agent- or keyboard-issued selection, applied to the real document.
@@ -572,6 +704,110 @@ type ViewportNodes<'w, 's> = Query<
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Viewport;
 
+/// Scales the selected block with the mouse wheel.
+///
+/// # The interaction is the ORIGINAL's, not a generic editor's
+///
+/// The reference frame states it in as many words -- "Scroll the mouse wheel to
+/// scale parts" -- so this is wheel-over-the-viewport on the selected block, with no
+/// gizmo, no axis handles and no modifier keys. A 3-axis gizmo would be a modern-
+/// editor affordance the original does not have.
+///
+/// # Why the factor is multiplicative and clamped
+///
+/// Multiplicative so repeated scrolls compose the way a user expects (each notch is
+/// the same relative change, not the same absolute one), and clamped so a long
+/// scroll cannot drive the scale to zero or infinity -- both of which the corpus
+/// does contain: authored block scales run 0.28 .. 2.254181, and a zero scale
+/// collapses the part to a point while an unbounded one makes the next
+/// re-projection's bounds meaningless.
+///
+/// # History granularity is one FRAME, and gesture coalescing is NOT implemented
+///
+/// [`bevy::input::mouse::AccumulatedMouseScroll`] is cleared by Bevy every frame, so
+/// this system runs at most once per frame and each run that changes the scale
+/// records exactly one history row. Two consequences, stated because the earlier
+/// version of this comment claimed the opposite:
+///
+/// - One *gesture* is many frames and therefore many undo steps. Coalescing them
+///   would need a "replace the top of the history" operation on a snapshot history,
+///   which changes documented semantics of [`crate::editor::session`] and is not
+///   done here. Until it is, undo steps frame by frame. This is a UX ceiling, not a
+///   defect, and it is counted rather than assumed: see
+///   [`LastPick::scale_applications`] and [`LastPick::wheel_rejected_outside_viewport`].
+/// - Several notches inside ONE frame collapse to a single factor, because only
+///   the sign of the accumulated delta is used. A fast flick therefore scales less
+///   than its notch count suggests. Using the magnitude would make one frame's
+///   worth of notches frame-rate dependent, so the sign is the more defensible of
+///   the two and the behaviour is documented instead of tuned away.
+fn wheel_scales_selection(
+    wheel: Res<bevy::input::mouse::AccumulatedMouseScroll>,
+    keys: Res<ButtonInput<KeyCode>>,
+    windows: Query<&Window>,
+    viewports: ViewportNodes,
+    mut state: ResMut<CreatorEditorState>,
+    mut last_pick: ResMut<LastPick>,
+) {
+    let delta = wheel.delta.y;
+    if delta.abs() < f32::EPSILON {
+        return;
+    }
+    let Some(index) = state.session.selection() else {
+        return;
+    };
+    // The wheel is not only a scale control: it is also how a grid pages. A cursor
+    // over the panel must not resize the creature, so this shares the click path's
+    // guard instead of re-deriving the viewport rect.
+    let Some(cursor) = windows.iter().find_map(Window::cursor_position) else {
+        return;
+    };
+    if !cursor_over_viewport(cursor, &viewports) {
+        last_pick.wheel_rejected_outside_viewport += 1;
+        return;
+    }
+    // Shift is the documented coarse step, not an invention: fine is 1.05, coarse
+    // 1.35, so a shift-scroll crosses a useful range in a few notches while a plain
+    // scroll stays precise.
+    let coarse = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
+    let factor = if coarse { 1.35 } else { 1.05 };
+    let current = state
+        .session
+        .document()
+        .blocks
+        .get(index)
+        .map(|block| block.transform.scale)
+        .unwrap_or(1.0);
+    let next = (current * if delta > 0.0 { factor } else { 1.0 / factor })
+        .clamp(MIN_PART_SCALE, MAX_PART_SCALE);
+    if (next - current).abs() < f32::EPSILON {
+        // Already at a limit. Recording nothing keeps undo from having a step that
+        // changes nothing, which is the difference between "at the limit" and
+        // "broken".
+        return;
+    }
+    if let Err(error) = state.session.apply_scale(index, next) {
+        warn!("scale refused: {error}");
+        return;
+    }
+    last_pick.last_scale = Some(next);
+    last_pick.scale_applications += 1;
+}
+
+/// The smallest scale a part may be scaled to.
+///
+/// Inside the corpus: authored block scales run 0.28 .. 2.254181, so a floor below
+/// that admits the user to write documents the game has never contained, and a
+/// floor at 0.28 would refuse to let them undo back out of it.
+pub const MIN_PART_SCALE: f32 = 0.05;
+
+/// The largest scale a part may be scaled to.
+///
+/// **OpenSpore's own ceiling**, and deliberately generous rather than matching the
+/// corpus maximum: an editor should not refuse a change the user asked for just
+/// because the shipped content never did it. It exists to bound the re-projection,
+/// not to police authoring.
+pub const MAX_PART_SCALE: f32 = 8.0;
+
 /// Mirrors the session into the UI's view model.
 ///
 /// The one direction the data flows. The UI never writes the view: a button
@@ -634,5 +870,82 @@ impl CreatorEditorState {
             framed: false,
             view,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cursor_in_rect;
+
+    /// The rect both callers share: a viewport node centred at the window centre.
+    fn rect() -> (bevy::math::Vec2, bevy::math::Vec2) {
+        (
+            bevy::math::Vec2::new(640.0, 360.0),
+            bevy::math::Vec2::new(384.0, 360.0),
+        )
+    }
+
+    #[test]
+    fn cursor_at_the_centre_is_inside() {
+        let (centre, half) = rect();
+        assert!(cursor_in_rect(centre, centre, half));
+    }
+
+    #[test]
+    fn every_edge_is_inclusive_in_both_directions() {
+        let (centre, half) = rect();
+        for point in [
+            centre + bevy::math::Vec2::new(half.x, 0.0),
+            centre - bevy::math::Vec2::new(half.x, 0.0),
+            centre + bevy::math::Vec2::new(0.0, half.y),
+            centre - bevy::math::Vec2::new(0.0, half.y),
+            centre + half,
+            centre - half,
+        ] {
+            assert!(
+                cursor_in_rect(point, centre, half),
+                "edge {point:?} must count as inside"
+            );
+        }
+    }
+
+    #[test]
+    fn one_pixel_past_an_edge_is_outside() {
+        let (centre, half) = rect();
+        for point in [
+            centre + bevy::math::Vec2::new(half.x + 1.0, 0.0),
+            centre - bevy::math::Vec2::new(half.x + 1.0, 0.0),
+            centre + bevy::math::Vec2::new(0.0, half.y + 1.0),
+            centre - bevy::math::Vec2::new(0.0, half.y + 1.0),
+        ] {
+            assert!(
+                !cursor_in_rect(point, centre, half),
+                "one pixel past {point:?} must be outside"
+            );
+        }
+    }
+
+    #[test]
+    fn the_two_axes_are_tested_independently() {
+        // A rect test that only checked one axis would pass every one of these.
+        let (centre, half) = rect();
+        let well_inside_x = centre + bevy::math::Vec2::new(0.0, half.y + 50.0);
+        assert!(!cursor_in_rect(well_inside_x, centre, half));
+        let well_inside_y = centre + bevy::math::Vec2::new(half.x + 50.0, 0.0);
+        assert!(!cursor_in_rect(well_inside_y, centre, half));
+    }
+
+    #[test]
+    fn a_degenerate_rect_accepts_only_its_own_point() {
+        // Guards the opposite defect: a half-size of zero must not turn into an
+        // "everything is inside" answer through a division or a sign slip.
+        let centre = bevy::math::Vec2::new(10.0, 10.0);
+        let zero = bevy::math::Vec2::ZERO;
+        assert!(cursor_in_rect(centre, centre, zero));
+        assert!(!cursor_in_rect(
+            centre + bevy::math::Vec2::new(0.5, 0.0),
+            centre,
+            zero
+        ));
     }
 }
