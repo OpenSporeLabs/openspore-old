@@ -42,6 +42,25 @@ pub struct MainCamera;
 #[derive(Debug, Clone, Copy, Component, Default)]
 pub struct OnStage;
 
+/// The debug ground plane, so a caller can remove it.
+///
+/// It exists because a floating model with nothing under it gives no depth cue.
+/// The **Creature Creator removes it**, for two reasons and the first is a bug:
+///
+/// 1. It is **opaque**, 400x400, and it sits at `y = -0.01`. A creature whose
+///    centre is below that -- and `0x135ff098` centres at `y = -0.529` -- is
+///    completely buried by it: ten entities resolve, ten report as visible, the
+///    camera frames them correctly, and the screen shows nothing but grey floor.
+///    "Everything resolved and nothing is on screen" is the exact signature of an
+///    occluder, and the entity counts all say the model is fine.
+/// 2. The reference Creator has a landscape backdrop and no grid, so keeping it
+///    would also be wrong on visual grounds.
+///
+/// Marked rather than found by position, because "the entity with the largest
+/// `Plane3d` mesh" is a heuristic that a scene with two floors would break.
+#[derive(Debug, Clone, Copy, Component, Default)]
+pub struct GroundPlane;
+
 /// Everything that is *not* Spore content: the world the content sits in.
 ///
 /// # Why this is a plugin and not a function
@@ -124,6 +143,7 @@ pub fn spawn_stage(
             ..default()
         })),
         Transform::from_xyz(0.0, -0.01, 0.0),
+        GroundPlane,
     ));
 }
 

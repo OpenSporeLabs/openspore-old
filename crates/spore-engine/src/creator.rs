@@ -331,6 +331,9 @@ impl CreatorStage {
             framed_extent: None,
             camera_position: None,
             camera_distance_to_centre: None,
+            skin: crate::editor::skin::SkinPalette::from_document(&self.document)
+                .map(|palette| palette.describe())
+                .unwrap_or_else(|| "no <skincolor*> in this document".to_owned()),
             blocks: self
                 .projection
                 .blocks()
@@ -540,6 +543,13 @@ pub struct CreatorRuntimeState {
     /// reads as a very large distance and a framed one as a small one, derived
     /// from the creature's own measured extent rather than from any constant.
     pub camera_distance_to_centre: Option<f32>,
+    /// The document's own skin, as a `1 / 3` description, or why there is none.
+    ///
+    /// A **string**, not a colour, because the interesting half is not the base
+    /// colour: it is that the pattern ids are reported and explicitly marked
+    /// `NOT_APPLIED`, since a 32-bit id with no registry cannot be turned into
+    /// stripes honestly.
+    pub skin: String,
     /// One row per authored block, in document order.
     ///
     /// **Including the unresolved ones.** An agent can therefore enumerate a
@@ -1112,6 +1122,37 @@ pub fn spawn_projection(
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
 ) -> (CreatorOutcome, Vec<Option<Entity>>) {
+    spawn_projection_skin(stage, selected, scale, None, commands, meshes, materials)
+}
+
+/// [`spawn_projection`], with the document's own skin colour applied.
+///
+/// # Why the colour comes from the DOCUMENT and not from a family lookup
+///
+/// `domain::paint::resolve` answers "what colour should a *model* be" by finding
+/// a `crt` record whose family matches the model's group. For a creature part that
+/// is the wrong question twice: a part's group (`0x40626000`) has no canonical
+/// name in the committed table so the lookup returns `ModelGroupUnnamed`, and
+/// where it does resolve it takes an *arbitrary* first match -- which is how every
+/// unnamed creature came to wear one shipped preset's green.
+///
+/// The document's colour is **in the document**. `<skincolor1..3>` is present in
+/// 47 of 47 creature records, `CreatorDocument::properties` has been parsing it
+/// all along, and reading it from the document being edited is both simpler and
+/// strictly more correct.
+///
+/// Split as its own function so the VIEWER's behaviour is unchanged and this stays
+/// opt-in: a caller that does not pass a palette gets exactly the neutral grey it
+/// got before, which is what makes the difference attributable.
+pub fn spawn_projection_skin(
+    stage: &CreatorStage,
+    selected: Option<usize>,
+    scale: f32,
+    palette: Option<crate::editor::skin::SkinPalette>,
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+) -> (CreatorOutcome, Vec<Option<Entity>>) {
     let counts = stage.projection.counts();
     let mut outcome = CreatorOutcome {
         blocks: stage.block_count(),
@@ -1140,11 +1181,28 @@ pub fn spawn_projection(
     // allocate 47 identical shaders' worth of state.
     let base = ASSET_TINT.to_linear();
     let selection = SELECTION_TINT.to_linear();
-    let plain_material = materials.add(texture::standard_material(
-        &texture::SurfaceSet::default(),
-        None,
-        Some([base.red, base.green, base.blue]),
-    ));
+    // The part material comes from the document's own skin when there is one, and
+    // falls back to the neutral grey otherwise. The fallback is a FALLBACK and
+    // says so in the report line -- "the document states no colour" is not the
+    // same claim as "the document is grey".
+    let plain_material = match palette
+        .as_ref()
+        .and_then(crate::editor::skin::SkinPalette::base)
+    {
+        Some(colour) => {
+            let linear = crate::editor::skin::linear_rgb(colour);
+            materials.add(texture::standard_material(
+                &texture::SurfaceSet::default(),
+                None,
+                Some(linear),
+            ))
+        }
+        None => materials.add(texture::standard_material(
+            &texture::SurfaceSet::default(),
+            None,
+            Some([base.red, base.green, base.blue]),
+        )),
+    };
     let selected_material = materials.add(texture::standard_material(
         &texture::SurfaceSet::default(),
         None,

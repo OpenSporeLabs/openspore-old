@@ -38,12 +38,15 @@
 
 use bevy::prelude::*;
 
-use crate::creator::{spawn_projection, CreatorRootMarker, CreatorRuntimeState, DocumentSource};
+use crate::creator::{
+    spawn_projection_skin, CreatorRootMarker, CreatorRuntimeState, DocumentSource,
+};
 use crate::editor::picking::{self, PickRay};
 use crate::editor::session::CreatorSession;
+use crate::editor::skin::SkinPalette;
 use crate::editor::ui;
 use crate::editor::ui::spawn::{spawn_creator_ui, CreatorUiPart, CreatorUiView};
-use crate::scene::{MainCamera, OnStage};
+use crate::scene::{GroundPlane, MainCamera, OnStage};
 use std::num::NonZeroUsize;
 
 /// Everything the editor needs to open, owned by the plugin.
@@ -201,8 +204,20 @@ pub struct LastPick {
 /// The creature is **not** spawned here: [`spawn_or_respawn_creature`] owns
 /// that, and having two owners is how a respawn ends up spawning the creature
 /// twice.
-fn spawn_creator_screen(mut commands: Commands, state: Res<CreatorEditorState>) {
+fn spawn_creator_screen(
+    mut commands: Commands,
+    state: Res<CreatorEditorState>,
+    ground: Query<Entity, With<GroundPlane>>,
+) {
     spawn_creator_ui(&mut commands, &state.view);
+    // The debug ground plane is opaque and 400x400 at y = -0.01, so it buries any
+    // creature whose centre sits below that -- and `0x135ff098` centres at
+    // y = -0.529. Every symptom said the model was fine: ten blocks resolved, ten
+    // visible, a valid framing. The screen was a grey floor. See
+    // `scene::GroundPlane`.
+    for entity in ground.iter() {
+        commands.entity(entity).despawn();
+    }
 }
 
 /// Respawns the creature when, and only when, the session has moved on.
@@ -234,10 +249,16 @@ fn spawn_or_respawn_creature(
     }
 
     let selection = state.session.selection();
-    let (outcome, _) = spawn_projection(
+    // The document's OWN skin colour, read from the document being edited. This is
+    // the whole reason the creature is not grey any more, and it is one line
+    // because the data was already parsed: `CreatorDocument::properties` has held
+    // `<skincolor1..3>` since the parser was written.
+    let palette = SkinPalette::from_document(state.session.document());
+    let (outcome, _) = spawn_projection_skin(
         state.session.stage(),
         selection,
         state.session.scale(),
+        palette,
         &mut commands,
         &mut meshes,
         &mut materials,
@@ -555,6 +576,9 @@ fn refresh_view_model(
     // `selected_block` stayed `null` in the runtime state, so the two resources
     // disagreed about whether anything was selected.
     runtime.selected_block = state.session.selection().map(|index| index as u32);
+    runtime.skin = SkinPalette::from_document(state.session.document())
+        .map(|palette| palette.describe())
+        .unwrap_or_else(|| "no <skincolor*> in this document".to_owned());
 }
 
 /// Opens a session from a request, for `lib::build_creator_editor_app`.
