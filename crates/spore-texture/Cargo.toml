@@ -10,3 +10,8 @@ description = "Raster envelope parsing and DXT5/BC3 block decoding for Spore tex
 [dependencies]
 spore-core = { workspace = true }
 thiserror = { workspace = true }
+# Already in the lock transitively (via bevy's `image`), so this records a
+# dependency rather than adding one. It is the only decoder this workspace has
+# for the raw-`png` record class -- see `src/png.rs` for why that class needed
+# one at all.
+png = "0.18"

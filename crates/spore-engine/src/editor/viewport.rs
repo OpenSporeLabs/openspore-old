@@ -254,6 +254,10 @@ pub struct CreatorViewportCamera;
 ///   camera with the default clear **erases the entire window**, including the UI
 ///   camera's output. This one field is what stops the two cameras destroying each
 ///   other.
+/// - `clear_color: ClearColorConfig::Custom(Color::NONE)` — transparent, and
+///   **not** `None`. See the inline note: `None` skips the intermediate clear and
+///   this camera then replaces its own viewport rect with an uncleared buffer,
+///   taking the UI and the painted backdrop with it.
 /// - `blend_state: None` — left `None` on purpose. Bevy *auto*-picks replace for
 ///   the first camera on a target and alpha-blend for later ones
 ///   (`bevy_core_pipeline-0.19.1/src/upscaling/mod.rs`), which is exactly the
@@ -264,9 +268,28 @@ pub fn viewport_camera_bundle(viewport: Option<CameraViewport>) -> impl Bundle {
         Camera {
             order: 1,
             viewport,
-            clear_color: ClearColorConfig::None,
+            // TRANSPARENT, not `None`. These are two different instructions and
+            // getting them the wrong way round costs the whole picture:
+            //
+            //   `None` on the intermediate clear means "do not clear", so this
+            //   camera draws into whatever the previous camera left in the shared
+            //   intermediate -- and then its output pass *replaces* its viewport
+            //   rect with that intermediate. The UI and the painted backdrop that
+            //   the UI camera had already put there are erased, and the symptom
+            //   is a black region containing only the creature.
+            //
+            //   `Custom(Color::NONE)` clears the intermediate to fully transparent,
+            //   so this camera's contribution is "creature over nothing", and the
+            //   auto alpha-blend (see `blend_state` below) lays it over the UI
+            //   camera's output. That is what puts the creature in front of the
+            //   backdrop rather than replacing it.
+            clear_color: ClearColorConfig::Custom(Color::NONE),
             output_mode: CameraOutputMode::Write {
                 blend_state: None,
+                // `None` here, and this one IS about not clearing: it is the
+                // final-target clear, and Bevy applies it attachment-wide rather
+                // than scissored to `viewport`. A default clear here would erase
+                // the entire window, UI included.
                 clear_color: ClearColorConfig::None,
             },
             ..default()

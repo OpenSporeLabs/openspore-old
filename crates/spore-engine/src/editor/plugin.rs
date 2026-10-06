@@ -81,9 +81,14 @@ impl Plugin for CreatorEditorPlugin {
                     claim_ui_camera,
                     remove_debug_ground,
                     frame_editor_camera,
+                    // Independent of the framing; what it needs is to run AFTER
+                    // `spawn_creator_screen`, which `PostStartup` guarantees and
+                    // `Startup` would not (`Commands::spawn` is deferred).
+                    crate::editor::backdrop::install_backdrop,
                     ui::font::apply,
                 ),
             )
+            .add_systems(Update, crate::editor::backdrop::publish_backdrop_geometry)
             .add_systems(
                 Update,
                 (

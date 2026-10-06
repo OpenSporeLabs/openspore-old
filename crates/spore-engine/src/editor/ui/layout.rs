@@ -534,6 +534,30 @@ pub fn part_cell_background() -> BackgroundColor {
     BackgroundColor(CreatorPalette::PART_CELL_BACKGROUND)
 }
 
+/// The painted backdrop's node: fills its parent, ignores layout flow.
+///
+/// # Absolute positioning, and it is not decoration
+///
+/// The viewport's children are laid out in a column by default, so an in-flow
+/// backdrop would take a row and push the HUD down out of the region. `Absolute`
+/// takes it out of flow entirely, so it covers the viewport without displacing
+/// anything. This is the same reason `layout::viewport()` pins `Relative`: it is
+/// the containing block this child is positioned against.
+///
+/// `Percent(100)` on both axes rather than a pixel size, because the backdrop has
+/// to follow the viewport when the window resizes -- and a fixed size would leave
+/// a strip of clear colour along one edge, which reads as a rendering bug.
+pub fn backdrop() -> Node {
+    Node {
+        position_type: PositionType::Absolute,
+        left: Val::ZERO,
+        top: Val::ZERO,
+        width: Val::Percent(CreatorMetrics::FULL_PERCENT),
+        height: Val::Percent(CreatorMetrics::FULL_PERCENT),
+        ..Node::default()
+    }
+}
+
 /// A cell's backing plate while hovered. OpenSpore's own.
 pub fn part_cell_background_hover() -> BackgroundColor {
     BackgroundColor(CreatorPalette::PART_CELL_HOVER)

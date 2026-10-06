@@ -232,6 +232,11 @@ fn texture_error_name(error: &spore_texture::TextureError) -> &'static str {
         E::ShortBlockChain { .. } => "TextureError::ShortBlockChain",
         E::OutputTooLarge { .. } => "TextureError::OutputTooLarge",
         E::OutputInvariant { .. } => "TextureError::OutputInvariant",
+        // Added with the raw-`png` decoder. This arm existing at all is the
+        // guard working: the census refuses to compile rather than bucket a new
+        // reason into a string it does not recognise.
+        E::Malformed { .. } => "TextureError::Malformed",
+        E::UnsupportedPngLayout { .. } => "TextureError::UnsupportedPngLayout",
     }
 }
 

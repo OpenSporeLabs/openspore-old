@@ -97,6 +97,7 @@ mod dxt5;
 mod error;
 pub mod framing;
 mod luminance;
+mod png;
 mod raster;
 
 use spore_core::record::type_id;
@@ -112,6 +113,7 @@ pub use crate::luminance::{
     luminance_record_size, LUMINANCE_BYTES_PER_TEXEL, LUMINANCE_FOURCC, LUMINANCE_HEADER_SIZE,
     LUMINANCE_PREFIX_SIZE,
 };
+pub use crate::png::{decode_png, PngImage};
 pub use crate::raster::{
     decode_raster, layer_count_for, mip_dimension, parse_envelope, MipImage, RasterEnvelope,
     RasterImage,

@@ -337,6 +337,9 @@ impl CreatorStage {
             viewport_scale_factor: 1.0,
             viewport_camera_position: None,
             viewport_camera_distance_to_centre: None,
+            backdrop_loaded: false,
+            backdrop_size: None,
+            backdrop_position: None,
             skin: crate::editor::skin::SkinPalette::from_document(&self.document)
                 .map(|palette| palette.describe())
                 .unwrap_or_else(|| "no <skincolor*> in this document".to_owned()),
@@ -589,6 +592,16 @@ pub struct CreatorRuntimeState {
     /// centre, so the two are comparable numbers rather than two definitions of
     /// "framed".
     pub viewport_camera_distance_to_centre: Option<f32>,
+    /// Whether the painted backdrop's image was read and installed.
+    pub backdrop_loaded: bool,
+    /// The backdrop node's laid-out size in physical px, or `None` before layout.
+    ///
+    /// Published because "the image loaded" and "the image is drawn" are separate
+    /// questions, and a zero-sized node with a perfectly valid image handle is the
+    /// state that looks exactly like a missing asset in a screenshot.
+    pub backdrop_size: Option<[f32; 2]>,
+    /// The backdrop node's laid-out top-left in physical px.
+    pub backdrop_position: Option<[f32; 2]>,
 }
 
 /// One authored block's row in [`CreatorRuntimeState::blocks`].

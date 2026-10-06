@@ -43,7 +43,8 @@
 
 use std::num::NonZeroUsize;
 
-use bevy::prelude::{Button, ChildOf, Commands, Entity, Name, Text, TextFont};
+use bevy::prelude::{Button, ChildOf, Commands, Entity, ImageNode, Name, Text, TextFont};
+use bevy::utils::default;
 
 use super::layout::{self, PanelSide, PartGrid};
 use super::theme::{CreatorCounts, CreatorMetrics, CreatorText};
@@ -161,6 +162,13 @@ pub enum CreatorUiPart {
     Panel,
     /// The 3D viewport.
     Viewport,
+    /// The painted backdrop inside the viewport, behind the creature.
+    ///
+    /// A separate part from [`Self::Viewport`] because it is a different job:
+    /// the viewport is the region, this is one child of it. The marker on the
+    /// viewport says "what can be found by kind"; this says "which node to hand
+    /// the backdrop image to", and there must be exactly one.
+    Backdrop,
     /// The tab strip.
     TabStrip,
     /// One tab.
@@ -527,7 +535,7 @@ fn spawn_section_bar(commands: &mut Commands, parent: Entity, index: usize, open
 /// never run. Keep the two in step: the variant says what the node **is**, the marker
 /// says what can **find** it.
 pub fn spawn_viewport(commands: &mut Commands, parent: Entity) -> Entity {
-    commands
+    let viewport = commands
         .spawn((
             layout::viewport(),
             layout::viewport_background(),
@@ -536,6 +544,43 @@ pub fn spawn_viewport(commands: &mut Commands, parent: Entity) -> Entity {
             CreatorUiPart::Viewport,
             crate::editor::plugin::Viewport,
             Name::new("creator-ui-viewport"),
+        ))
+        .id();
+    spawn_viewport_backdrop(commands, viewport);
+    viewport
+}
+
+/// The painted scene behind the creature.
+///
+/// # Inserted first, on purpose
+///
+/// UI children paint in spawn order, so this must come before
+/// `spawn_viewport_hud` or the HUD would be behind the backdrop and invisible
+/// against a bright sky. That is the whole ordering constraint: the backdrop is
+/// the bottom layer, the HUD is the top.
+///
+/// It carries no `Image` yet. `spawn_creator_screen` is a `Startup` system with
+/// no `Assets<Image>`, and the bytes come from a package the session holds, so
+/// the image is filled in afterwards by
+/// [`crate::editor::backdrop::install_backdrop`]. Spawning it empty and filling
+/// it later is why the node exists at all: `CreatorUiPart::Backdrop` is the
+/// findable handle, and there is exactly one of them.
+pub fn spawn_viewport_backdrop(commands: &mut Commands, parent: Entity) -> Entity {
+    commands
+        .spawn((
+            layout::backdrop(),
+            ImageNode {
+                // `Stretch`, not the default. The default sizes the node to the
+                // image and preserves its aspect ratio, which would letterbox a
+                // 348x135 strip inside a 768x665 region and leave the creature
+                // floating in the middle of a small picture. Stretching is the
+                // point: this is a backdrop, not an illustration.
+                image_mode: bevy::ui::widget::NodeImageMode::Stretch,
+                ..default()
+            },
+            ChildOf(parent),
+            CreatorUiPart::Backdrop,
+            Name::new("creator-ui-backdrop"),
         ))
         .id()
 }

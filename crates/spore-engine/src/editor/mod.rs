@@ -12,6 +12,7 @@
 //! | [`picking`] | cursor ray -> `BlockIndex` | pure maths, testable with no camera, so the interesting cases can be written down |
 //! | [`ui`] | the screen's layout, proportions and colours | a screenshot cannot be asserted on, so the proportions have to be numbers first |
 
+pub mod backdrop;
 pub mod picking;
 pub mod plugin;
 pub mod session;

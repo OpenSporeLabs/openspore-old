@@ -18,6 +18,36 @@ use crate::{DXT1_FOURCC, DXT5_FOURCC, ENVELOPE_SIZE, LUMINANCE_FOURCC};
 /// Every way decoding a Spore raster texture record can fail.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum TextureError {
+    // ---- non-envelope decoders ----------------------------------------
+    /// The byte stream is not a valid instance of the format it claims to be.
+    ///
+    /// Added for the raw-`png` decoder in [`crate::png`], whose input has no
+    /// envelope and therefore no variant above could describe "the header is
+    /// wrong". Every other variant here is about a raster record's own framing,
+    /// and reusing one of those for a PNG would make the error text lie about
+    /// which record class failed.
+    ///
+    /// Distinct from [`TextureError::UnsupportedPngLayout`] on purpose: *corrupt*
+    /// and *valid but not implemented* are different answers, and a caller that
+    /// conflates them will report a missing asset when the real problem is a
+    /// decoder gap.
+    #[error("texture: not a valid image: {detail}")]
+    Malformed {
+        /// What was wrong, in the decoder's own words.
+        detail: String,
+    },
+
+    /// A structurally valid image in a layout this build does not convert.
+    ///
+    /// Only the 8-bit greyscale / grey+alpha / rgb / rgba layouts are decoded.
+    /// A 16-bit or interlaced PNG is a *gap*, not a corruption, and saying so is
+    /// the difference between "fix the decoder" and "the file is broken".
+    #[error("texture: valid image, unsupported layout: {detail}")]
+    UnsupportedPngLayout {
+        /// The colour type or bit depth, as the decoder names it.
+        detail: String,
+    },
+
     // ---- envelope ------------------------------------------------------
     /// Fewer than [`ENVELOPE_SIZE`] bytes: not even the envelope fits.
     ///

@@ -668,6 +668,25 @@ impl SessionRecords {
 }
 
 impl CreatorSession {
+    /// The live content store, when this session was opened on real packages.
+    ///
+    /// `None` for a synthetic session, which is the honest answer: there are no
+    /// packages behind it, so there is nothing to read a *non-document* record
+    /// from. Callers that want art rather than the document -- the editor's
+    /// backdrop, the part thumbnails -- need this, and every one of them has to
+    /// cope with its absence rather than assume it.
+    ///
+    /// Deliberately not folded into [`Self::stage`]: a projection is a
+    /// statement about the document, and reaching the whole package set through
+    /// it would make "what does this creature contain" and "what does this
+    /// install contain" the same question.
+    pub fn store(&self) -> Option<&spore_assets::ContentStore> {
+        match &self.records {
+            SessionRecords::Packages(world) => Some(world.store()),
+            SessionRecords::Synthetic(_) => None,
+        }
+    }
+
     /// The current projection, for a caller that wants to pick against it
     /// without also reaching for the stage.
     ///
