@@ -388,13 +388,32 @@ fn the_column_count_really_is_four_for_the_four_column_grid() {
 }
 
 #[test]
-fn a_part_cell_is_the_observed_180_square() {
-    assert_eq!(layout::part_cell_side(), Val::Px(180.0));
-    assert_eq!(layout::part_cell().flex_basis, Val::Px(180.0));
+fn a_part_cell_is_180_wide_and_a_tenth_of_the_grid_tall() {
+    // The 180 is the observed **width**. It used to be asserted as `flex_basis`,
+    // which in this column container is a HEIGHT -- so the test passed while every
+    // cell rendered 180 px tall, ten rows overflowed a ~520 px grid, and flex
+    // shrank each one to about 26 px. Asserting the value is not the same as
+    // asserting the axis, and only the axis was wrong.
+    let cell = layout::part_cell();
     assert_eq!(
-        layout::part_cell().aspect_ratio,
-        Some(1.0),
-        "the reference's cells are square; an unset aspect ratio would let them become rectangles"
+        cell.width,
+        Val::Percent(23.5),
+        "a percentage, so four columns are four columns at any panel width; \
+         180 px of it is the measured value at the reference's 1920 window"
+    );
+    assert_eq!(
+        cell.height,
+        Val::Px(46.0),
+        "ten rows must fit the grid without flex shrinking them"
+    );
+    assert_eq!(
+        cell.flex_shrink, 0.0,
+        "shrink is what turned every cell into a 2 px smear"
+    );
+    assert_eq!(
+        cell.aspect_ratio, None,
+        "an aspect ratio here fights the row height instead of describing the \
+         reference, whose cells are about 185 x 97"
     );
 }
 
@@ -1137,7 +1156,9 @@ fn no_layout_function_returns_a_magic_proportion() {
     assert_eq!(layout::tab_strip().height, Val::Px(60.0));
     assert_eq!(layout::pager().height, Val::Px(56.0));
     assert_eq!(layout::bottom_bar().height, Val::Px(55.0));
-    assert_eq!(layout::part_cell().flex_basis, Val::Px(180.0));
+    // A percentage, by the same rule as the two beside it: a literal in
+    // `layout::part_cell()` is a magic number whichever axis it is on.
+    assert_eq!(layout::part_cell().width, Val::Percent(23.5));
     assert_eq!(layout::panel().width, Val::Percent(40.0));
     assert_eq!(layout::viewport().width, Val::Percent(60.0));
     assert_eq!(layout::section_bar().height, Val::Px(44.0));

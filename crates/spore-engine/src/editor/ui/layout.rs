@@ -503,10 +503,48 @@ pub fn part_grid() -> Node {
 ///
 /// `aspect_ratio: 1` pins the square the reference shows, so a cell cannot
 /// become a rectangle because the flex algorithm handed it a different height.
+/// One catalogue cell.
+///
+/// # The 180 is the WIDTH, and that was the bug
+///
+/// This used to set `flex_basis: Val::Px(180.0)` inside a **column** flex
+/// container, where `flex_basis` is the main axis -- the height. So every cell was
+/// 180 px tall, ten rows wanted 1800 px, the grid had about 520, and flex
+/// shrank each row to roughly 26 px. The cells rendered as wide bars.
+///
+/// The measured reference value is 180 px **across**: four columns fill 720 px of a
+/// 768 px panel, and ten rows of the reference's grid occupy about 970 px, which is
+/// ~97 px a row. The reference's cells are not squares either, so the
+/// `aspect_ratio: Some(1.0)` that "made them square" was fighting the row height
+/// rather than describing anything.
+///
+/// # Percentages for the height, because the panel's height is not a constant
+///
+/// `PART_CELL_ROW_PERCENT` x 10 fills the grid whatever the window is. A pixel
+/// height cannot: at the reference's 1240 px window ten square 180 px rows do not
+/// fit either, and the grid would need a scroll container this widget does not
+/// have. `flex_shrink: 0` then makes the number mean what it says instead of
+/// letting the layout quietly disagree with it.
 pub fn part_cell() -> Node {
     Node {
-        flex_basis: Val::Px(CreatorMetrics::PART_CELL_SIDE_PX),
-        aspect_ratio: Some(CreatorMetrics::ASPECT_SQUARE),
+        // Percent, not the measured 180 px. The grid is `SpaceBetween` in a
+        // `Row`, so four 180 px cells want 720 px of a 488 px panel and only two
+        // fit once `flex_shrink` is 0. A percentage is what makes four columns
+        // four columns at ANY panel width; the measured 180 is what that
+        // percentage works out to at the reference's 768 px panel.
+        width: Val::Percent(CreatorMetrics::PART_CELL_COLUMNS_PERCENT),
+        flex_basis: Val::Auto,
+        // Pixels, and derived: ten rows must fit the grid's height with the gaps
+        // between them, and the grid's height is not a constant this widget can
+        // read at spawn. `PART_CELL_ROW_PX` is that budget for the editor's
+        // default 1280x720 window (see its own doc). A percentage here resolved
+        // against a flex-grown parent and came out at three hundred pixels.
+        height: Val::Px(CreatorMetrics::PART_CELL_ROW_PX),
+        // 0, not the default 1: shrinking the height is precisely what turned every
+        // cell into a 2 px smear, and the width is a percentage now so it does not
+        // need to shrink either.
+        flex_shrink: 0.0,
+        flex_grow: 0.0,
         align_items: AlignItems::Center,
         justify_content: JustifyContent::Center,
         // This is where the reference's "generous spacing" lives. Four 180 px
@@ -520,16 +558,6 @@ pub fn part_cell() -> Node {
     }
 }
 
-/// One part cell's side length as a [`Val`].
-///
-/// [`part_cell`] is the style; this is the OBSERVED 180 px
-/// stated on its own so a test can check "the cell is 180 px" as a value rather
-/// than inferring it from a flex algorithm that has not run.
-pub const fn part_cell_side() -> Val {
-    Val::Px(CreatorMetrics::PART_CELL_SIDE_PX)
-}
-
-/// A cell's backing plate. OpenSpore's own.
 pub fn part_cell_background() -> BackgroundColor {
     BackgroundColor(CreatorPalette::PART_CELL_BACKGROUND)
 }

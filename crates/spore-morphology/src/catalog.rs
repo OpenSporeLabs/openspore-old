@@ -1082,6 +1082,48 @@ pub struct CatalogCounts {
 
 // ---------------------------------------------------------------------------
 // Building one entry
+/// The decoded `gmsh` geometry for one part identity, with no document in sight.
+///
+/// # Why this exists, and why it is not a second chain walk
+///
+/// The catalogue needs *counts* for every identity, so it deliberately discards
+/// the mesh it decoded (`build_entry` keeps `vertices`/`triangles`/`extent` and
+/// drops the rest). Anything that wants to DRAW a part -- the Creator's thumbnail
+/// grid -- needs the mesh itself, and 482 parts cannot be drawn by composing a
+/// one-block document through a public API per frame.
+///
+/// So this hands back the mesh, and it does so by going through [`Resolver`]
+/// exactly as [`build_entry`] does, on a synthesised one-block document. The
+/// alternative -- walking `prop -> part pair -> gmsh` here -- would be a second
+/// implementation of the chain, which is the specific duplication this crate
+/// exists to prevent: two answers to "what is part X", free to drift.
+///
+/// # Cost, stated because 482 of these is not free
+///
+/// Each call resolves one identity through the store: a rigblock read, a prop
+/// read, a container read and a `gmsh` decode. Measured over the part layer that
+/// is ~700 vertices per part, so the full catalogue is roughly 340k vertices.
+/// [`crate::catalog::Catalog`] resolves all of them too and throws the meshes
+/// away, which is the argument for caching this rather than calling it per frame.
+pub fn geometry_of(
+    source: &dyn RecordSource,
+    id: BlockId,
+) -> Option<spore_rigblock::gmsh::GmshMesh> {
+    let document = CreatorDocument {
+        format_version: None,
+        properties: Default::default(),
+        blocks: vec![Block {
+            block_id: Some(id),
+            ..Block::default()
+        }],
+    };
+    let composition = Resolver::new(source).compose(&document).ok()?;
+    match composition.slots().first()? {
+        PartSlot::Resolved(part) => part.as_ref().geometry.clone(),
+        PartSlot::Unresolved(_) => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 
 /// Resolves one identity and classifies every group of the result.

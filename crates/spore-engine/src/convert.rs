@@ -537,6 +537,46 @@ pub fn tangents_of(mesh: &Mesh) -> Option<Vec<[f32; 4]>> {
     }
 }
 
+/// Lifts a decoded `gmsh` part into a Bevy [`Mesh`].
+///
+/// # The one place a part becomes drawable geometry
+///
+/// [`crate::creator`] has a private twin of this for a projected block. It is
+/// private because it took a `ProjectedPart` -- a *document* view of a part, with
+/// the block's transform already folded in somewhere else. A thumbnail needs the
+/// opposite: the mesh alone, in its own local space, so it can be centred in a
+/// grid cell. Two functions, one lift.
+///
+/// # No UVs, and that is the record's doing rather than ours
+///
+/// `uvs: None` and `raw_normal_bytes: None` because a `gmsh` part record declares
+/// no TEXCOORD and no NORMAL element -- the same reason the creature viewport's
+/// parts are untextured. `spore-rigblock` does expose a UV-*like* attribute block
+/// (`0x08000202`, 8 bytes, `nv` floats, float-plausible in 1616 of 1616 records)
+/// but grades its meaning UNKNOWN and does not decode it, and reading it as
+/// floats anyway is exactly how a decoder invents normals.
+///
+/// So a baked thumbnail is the part's real silhouette in flat shading. That is
+/// honest and it is what the creature viewport already shows; it is not the
+/// reference's textured mouths, and no amount of work in this file changes that.
+pub fn part_mesh(geometry: &spore_morphology::GmshMesh) -> Option<Mesh> {
+    let buffers = MeshBuffers {
+        positions: geometry.positions.clone(),
+        uvs: None,
+        indices: geometry
+            .indices
+            .iter()
+            .map(|index| u32::from(*index))
+            .collect(),
+        topology: Topology::TriangleList,
+        raw_normal_bytes: None,
+    };
+    if buffers.indices.is_empty() || buffers.positions.is_empty() {
+        return None;
+    }
+    Some(to_bevy_mesh(&buffers, NormalMode::Computed))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

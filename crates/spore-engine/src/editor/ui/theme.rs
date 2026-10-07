@@ -248,6 +248,33 @@ impl CreatorMetrics {
     /// below is what constrains them.
     pub const PART_CELL_SIDE_PX: f32 = 180.0;
 
+    /// One grid column's share of the grid's width, as a percentage.
+    ///
+    /// Four columns at 23.5% fill 94% of the panel with the gaps between them,
+    /// which is what `layout::part_grid`'s `SpaceBetween` wants. Expressed as a
+    /// percentage rather than as the measured 180 px because the panel's width
+    /// varies with the window and 180 px does not: at the editor's default
+    /// 1280-wide window the panel is 512 px, and four 180 px cells would fit two.
+    ///
+    /// At the reference's own 1920-wide window this works out to 180 px, which is
+    /// where the measured number comes from.
+    pub const PART_CELL_COLUMNS_PERCENT: f32 = 23.5;
+
+    /// One grid row's height in pixels.
+    ///
+    /// **OpenSpore's own, and derived rather than measured**, because the
+    /// reference's row height is measured at a 1240 px-tall window and this editor
+    /// runs at 720. Ten rows plus nine 6 px gaps have to fit the grid, which is
+    /// the panel's height minus the tab strip and the pager: at 1280x720 that is
+    /// about 520 px, so `(520 - 9 * 6) / 10 = 46.6`.
+    ///
+    /// A percentage was tried and does not work: the grid is sized by `flex_grow`,
+    /// and a percentage height against a flex-grown parent resolved to roughly
+    /// 300 px, which put two rows on screen. A scroll container would let the rows
+    /// be as tall as the reference's and is the right answer for a future revision;
+    /// this is a number that fits.
+    pub const PART_CELL_ROW_PX: f32 = 46.0;
+
     /// **OpenSpore's own choice.** Gap between part cells, in pixels.
     ///
     /// Forced small by the arithmetic, which is checked at compile time: four

@@ -402,8 +402,31 @@ pub fn build_creator_editor_app(window: WindowOptions, request: &CreatorRequest)
     }
     runtime.document = session.stage().document_identity();
 
+    // The part catalogue is resolved HERE, before the app exists, and the grid's
+    // cell count is set on the view from it.
+    //
+    // It used to be built in a `Startup` system, which is unordered relative to
+    // `spawn_creator_screen` -- and the UI tree is spawned once, from the view, at
+    // startup. So the cells were spawned with `cells: 0` and no cell ever
+    // appeared, no matter how many parts the catalogue held. A data question
+    // answered by a scheduler race; the fix is to answer it before there is a
+    // scheduler.
+    let mut palette_state = editor::thumbnail_bake::PaletteState::default();
+    let mut view = CreatorUiView::default();
+    if let Some(store) = session.store() {
+        let palette = editor::thumbnails::build_palette(store, editor::thumbnail_bake::PART_GROUP);
+        view.cells = palette.drawable();
+        let pages = palette
+            .drawable()
+            .max(1)
+            .div_ceil(editor::thumbnail_bake::TILES_PER_PAGE);
+        view.pages = std::num::NonZeroUsize::new(pages).unwrap_or(std::num::NonZeroUsize::MIN);
+        palette_state.set(palette);
+    }
+
     let mut app = base_app(window);
-    app.insert_resource(CreatorEditorState::new(session, CreatorUiView::default()));
+    app.insert_resource(CreatorEditorState::new(session, view));
+    app.insert_resource(palette_state);
     app.insert_resource(LastPick::default());
     app.insert_resource(editor::plugin::CreatorSelectionCommand::default());
     app.insert_resource(runtime);

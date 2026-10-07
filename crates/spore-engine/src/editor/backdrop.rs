@@ -275,15 +275,23 @@ pub fn publish_backdrop_geometry(
 /// `Without<BackdropInstalled>` is what makes this idempotent, and it is why
 /// [`install_backdrop`] can run in `PostStartup` and simply stop: there is no
 /// counter and no handle comparison to get wrong.
-type PendingBackdrops<'w, 's> = Query<
-    'w,
-    's,
-    (Entity, &'static mut ImageNode),
-    (
-        With<crate::editor::ui::spawn::CreatorUiPart>,
-        Without<BackdropInstalled>,
-    ),
->;
+type PendingBackdrops<'w, 's> =
+    Query<'w, 's, (Entity, &'static mut ImageNode), (With<Backdrop>, Without<BackdropInstalled>)>;
+
+/// Marks **the** backdrop node.
+///
+/// Its own component rather than a `CreatorUiPart` filter, and that is a fix
+/// rather than a style choice. The query used to filter on
+/// `With<CreatorUiPart>`, which was unique when the backdrop was the only node
+/// carrying an `ImageNode`. Adding one to each of the forty part cells made it
+/// match **41** entities, `single_mut()` refused, and the backdrop silently went
+/// away again -- the log said so outright: "expected exactly one backdrop node
+/// with an ImageNode, found 41".
+///
+/// A filter broad enough to collect every future `ImageNode` is not a filter.
+/// This one names the node it means.
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Backdrop;
 
 /// Marks a backdrop node whose image slot has been resolved, one way or the other.
 ///

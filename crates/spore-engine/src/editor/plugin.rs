@@ -89,6 +89,36 @@ impl Plugin for CreatorEditorPlugin {
                 ),
             )
             .add_systems(Update, crate::editor::backdrop::publish_backdrop_geometry)
+            // The bake is its own chain, and deliberately NOT part of the
+            // editor's `Update` tuple: it is a forty-part decode plus a read-back,
+            // and interleaving it with the per-frame selection and wheel systems
+            // would put a second of work between a click and its result.
+            // Chained, and the chain is load-bearing twice over. `create_atlas`
+            // must run before `start_bake` because `start_bake` takes
+            // `ResMut<AtlasHandle>` and a `Startup` system that runs first against a
+            // resource that does not exist yet is a panic, not a deferral --
+            // `ResMut` validation happens when the system runs. And
+            // `prepare_palette` must precede `start_bake` because the bake reads
+            // the catalogue it builds.
+            .add_systems(
+                Startup,
+                (
+                    create_atlas,
+                    crate::editor::thumbnail_bake::prepare_palette,
+                    crate::editor::thumbnail_bake::start_bake,
+                )
+                    .chain(),
+            )
+            .add_systems(
+                Update,
+                (
+                    crate::editor::thumbnail_bake::request_capture,
+                    crate::editor::thumbnail_bake::clear_staging,
+                    crate::editor::thumbnail_bake::publish_bake_state,
+                ),
+            )
+            .init_resource::<crate::editor::thumbnail_bake::PaletteState>()
+            .init_resource::<crate::editor::thumbnail_bake::BakeState>()
             .add_systems(
                 Update,
                 (
@@ -102,6 +132,10 @@ impl Plugin for CreatorEditorPlugin {
                     frame_editor_camera_after_an_edit,
                     apply_selection_command,
                     read_viewport_click,
+                    // Cell presses are a document edit, so they sit with the other
+                    // edit-driven systems and before `refresh_view_model`, which
+                    // republishes the selection they may have changed.
+                    crate::editor::thumbnail_bake::read_part_cell_click,
                     wheel_scales_selection,
                     refresh_view_model,
                     crate::creator::tick_creator_runtime,
@@ -111,6 +145,17 @@ impl Plugin for CreatorEditorPlugin {
             )
             .init_resource::<CreatorViewport>();
     }
+}
+
+/// Creates the atlas texture the part thumbnails are baked into.
+///
+/// A separate `Startup` system because it needs `Assets<Image>`, which
+/// [`crate::editor::thumbnail_bake::start_bake`] does have -- but keeping the
+/// creation here means the texture exists before anything can ask to render into
+/// it, and one `init_resource` cannot allocate an asset handle.
+fn create_atlas(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
+    let handle = images.add(crate::editor::thumbnail_bake::atlas_image());
+    commands.insert_resource(crate::editor::thumbnail_bake::AtlasHandle(handle));
 }
 
 /// Spawns the camera the creature is rendered through.
@@ -183,9 +228,15 @@ fn tag_viewport_content(
     lights: Query<Entity, With<DirectionalLight>>,
 ) {
     for entity in creatures.iter().chain(lights.iter()) {
+        // `try_insert`, not `insert`: `spawn_or_respawn_creature` runs earlier in
+        // this same chain and queues the previous creature for despawn, and the
+        // despawn is applied at the end of the schedule -- so this frame's query
+        // still returns those entities, and a plain `insert` on one panics with
+        // "Entity despawned". The whole editor died on the first respawn because
+        // of it. A missing render layer on an entity that is leaving is harmless.
         commands
             .entity(entity)
-            .insert(bevy::camera::visibility::RenderLayers::layer(1));
+            .try_insert(bevy::camera::visibility::RenderLayers::layer(1));
     }
 }
 
@@ -1078,12 +1129,29 @@ pub const MAX_PART_SCALE: f32 = 8.0;
 fn refresh_view_model(
     mut state: ResMut<CreatorEditorState>,
     mut runtime: ResMut<CreatorRuntimeState>,
+    palette: Res<crate::editor::thumbnail_bake::PaletteState>,
 ) {
-    let resolved = state.session.projection().resolved().count();
     let blocks = state.session.stage().block_count();
-    state.view.cells = resolved;
     state.view.active_tab = state.view.active_tab.min(blocks.max(1).saturating_sub(1));
-    state.view.pages = NonZeroUsize::new(resolved.max(1)).unwrap_or(NonZeroUsize::MIN);
+
+    // The grid counts the CATALOGUE -- the parts the user can choose from -- and
+    // not the blocks the current document happens to have.
+    //
+    // It used to count `projection().resolved().count()`, which is the document's
+    // block count, so a ten-block spine offered ten parts and the reference's
+    // forty could never appear. Worse, the number moved whenever the document was
+    // edited: adding a block would add a cell to the parts grid. Two different
+    // questions, one counter.
+    let drawable = palette
+        .palette
+        .as_ref()
+        .map(|catalogue| catalogue.drawable())
+        .unwrap_or(0);
+    state.view.cells = drawable;
+    let pages = drawable
+        .max(1)
+        .div_ceil(crate::editor::thumbnail_bake::TILES_PER_PAGE);
+    state.view.pages = NonZeroUsize::new(pages).unwrap_or(NonZeroUsize::MIN);
 
     // The selected block is republished EVERY frame, not only when the revision
     // moves. Selecting a block changes no document state, so the revision does not

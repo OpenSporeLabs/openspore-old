@@ -364,13 +364,26 @@ pub fn spawn_part_grid(commands: &mut Commands, parent: Entity, view: &CreatorUi
     // belongs on page two and rendering forty cells into a twelve-cell page would
     // push the pager off the panel — a clipping problem dressed as a layout one.
     let count = view.cells.min(view.grid.cells_per_page());
-    for _ in 0..count {
+    for index in 0..count {
         commands.spawn((
             layout::part_cell(),
             layout::part_cell_background(),
+            // The picture the atlas bake fills in. Starts as `ImageNode`'s
+            // default, which is Bevy's 1x1 TRANSPARENT texture -- so a cell with
+            // no bake yet shows the cell's own backing plate and nothing else.
+            // Deliberately not a grey box: a stand-in and a real-but-different
+            // picture look identical to the person choosing a part, and this
+            // crate does not ship stand-ins.
+            // The DEFAULT `Fit` mode, deliberately: the cell is a wide bar
+            // (180 x ~47, see `layout::part_cell`) and the tile is square, so `Fit`
+            // draws a centred undistorted square. `Stretch` -- which is what the
+            // backdrop uses, correctly, because a backdrop is meant to fill -- squashed
+            // every part into a 2 px horizontal smear.
+            ImageNode::default(),
             Button,
             ChildOf(grid),
             CreatorUiPart::PartCell,
+            crate::editor::thumbnail_bake::PartCellIndex(index),
             Name::new("creator-ui-part-cell"),
         ));
     }
@@ -580,6 +593,9 @@ pub fn spawn_viewport_backdrop(commands: &mut Commands, parent: Entity) -> Entit
             },
             ChildOf(parent),
             CreatorUiPart::Backdrop,
+            // Its own marker, because the install query must find exactly one
+            // `ImageNode` and every part cell now carries one too.
+            crate::editor::backdrop::Backdrop,
             Name::new("creator-ui-backdrop"),
         ))
         .id()

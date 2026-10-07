@@ -17,6 +17,7 @@ pub mod picking;
 pub mod plugin;
 pub mod session;
 pub mod skin;
+pub mod thumbnail_bake;
 pub mod thumbnails;
 pub mod ui;
 pub mod viewport;

@@ -340,6 +340,10 @@ impl CreatorStage {
             backdrop_loaded: false,
             backdrop_size: None,
             backdrop_position: None,
+            bake_stage: String::new(),
+            bake_tiles: 0,
+            bake_reason: None,
+            bake_pages: 1,
             skin: crate::editor::skin::SkinPalette::from_document(&self.document)
                 .map(|palette| palette.describe())
                 .unwrap_or_else(|| "no <skincolor*> in this document".to_owned()),
@@ -602,6 +606,14 @@ pub struct CreatorRuntimeState {
     pub backdrop_size: Option<[f32; 2]>,
     /// The backdrop node's laid-out top-left in physical px.
     pub backdrop_position: Option<[f32; 2]>,
+    /// Where the part-thumbnail bake got to, as a debug-formatted stage name.
+    pub bake_stage: String,
+    /// How many atlas tiles actually carry an image.
+    pub bake_tiles: u32,
+    /// Why the bake failed, or `None` while it is fine.
+    pub bake_reason: Option<String>,
+    /// How many pages of parts the catalogue holds.
+    pub bake_pages: u32,
 }
 
 /// One authored block's row in [`CreatorRuntimeState::blocks`].

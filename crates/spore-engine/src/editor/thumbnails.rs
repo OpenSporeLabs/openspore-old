@@ -134,7 +134,13 @@ impl Palette {
 ///
 /// Packages with no path are **counted, not skipped silently**; see
 /// [`Palette::packages_without_path`].
-fn source_over(store: &ContentStore) -> (PackageSource, usize) {
+/// Builds a [`PackageSource`] over the packages a store already has open.
+///
+/// Public because the atlas needs the same bridge: it resolves a part's geometry
+/// on demand, and `PackageSource` is built from **paths** rather than from a
+/// store, so anything wanting per-part resolution has to reconstruct this. Two
+/// copies would be two answers to "which packages is this session reading".
+pub fn source_over(store: &ContentStore) -> (PackageSource, usize) {
     let mut source = PackageSource::new();
     let mut without_path = 0;
     for package in store.packages() {

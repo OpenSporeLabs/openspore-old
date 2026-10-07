@@ -64,8 +64,9 @@ pub mod resolve;
 pub mod source;
 
 pub use catalog::{
-    Absent, Catalog, CatalogCounts, CatalogEntry, DeclaredDependency, Dependencies, DocumentRecord,
-    ExtentComparison, Geometry, Lookup, PartReference, RigblockBounds, Skeleton, Stop,
+    geometry_of, Absent, Catalog, CatalogCounts, CatalogEntry, DeclaredDependency, Dependencies,
+    DocumentRecord, ExtentComparison, Geometry, Lookup, PartReference, RigblockBounds, Skeleton,
+    Stop,
 };
 pub use composition::{Composition, Counts, PartSlot, UnresolvedPart};
 pub use dbpf::PackageSource;
@@ -75,4 +76,8 @@ pub use projection::{
 };
 pub use provenance::{Grade, Hop, Stage, StopReason, Trail};
 pub use resolve::{compose, ResolvedPart, Resolver};
+// Re-exported so a consumer can name a part's mesh type without taking a direct
+// dependency on `spore-rigblock`: the crate that hands the mesh out should be the
+// crate you already depend on, or the geometry type has two homes.
 pub use source::{MemorySource, Probe, RecordSource};
+pub use spore_rigblock::GmshMesh;
