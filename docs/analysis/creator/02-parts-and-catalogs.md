@@ -384,6 +384,47 @@ chain; the phrase "creature DB" is UNSUPPORTED as a parts catalog.
   `graph::claims::PROP_LAYOUT_UNRESOLVED` claim. Nothing here was used to
   derive an identity.
 
+  The same group also contains **44 palette definitions** at
+  `0x00b1b104:0x406b6a00:*`. Their first property is a UTF-16LE title, including
+  `Creature Editor Palette` (instance `0x0c`), `Creature Editor Texture Palette`
+  (`0x0d`), `Flora Editor Palette` (`0x14`), `Building Editor Palette` (`0x28`),
+  and multiple `Vehicle Editor Parts Palette` records (`0x32..0x3d`, with gaps).
+  This establishes that palette definitions and descriptive titles exist; it does
+  **not** establish which of the six creature-editor tabs selects which category,
+  nor a category/page/item-to-rigblock mapping. The binary tail contains further
+  resource-like values, but their record grammar and semantics remain UNKNOWN.
+  The editor therefore keeps its tab identities positional until the runtime
+  lookup chain (`PaletteMain` → `PaletteCategory` → pages → items) is fully
+  reconstructed.
+
+  **Runtime follow-up (Ghidra, `SporeApp.exe` 3.1.0.22, image base
+  `0x00400000`).** The UI side of that chain is now better bounded:
+
+  * `FUN_005cb5a0` constructs one page/category view for every entry in a
+    runtime vector and passes each entry to `FUN_005c53c0`.
+  * `FUN_005cb240` validates a selected category index against that vector,
+    stores the active entry, and calls `FUN_005cadb0(index / 9)`.
+  * `FUN_005cadb0` toggles previous/next-page controls based on a page size of
+    nine. `FUN_005cae60` lays out the items in a 3×3 page.
+  * `FUN_005c9230` constructs a page from the category's runtime item array and
+    creates item UI objects from those records.
+
+  This confirms that category selection and nine-item pages are real runtime
+  behavior. It does **not** recover the six visible creature-editor tab slots'
+  category ids, nor the `prop` grammar that links category items to rigblock
+  identities. OpenSpore therefore still does not filter its rigblock catalog by
+  those tabs. The runtime validates a category index against a live category
+  vector; treating that position as a category identity would still be a guess.
+
+  **Attachment follow-up.** The recovered authoring document supports parent
+  indices and arbitrary local transforms, and the runtime `EditorRigblock`
+  exposes parent/child links plus snap-compatibility lists. The contents of those
+  lists and the socket transforms remain unknown. OpenSpore's new manual drop
+  behavior uses its existing bounds picker: dropping a catalog part on a picked
+  block adds a child whose local position is the hit point transformed into the
+  parent's local space. This is an OpenSpore authoring interaction, not a claim
+  to reproduce Spore's automatic snap or attachment rules.
+
 ### 4.4 Where names *do* live (measured, all UTF-16LE strings inside `prop`)
 
 | package | group | named `prop` records | sample strings |

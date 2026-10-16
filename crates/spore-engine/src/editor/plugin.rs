@@ -6,12 +6,9 @@
 //!
 //! ## The one rule this module exists to enforce
 //!
-//! A click in the viewport does not move an entity. It calls
-//! [`CreatorSession::select`](session::CreatorSession::select), which changes
-//! the session's selection, and the selection reaches the screen because the
-//! spawn system reads it. Nothing else. So the UI, the picker and a future
-//! script all drive selection through one call, and there is no path on which the
-//! picture and the document disagree about what is selected.
+//! A click selects the projected document block. Keyboard nudges and mouse-wheel
+//! scales are then written through [`CreatorSession`], so the rendered projection
+//! and the saved `<sporemodel>` remain the same source of truth.
 //!
 //! ## Frame order, and why each step is where it is
 //!
@@ -19,7 +16,9 @@
 //! |---|---|---|
 //! | [`spawn_creator_screen`] | `Startup` | the UI tree is static furniture; it is spawned once |
 //! | [`spawn_or_respawn_creature`] | `Update`, **first** | `Commands::spawn` is deferred, so a respawn's entities do not exist until the next frame |
-//! | [`read_viewport_click`] | `Update` | after the creature is on screen, or a click would pick against the previous document |
+//! | [`read_viewport_click`] / edit commands | `Update` | after the creature is on screen, or a click would pick against the previous document |
+//! | [`select_palette_tab`] / [`reflect_active_palette_tab`] | `Update` | tab position and active fill stay in sync while category item links remain unresolved |
+//! | [`orbit_editor_camera`] | `Update` | pointer motion moves only the viewport camera, never the UI camera |
 //! | [`refresh_view_model`] | `Update` | last: it reads the selection that `read_viewport_click` may have just changed |
 //!
 //! [`spawn_or_respawn_creature`] is deliberately **not** in `PostStartup` even
@@ -80,6 +79,7 @@ impl Plugin for CreatorEditorPlugin {
                 (
                     claim_ui_camera,
                     remove_debug_ground,
+                    spawn_creator_ground,
                     frame_editor_camera,
                     // Independent of the framing; what it needs is to run AFTER
                     // `spawn_creator_screen`, which `PostStartup` guarantees and
@@ -117,8 +117,19 @@ impl Plugin for CreatorEditorPlugin {
                     crate::editor::thumbnail_bake::publish_bake_state,
                 ),
             )
+            .add_systems(
+                Update,
+                (
+                    crate::editor::thumbnail_bake::page_catalog_on_arrow_click,
+                    crate::editor::thumbnail_bake::page_catalog_on_wheel,
+                    crate::editor::thumbnail_bake::show_catalog_page,
+                )
+                    .chain(),
+            )
             .init_resource::<crate::editor::thumbnail_bake::PaletteState>()
             .init_resource::<crate::editor::thumbnail_bake::BakeState>()
+            .init_resource::<crate::editor::thumbnail_bake::CatalogPage>()
+            .init_resource::<crate::editor::thumbnail_bake::BakedAtlas>()
             .add_systems(
                 Update,
                 (
@@ -131,18 +142,33 @@ impl Plugin for CreatorEditorPlugin {
                     sync_creator_viewport,
                     frame_editor_camera_after_an_edit,
                     apply_selection_command,
-                    read_viewport_click,
+                    select_palette_tab,
+                    reflect_active_palette_tab,
                     // Cell presses are a document edit, so they sit with the other
                     // edit-driven systems and before `refresh_view_model`, which
                     // republishes the selection they may have changed.
-                    crate::editor::thumbnail_bake::read_part_cell_click,
-                    wheel_scales_selection,
+                    crate::editor::thumbnail_bake::read_part_cell_gesture,
+                    read_viewport_click,
+                    nudge_selected_block,
+                    remove_selected_block,
                     refresh_view_model,
                     crate::creator::tick_creator_runtime,
                     publish_viewport_state,
                 )
                     .chain(),
             )
+            .add_systems(Update, orbit_editor_camera)
+            .add_systems(Update, wheel_scales_selection)
+            .add_systems(
+                Update,
+                (
+                    wheel_scales_composition,
+                    apply_composition_scale,
+                    fit_camera_for_composition_scale,
+                )
+                    .chain(),
+            )
+            .init_resource::<crate::editor::thumbnail_bake::PendingPartDrag>()
             .init_resource::<CreatorViewport>();
     }
 }
@@ -514,13 +540,40 @@ fn remove_debug_ground(mut commands: Commands, ground: Query<Entity, With<Ground
     }
 }
 
+/// Restore the scene ground after the shared debug plane is removed.
+///
+/// The Creator reference has an authored floor/stage; a neutral ground plane is
+/// the honest fallback until the original stage assets are identified.
+fn spawn_creator_ground(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    commands.spawn((
+        Mesh3d(meshes.add(Plane3d::default().mesh().size(200.0, 200.0))),
+        MeshMaterial3d(materials.add(StandardMaterial {
+            base_color: Color::srgb(0.20, 0.24, 0.12),
+            perceptual_roughness: 0.98,
+            ..default()
+        })),
+        Transform::from_xyz(0.0, -0.06, 0.0),
+        CreatorGround,
+        bevy::camera::visibility::RenderLayers::layer(1),
+    ));
+}
+
+/// The editor's own floor. Kept outside `OnStage` so creature rebuilds cannot
+/// accidentally despawn it.
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+struct CreatorGround;
+
 /// Respawns the creature when, and only when, the session has moved on.
 fn spawn_or_respawn_creature(
     mut commands: Commands,
     mut state: ResMut<CreatorEditorState>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    existing: Query<Entity, (With<OnStage>, Without<CreatorRootMarker>)>,
+    existing: RebuildEntities,
     roots: Query<Entity, With<CreatorRootMarker>>,
     mut runtime: ResMut<CreatorRuntimeState>,
 ) {
@@ -548,7 +601,7 @@ fn spawn_or_respawn_creature(
     // because the data was already parsed: `CreatorDocument::properties` has held
     // `<skincolor1..3>` since the parser was written.
     let palette = SkinPalette::from_document(state.session.document());
-    let (outcome, _) = spawn_projection_skin(
+    let (outcome, entities) = spawn_projection_skin(
         state.session.stage(),
         selection,
         state.session.scale(),
@@ -567,10 +620,56 @@ fn spawn_or_respawn_creature(
     runtime.total_triangles = outcome.triangles as u32;
     runtime.total_vertices = outcome.vertices as u32;
     runtime.total_bones = outcome.bones as u32;
+    let _ = entities;
     state.built_selection = selection;
     runtime.max_depth = state.session.stage().projection.max_depth() as u32;
     state.built_revision = state.session.revision();
 }
+
+/// Applies presentation scale to the composition root without rebuilding its parts.
+fn apply_composition_scale(
+    state: Res<CreatorEditorState>,
+    mut roots: Query<&mut Transform, With<CreatorRootMarker>>,
+) {
+    if let Ok(mut root) = roots.single_mut() {
+        root.scale = Vec3::splat(state.session.scale());
+    }
+}
+
+/// Reframes the camera when Ctrl+wheel changes the composition's display scale.
+fn fit_camera_for_composition_scale(
+    mut last_scale: Local<Option<f32>>,
+    state: Res<CreatorEditorState>,
+    framing: Option<Res<crate::loader::CameraFraming>>,
+    mut cameras: Query<&mut Transform, With<CreatorViewportCamera>>,
+) {
+    let scale = state.session.scale();
+    if *last_scale == Some(scale) {
+        return;
+    }
+    *last_scale = Some(scale);
+    let Some(framing) = framing else { return };
+    let Some(mut camera) = cameras.iter_mut().next() else {
+        return;
+    };
+    let bounds = (
+        [
+            framing.bounds.0[0] * scale,
+            framing.bounds.0[1] * scale,
+            framing.bounds.0[2] * scale,
+        ],
+        [
+            framing.bounds.1[0] * scale,
+            framing.bounds.1[1] * scale,
+            framing.bounds.1[2] * scale,
+        ],
+    );
+    crate::loader::frame_camera(&mut camera, bounds, framing.vertical_fov_degrees);
+    apply_side_on_view(&mut camera, bounds);
+}
+
+/// Editor-owned content that is replaced when the authoring session changes.
+type RebuildEntities<'w, 's> = Query<'w, 's, Entity, (With<OnStage>, Without<CreatorRootMarker>)>;
 
 /// Frames the camera on the projection, once, in `PostStartup`.
 ///
@@ -681,13 +780,20 @@ fn apply_side_on_view(transform: &mut Transform, bounds: ([f32; 3], [f32; 3])) {
 /// on edit -- which is defensible while the extent is what decides the framing,
 /// and is the thing to revisit once the camera has user orbit on it.
 fn frame_editor_camera_after_an_edit(
-    cameras: Query<&mut Transform, With<CreatorViewportCamera>>,
-    state: ResMut<CreatorEditorState>,
+    mut cameras: Query<&mut Transform, With<CreatorViewportCamera>>,
+    mut state: ResMut<CreatorEditorState>,
 ) {
     if state.framed && state.built_revision == state.session.revision() {
         return;
     }
-    frame_editor_camera(cameras, state);
+    let Some(framing) = state.session.stage().camera_framing() else {
+        return;
+    };
+    if let Ok(mut camera) = cameras.single_mut() {
+        crate::loader::frame_camera(&mut camera, framing.bounds, framing.vertical_fov_degrees);
+        apply_side_on_view(&mut camera, framing.bounds);
+        state.framed = true;
+    }
 }
 
 /// Turns a click in the viewport into a selection change.
@@ -698,6 +804,7 @@ fn read_viewport_click(
     viewport: Res<CreatorViewport>,
     mut state: ResMut<CreatorEditorState>,
     mut last_pick: ResMut<LastPick>,
+    part_drag: Res<crate::editor::thumbnail_bake::PendingPartDrag>,
 ) {
     // Only act on an actual click. This system runs EVERY frame, and the first
     // version called `session.select(None)` whenever the cursor was not over
@@ -709,7 +816,7 @@ fn read_viewport_click(
     //
     // "Not a click" and "a click that hit nothing" are different events and only
     // the second one is allowed to change the selection.
-    if !buttons.just_pressed(MouseButton::Left) {
+    if !buttons.just_pressed(MouseButton::Left) || part_drag.0.is_some() {
         return;
     }
     last_pick.presses_seen += 1;
@@ -722,13 +829,15 @@ fn read_viewport_click(
         &cameras,
         &viewport,
         state.session.projection(),
+        state.session.scale(),
         &mut last_pick.rejected_outside_viewport,
     );
     last_pick.hits = hits;
     last_pick.pick_probe = probe;
     // Same block clicked twice in a row is not a new event, so re-running the
     // selection would only push another identical row into the history.
-    if block.map(|index| index as u32) == last_pick.block && block.is_some() {
+    if block == state.session.selection() && block.is_some() {
+        last_pick.block = block.map(|index| index as u32);
         last_pick.selected = block.map(|index| index as u32);
         return;
     }
@@ -745,6 +854,104 @@ fn read_viewport_click(
             warn!("selection refused: {error}");
         }
     }
+}
+
+/// Selects the pressed tab position.
+///
+/// Tab positions are real UI state, but their category-to-part mapping is not
+/// yet decoded from the game's palette records. Keep the selection positional
+/// rather than assigning invented category names or filtering parts incorrectly.
+fn select_palette_tab(
+    tabs: Query<(&Interaction, &ui::spawn::TabIndex), Changed<Interaction>>,
+    mut state: ResMut<CreatorEditorState>,
+) {
+    for (interaction, index) in tabs.iter() {
+        if let Some(active) = pressed_tab(
+            *interaction,
+            index.0,
+            crate::editor::ui::theme::CreatorCounts::TAB_COUNT,
+        ) {
+            state.view.active_tab = active;
+        }
+    }
+}
+
+/// Returns a tab index only for a pressed, in-range tab.
+fn pressed_tab(interaction: Interaction, index: usize, count: usize) -> Option<usize> {
+    (interaction == Interaction::Pressed && index < count).then_some(index)
+}
+
+/// Applies the selected tab state to the visible strip.
+fn reflect_active_palette_tab(
+    state: Res<CreatorEditorState>,
+    mut tabs: Query<(&ui::spawn::TabIndex, &mut BackgroundColor)>,
+    mut last_active: Local<Option<usize>>,
+) {
+    let active = state.view.active_tab();
+    if *last_active == Some(active) {
+        return;
+    }
+    let mut found_active = false;
+    for (index, mut background) in &mut tabs {
+        *background = ui::layout::tab_background(index.0 == active);
+        found_active |= index.0 == active;
+    }
+    if found_active {
+        *last_active = Some(active);
+    }
+}
+
+/// Orbits the viewport camera around the creature while the right mouse button is
+/// held over the viewport.
+fn orbit_editor_camera(
+    motion: Res<bevy::input::mouse::AccumulatedMouseMotion>,
+    buttons: Res<ButtonInput<MouseButton>>,
+    windows: Query<&Window>,
+    viewport: Res<CreatorViewport>,
+    framing: Option<Res<crate::loader::CameraFraming>>,
+    mut cameras: Query<&mut Transform, With<CreatorViewportCamera>>,
+) {
+    if !buttons.pressed(MouseButton::Right) || motion.delta == Vec2::ZERO {
+        return;
+    }
+    let Some(cursor) = windows.iter().find_map(Window::cursor_position) else {
+        return;
+    };
+    if viewport.cursor_to_ndc(cursor).is_none() {
+        return;
+    }
+    let Some(framing) = framing else {
+        return;
+    };
+    let (lo, hi) = framing.bounds;
+    let centre = Vec3::new(
+        (lo[0] + hi[0]) * 0.5,
+        (lo[1] + hi[1]) * 0.5,
+        (lo[2] + hi[2]) * 0.5,
+    );
+    if let Ok(mut camera) = cameras.single_mut() {
+        orbit_transform(&mut camera, centre, motion.delta);
+    }
+}
+
+/// Rotates a camera's position around `centre`, preserving its current distance.
+fn orbit_transform(transform: &mut Transform, centre: Vec3, delta: Vec2) {
+    const RADIANS_PER_PIXEL: f32 = 0.006;
+    const MAX_PITCH: f32 = 1.48;
+
+    let offset = transform.translation - centre;
+    let radius = offset.length();
+    if !radius.is_finite() || radius <= f32::EPSILON {
+        return;
+    }
+    let direction = offset / radius;
+    let yaw = direction.x.atan2(direction.z) - delta.x * RADIANS_PER_PIXEL;
+    let pitch = (direction.y.clamp(-1.0, 1.0).asin() + delta.y * RADIANS_PER_PIXEL)
+        .clamp(-MAX_PITCH, MAX_PITCH);
+    let horizontal = pitch.cos();
+    let position =
+        centre + Vec3::new(yaw.sin() * horizontal, pitch.sin(), yaw.cos() * horizontal) * radius;
+    *transform = Transform::from_translation(position).looking_at(centre, Vec3::Y);
 }
 
 /// The block under the cursor, or `None`.
@@ -780,6 +987,7 @@ fn pick_under_cursor(
     cameras: &Query<(&Camera, &GlobalTransform), With<CreatorViewportCamera>>,
     viewport: &CreatorViewport,
     projection: &spore_morphology::Projection,
+    root_scale: f32,
     rejected: &mut u32,
 ) -> (Option<usize>, u32, Option<PickProbe>) {
     if !buttons.just_pressed(MouseButton::Left) {
@@ -845,7 +1053,12 @@ fn pick_under_cursor(
         return (None, 0, Some(probe));
     };
     probe.mapped = true;
-    let hits = picking::pick_all(PickRay::from(ray), projection);
+    let mut ray = PickRay::from(ray);
+    if root_scale.is_finite() && root_scale > f32::EPSILON {
+        ray.origin /= root_scale;
+        ray.direction = ray.direction.normalize();
+    }
+    let hits = picking::pick_all(ray, projection);
     (
         hits.first().map(|hit| hit.block),
         hits.len() as u32,
@@ -1058,7 +1271,17 @@ fn wheel_scales_selection(
     mut last_pick: ResMut<LastPick>,
 ) {
     let delta = wheel.delta.y;
-    if delta.abs() < f32::EPSILON {
+    if delta.abs() < f32::EPSILON
+        || keys.pressed(KeyCode::ControlLeft)
+        || keys.pressed(KeyCode::ControlRight)
+    {
+        return;
+    }
+    let Some(cursor) = windows.iter().find_map(Window::cursor_position) else {
+        return;
+    };
+    if !viewport_probe(cursor, &viewport).inside {
+        // Palette wheel navigation is handled by show_catalog_page.
         return;
     }
     let Some(index) = state.session.selection() else {
@@ -1069,9 +1292,6 @@ fn wheel_scales_selection(
     // guard -- now literally the same call on the same [`CreatorViewport`], so the
     // two cannot disagree and the scaling factor no longer has to be looked up from
     // a camera here: the rectangle carries the factor it was measured under.
-    let Some(cursor) = windows.iter().find_map(Window::cursor_position) else {
-        return;
-    };
     let probe = viewport_probe(cursor, &viewport);
     last_pick.wheel_probe = Some(probe);
     if !probe.inside {
@@ -1106,6 +1326,99 @@ fn wheel_scales_selection(
     last_pick.scale_applications += 1;
 }
 
+/// Uniformly scales the whole editable assembly with Ctrl+wheel over the viewport.
+///
+/// Plain wheel remains part-scale editing when a part is selected; Ctrl+wheel is
+/// the explicit whole-creature operation. This changes only the session's root
+/// display scale, not the authored per-block transforms.
+fn wheel_scales_composition(
+    wheel: Res<bevy::input::mouse::AccumulatedMouseScroll>,
+    keys: Res<ButtonInput<KeyCode>>,
+    windows: Query<&Window>,
+    viewport: Res<CreatorViewport>,
+    mut state: ResMut<CreatorEditorState>,
+) {
+    let delta = wheel.delta.y;
+    if delta.abs() < f32::EPSILON
+        || !(keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight))
+    {
+        return;
+    }
+    let Some(cursor) = windows.iter().find_map(Window::cursor_position) else {
+        return;
+    };
+    if viewport.cursor_to_ndc(cursor).is_none() {
+        return;
+    }
+    let current = state.session.scale();
+    let factor = if keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight) {
+        1.25
+    } else {
+        1.05
+    };
+    let next = (current * if delta > 0.0 { factor } else { 1.0 / factor }).clamp(0.05, 8.0);
+    state.session.set_scale(next);
+}
+
+/// Nudges the selected block in its local XY plane with the arrow keys.
+///
+/// This is a deterministic editing affordance for placements whose original
+/// socket/snap transforms are not recovered. One key press creates one undoable
+/// transform edit; holding a key is rate-limited by Bevy's `just_pressed` edge.
+fn nudge_selected_block(
+    keys: Res<ButtonInput<KeyCode>>,
+    mouse: Res<ButtonInput<MouseButton>>,
+    mut state: ResMut<CreatorEditorState>,
+) {
+    let Some(index) = state.session.selection() else {
+        return;
+    };
+    let coarse = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
+    let offset = if coarse { 0.20 } else { 0.05 };
+    let dz = mouse.pressed(MouseButton::Right);
+    let right = keys.just_pressed(KeyCode::ArrowRight);
+    let left = keys.just_pressed(KeyCode::ArrowLeft);
+    let up = keys.just_pressed(KeyCode::ArrowUp);
+    let down = keys.just_pressed(KeyCode::ArrowDown);
+    let delta = if dz {
+        Vec3::new(0.0, 0.0, (up as u8 as f32 - down as u8 as f32) * offset)
+    } else {
+        Vec3::new(
+            (right as u8 as f32 - left as u8 as f32) * offset,
+            (up as u8 as f32 - down as u8 as f32) * offset,
+            0.0,
+        )
+    };
+    if delta == Vec3::ZERO {
+        return;
+    }
+    let Some(block) = state.session.document().blocks.get(index) else {
+        return;
+    };
+    let position = block.transform.position;
+    let next = spore_creator_core::document::Vec3 {
+        x: position.x + delta.x,
+        y: position.y + delta.y,
+        z: position.z + delta.z,
+    };
+    if let Err(error) = state.session.apply_position(index, next) {
+        warn!("move refused: {error}");
+    }
+}
+
+/// Removes the selected block with Backspace or Delete.
+fn remove_selected_block(keys: Res<ButtonInput<KeyCode>>, mut state: ResMut<CreatorEditorState>) {
+    if !(keys.just_pressed(KeyCode::Backspace) || keys.just_pressed(KeyCode::Delete)) {
+        return;
+    }
+    let Some(index) = state.session.selection() else {
+        return;
+    };
+    if let Err(error) = state.session.apply_remove(index) {
+        warn!("remove refused: {error}");
+    }
+}
+
 /// The smallest scale a part may be scaled to.
 ///
 /// Inside the corpus: authored block scales run 0.28 .. 2.254181, so a floor below
@@ -1131,9 +1444,6 @@ fn refresh_view_model(
     mut runtime: ResMut<CreatorRuntimeState>,
     palette: Res<crate::editor::thumbnail_bake::PaletteState>,
 ) {
-    let blocks = state.session.stage().block_count();
-    state.view.active_tab = state.view.active_tab.min(blocks.max(1).saturating_sub(1));
-
     // The grid counts the CATALOGUE -- the parts the user can choose from -- and
     // not the blocks the current document happens to have.
     //
@@ -1276,7 +1586,47 @@ impl CreatorEditorState {
 
 #[cfg(test)]
 mod tests {
-    use super::pointer_in_node_space;
+    use super::{orbit_transform, pointer_in_node_space, pressed_tab};
+    use bevy::prelude::{Transform, Vec2, Vec3};
+
+    #[test]
+    fn only_a_pressed_in_range_tab_selects_a_position() {
+        assert_eq!(
+            pressed_tab(bevy::prelude::Interaction::Pressed, 2, 6),
+            Some(2)
+        );
+        assert_eq!(pressed_tab(bevy::prelude::Interaction::Hovered, 2, 6), None);
+        assert_eq!(pressed_tab(bevy::prelude::Interaction::Pressed, 6, 6), None);
+    }
+
+    #[test]
+    fn orbit_keeps_the_creature_centre_and_camera_distance() {
+        let centre = Vec3::new(2.0, -1.0, 4.0);
+        let mut camera = Transform::from_xyz(2.0, 2.0, 14.0).looking_at(centre, Vec3::Y);
+        let distance = camera.translation.distance(centre);
+
+        orbit_transform(&mut camera, centre, Vec2::new(90.0, -30.0));
+
+        assert!((camera.translation.distance(centre) - distance).abs() < 1e-5);
+        assert!(
+            camera
+                .forward()
+                .dot((centre - camera.translation).normalize())
+                > 0.999
+        );
+        assert_ne!(camera.translation, Vec3::new(2.0, 2.0, 14.0));
+    }
+
+    #[test]
+    fn orbit_does_not_move_a_camera_at_the_orbit_centre() {
+        let centre = Vec3::new(1.0, 2.0, 3.0);
+        let mut camera = Transform::from_translation(centre);
+        let before = camera;
+
+        orbit_transform(&mut camera, centre, Vec2::new(20.0, 20.0));
+
+        assert_eq!(camera, before);
+    }
 
     #[test]
     fn the_cursors_own_units_are_logical_and_the_nodes_are_physical() {

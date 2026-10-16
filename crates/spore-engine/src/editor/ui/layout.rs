@@ -441,15 +441,14 @@ pub fn tab_placeholder_ink(active: bool) -> TextColor {
 ///
 /// `TAB_1`..=`TAB_6`, from [`CreatorText::TAB_PLACEHOLDER_PREFIX`]. This is a *slot* label: it
 /// says which of the six tabs it is and nothing about what that tab does,
-/// because the corpus has no category table and a screenshot cannot supply one.
+/// because the palette's category-to-item mapping remains unresolved and a
+/// screenshot cannot supply it.
 /// An out-of-range index yields `None` rather than a fabricated `TAB_7`.
 pub fn tab_placeholder_label(index: usize) -> Option<String> {
     if index < CreatorCounts::TAB_COUNT {
-        Some(format!(
-            "{}{}",
-            CreatorText::TAB_PLACEHOLDER_PREFIX,
-            index + 1
-        ))
+        CreatorText::TAB_GLYPHS
+            .get(index)
+            .map(|glyph| (*glyph).to_owned())
     } else {
         None
     }

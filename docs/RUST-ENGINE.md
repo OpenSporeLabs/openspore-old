@@ -238,7 +238,10 @@ Verified: `--bogus` → 2; `--package /nope.package --info` → 3.
 ### The other modes
 
 * `--placeholder` — prints `OPENSPORE-MODE v1 placeholder` and opens a window on
-  a built-in mesh. Proves the renderer with no game data involved.
+  a **modular procedural creature** (ten primitives under one root), built by the
+  Bevy-free `crate::domain::assembly` and rendered by
+  `crate::scene::spawn_placeholder_creature`. Proves the renderer with no game
+  data involved. See [`VERTICAL-SLICE.md`](VERTICAL-SLICE.md).
 * `--record T:G:I --package ...` — the explicit-identity form of the vertical
   slice. `--record` and `--preset` both accepted; a later one of the two wins and
   claims the origin.

@@ -62,8 +62,9 @@ pub struct CreatorUiView {
     /// Index of the active tab, zero-based, into a
     /// [`TAB_COUNT`](CreatorCounts::TAB_COUNT)-element strip.
     ///
-    /// A *position*, never a name. The corpus has no category table, so nothing
-    /// may depend on what index 2 means. Read it through
+    /// A *position*, never a name. The palette definitions exist but the
+    /// category-to-rigblock links are unresolved, so nothing may depend on what
+    /// index 2 means. Read it through
     /// [`active_tab`](Self::active_tab), which bounds it.
     pub active_tab: usize,
     /// The part grid's shape.
@@ -94,6 +95,8 @@ pub struct CreatorUiView {
     /// instead of being indistinguishable from a creature literally named
     /// "Name Your Creature".
     pub name: String,
+    /// The lower status-strip balance label. No gameplay price is inferred.
+    pub dna: String,
 }
 
 impl Default for CreatorUiView {
@@ -111,6 +114,7 @@ impl Default for CreatorUiView {
             paint_mode: false,
             sections_open: [false; CreatorCounts::SECTION_BAR_COUNT],
             name: String::new(),
+            dna: String::new(),
         }
     }
 }
@@ -328,6 +332,7 @@ fn spawn_tab(commands: &mut Commands, parent: Entity, index: usize, active: bool
             Button,
             ChildOf(parent),
             CreatorUiPart::Tab,
+            TabIndex(index),
             Name::new("creator-ui-tab"),
         ))
         .id();
@@ -337,16 +342,18 @@ fn spawn_tab(commands: &mut Commands, parent: Entity, index: usize, active: bool
     // `TAB_COUNT` without raising the strip's capacity should get a nameless tab
     // rather than a panic on the first frame.
     if let Some(label) = layout::tab_placeholder_label(index) {
-        spawn_label(
-            commands,
-            entity,
-            &label,
-            CreatorText::TAB_PLACEHOLDER_SIZE_PX,
-        );
+        spawn_label(commands, entity, &label, CreatorMetrics::TAB_SIDE_PX * 0.72);
     }
 
     entity
 }
+
+/// Stable position of a tab in the category strip.
+///
+/// The index is deliberately not named as a creature-part category until the
+/// palette records' category-to-part mapping is decoded.
+#[derive(bevy::prelude::Component, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TabIndex(pub usize);
 
 /// The part grid and its cells.
 pub fn spawn_part_grid(commands: &mut Commands, parent: Entity, view: &CreatorUiView) -> Entity {
@@ -360,9 +367,7 @@ pub fn spawn_part_grid(commands: &mut Commands, parent: Entity, view: &CreatorUi
         ))
         .id();
 
-    // Capped at `cells_per_page`, because a catalogue longer than one page
-    // belongs on page two and rendering forty cells into a twelve-cell page would
-    // push the pager off the panel — a clipping problem dressed as a layout one.
+    // The UI holds one page, independent of the size of the backing catalogue.
     let count = view.cells.min(view.grid.cells_per_page());
     for index in 0..count {
         commands.spawn((
@@ -405,17 +410,27 @@ pub fn spawn_pager(commands: &mut Commands, parent: Entity, view: &CreatorUiView
 
     spawn_pager_arrow(commands, pager, true);
 
-    spawn_label(
-        commands,
-        pager,
-        &layout::pager_label_text(view.page, view.pages),
-        CreatorText::PAGER_TEXT_SIZE_PX,
-    );
+    commands.spawn((
+        Text::new(layout::pager_label_text(view.page, view.pages)),
+        bevy::text::TextFont::from_font_size(CreatorText::PAGER_TEXT_SIZE_PX),
+        ChildOf(pager),
+        CreatorUiPart::Label,
+        PagerReadout,
+        Name::new("creator-ui-pager-readout"),
+    ));
 
     spawn_pager_arrow(commands, pager, false);
 
     pager
 }
+
+/// Identifies the mutable page-number text.
+#[derive(bevy::prelude::Component, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PagerReadout;
+
+/// Whether a pager arrow moves toward the previous page.
+#[derive(bevy::prelude::Component, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PagerDirection(pub bool);
 
 /// One of the pager's arrows.
 ///
@@ -430,6 +445,7 @@ fn spawn_pager_arrow(commands: &mut Commands, parent: Entity, previous: bool) ->
             Button,
             ChildOf(parent),
             CreatorUiPart::PagerArrow,
+            PagerDirection(previous),
             Name::new("creator-ui-pager-arrow"),
         ))
         .id();
@@ -664,7 +680,7 @@ pub fn spawn_bottom_bar(commands: &mut Commands, root: Entity, view: &CreatorUiV
 /// is baked into a layout module. The pill's minimum width and its fill are the
 /// only parts of this widget that are layout facts, and both are asserted.
 pub fn spawn_dna_pill(commands: &mut Commands, parent: Entity) -> Entity {
-    commands
+    let pill = commands
         .spawn((
             layout::pill(CreatorMetrics::DNA_PILL_MIN_WIDTH_PX),
             layout::pill_background(),
@@ -672,7 +688,9 @@ pub fn spawn_dna_pill(commands: &mut Commands, parent: Entity) -> Entity {
             CreatorUiPart::DnaPill,
             Name::new("creator-ui-dna-pill"),
         ))
-        .id()
+        .id();
+    spawn_label(commands, pill, "◉", CreatorText::BUTTON_GLYPH_SIZE_PX);
+    pill
 }
 
 /// The name field pill, showing the OBSERVED placeholder when unset.

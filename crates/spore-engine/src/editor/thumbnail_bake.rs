@@ -38,6 +38,8 @@
 //! shown as absent, because a stand-in and a real-but-different picture are
 //! indistinguishable to the person looking at the grid.
 
+use std::num::NonZeroUsize;
+
 use bevy::camera::{
     visibility::RenderLayers, Camera, ClearColorConfig, ImageRenderTarget, RenderTarget,
 };
@@ -48,21 +50,19 @@ use spore_creator_core::document::BlockId;
 
 use crate::editor::thumbnails::{source_over, Palette, THUMBNAIL_SIDE};
 
-/// Tiles across the atlas.
-///
-/// 8 x 5 = 40, which is exactly one page of the four-column grid. The atlas
-/// arrangement is deliberately **not** the on-screen arrangement: the UI grid is
-/// 4 wide by 10 tall because that is what the panel's width allows, while the
-/// atlas wants to be roughly square so one camera frames it evenly.
+/// Tiles across the complete thumbnail atlas.
 pub const ATLAS_COLUMNS: usize = 8;
-/// Tiles down the atlas.
-pub const ATLAS_ROWS: usize = 5;
-/// How many thumbnails one page holds, and so how many the atlas carries.
-pub const TILES_PER_PAGE: usize = ATLAS_COLUMNS * ATLAS_ROWS;
+/// Tiles down the complete thumbnail atlas, enough for all 464 drawable parts.
+pub const ATLAS_ROWS: usize = 60;
+/// Visible reference grid: four columns by ten rows.
+pub const TILES_PER_PAGE: usize = 40;
+/// Full image capacity (480 tiles).
+pub const ATLAS_TILE_COUNT: usize = ATLAS_COLUMNS * ATLAS_ROWS;
+
 /// World spacing between tile centres.
 const SPACING: f32 = 1.0;
 /// How much of its tile a part fills. Below 1 so neighbouring parts do not touch.
-const FILL: f32 = 0.72;
+const FILL: f32 = 0.92;
 /// The layer the staging meshes and the bake camera share.
 ///
 /// Layer 2: layer 1 is the creature viewport's, and sharing it would put 40 parts
@@ -100,6 +100,70 @@ pub struct BakeState {
     pub tiles: u32,
     /// Frames the staged scene has been given before the capture is requested.
     pub frames: u32,
+}
+
+/// The visible catalogue page. Internally zero-based; the UI displays page+1.
+#[derive(Resource, Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CatalogPage(pub usize);
+
+/// Captured atlas retained so page navigation only changes UI images.
+#[derive(Resource, Debug, Clone, Default)]
+pub struct BakedAtlas(pub Option<Handle<Image>>);
+
+/// Returns the page selected by a pager-arrow click, bounded to the catalogue.
+fn page_after_arrow(page: usize, previous: bool, pages: usize) -> usize {
+    let last = pages.saturating_sub(1);
+    if previous {
+        page.saturating_sub(1).min(last)
+    } else {
+        page.saturating_add(1).min(last)
+    }
+}
+
+/// Applies a click on either page arrow to the visible catalogue page.
+pub fn page_catalog_on_arrow_click(
+    arrows: Query<(&Interaction, &crate::editor::ui::spawn::PagerDirection), Changed<Interaction>>,
+    palette: Res<PaletteState>,
+    mut page: ResMut<CatalogPage>,
+) {
+    let Some(catalogue) = palette.palette.as_ref() else {
+        return;
+    };
+    let pages = catalogue.drawable().max(1).div_ceil(TILES_PER_PAGE);
+    for (interaction, direction) in &arrows {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+        page.0 = page_after_arrow(page.0, direction.0, pages);
+    }
+}
+
+/// Moves between pages while the pointer is over the catalog panel.
+pub fn page_catalog_on_wheel(
+    wheel: Res<bevy::input::mouse::AccumulatedMouseScroll>,
+    windows: Query<&Window>,
+    viewport: Res<crate::editor::viewport::CreatorViewport>,
+    palette: Res<PaletteState>,
+    mut page: ResMut<CatalogPage>,
+) {
+    if wheel.delta.y.abs() < f32::EPSILON {
+        return;
+    }
+    let Some(cursor) = windows.iter().find_map(Window::cursor_position) else {
+        return;
+    };
+    if viewport.cursor_to_ndc(cursor).is_some() {
+        return;
+    }
+    let Some(catalogue) = palette.palette.as_ref() else {
+        return;
+    };
+    let pages = catalogue.drawable().max(1).div_ceil(TILES_PER_PAGE);
+    if wheel.delta.y < 0.0 {
+        page.0 = (page.0 + 1).min(pages.saturating_sub(1));
+    } else {
+        page.0 = page.0.saturating_sub(1);
+    }
 }
 
 /// Marks an entity that exists only to be photographed.
@@ -317,12 +381,9 @@ pub fn stage_page(
     if entries.is_empty() {
         return 0;
     }
-    let start = page * TILES_PER_PAGE;
     let mut placed = 0u32;
-    for slot in 0..TILES_PER_PAGE {
-        let Some(id) = entries.get(start + slot).copied() else {
-            break;
-        };
+    let _ = page;
+    for (slot, id) in entries.into_iter().take(ATLAS_TILE_COUNT).enumerate() {
         let Some(geometry) = spore_morphology::geometry_of(&source, id) else {
             continue;
         };
@@ -370,7 +431,7 @@ pub fn stage_camera(commands: &mut Commands, atlas: Handle<Image>) {
     // viewport has the same two-light rig, which is why they match.
     commands.spawn((
         DirectionalLight {
-            illuminance: 26_000.0,
+            illuminance: 48_000.0,
             shadow_maps_enabled: false,
             ..default()
         },
@@ -380,7 +441,7 @@ pub fn stage_camera(commands: &mut Commands, atlas: Handle<Image>) {
     ));
     commands.spawn((
         DirectionalLight {
-            illuminance: 11_000.0,
+            illuminance: 22_000.0,
             shadow_maps_enabled: false,
             ..default()
         },
@@ -489,16 +550,8 @@ pub fn start_bake(
     }
     let page = 0usize;
     let material = materials.add(StandardMaterial {
-        // Pale cream, OpenSpore's own choice.
-        //
-        // It started as the document's own skin base, on the reasoning that a
-        // thumbnail should look like the creature it replaces. That was wrong on
-        // both counts: the bake photographs the part in isolation, with no
-        // lighting context to carry it, and a mid-tone brown on the panel's dark
-        // blue measured at RGB (44, 22, 16) -- a shape you can barely see. The
-        // reference's own part thumbnails are pale, and legibility on a dark panel
-        // is the requirement here, not colour fidelity to a skin nobody chose yet.
         base_color: Color::srgb(0.88, 0.82, 0.72),
+        emissive: LinearRgba::new(0.24, 0.19, 0.13, 1.0),
         perceptual_roughness: 0.8,
         metallic: 0.0,
         ..default()
@@ -561,10 +614,8 @@ const SETTLE_FRAMES: u32 = 6;
 /// here.
 fn on_captured(
     capture: On<bevy::render::view::screenshot::ScreenshotCaptured>,
-    // No `Commands`: the staging scene is torn down by `clear_staging`, which can
-    // take the wider parameter set this observer cannot.
-    mut cells: Query<&mut ImageNode, With<PartCellIndex>>,
     mut images: ResMut<Assets<Image>>,
+    mut baked: ResMut<BakedAtlas>,
     mut bake: ResMut<BakeState>,
 ) {
     // QA escape hatch: write the raw capture so a wrong atlas can be looked at
@@ -594,23 +645,80 @@ fn on_captured(
         }
     }
 
-    let mut assigned = 0u32;
-    for mut cell in cells.iter_mut() {
-        let Some(tile) = slice_tile(&capture.image, assigned as usize) else {
-            break;
-        };
-        cell.image = images.add(tile);
-        assigned += 1;
-    }
-    bake.tiles = assigned;
-    bake.stage = if assigned == 0 {
+    baked.0 = Some(images.add(capture.image.clone()));
+    bake.stage = if bake.tiles == 0 {
         BakeStage::Failed
     } else {
         BakeStage::Done
     };
-    if assigned == 0 {
+    if bake.tiles == 0 {
         bake.reason = Some("the capture produced no readable tiles".to_owned());
     }
+}
+
+/// Pages the complete catalogue atlas into the forty visible part cells.
+#[allow(clippy::too_many_arguments)]
+pub fn show_catalog_page(
+    palette: Res<PaletteState>,
+    baked: Res<BakedAtlas>,
+    page: Res<CatalogPage>,
+    viewport: Res<crate::editor::viewport::CreatorViewport>,
+    windows: Query<&Window>,
+    mut cells: Query<(&PartCellIndex, &mut ImageNode)>,
+    mut readout: Query<&mut Text, With<crate::editor::ui::spawn::PagerReadout>>,
+    mut images: ResMut<Assets<Image>>,
+    mut state: ResMut<crate::editor::plugin::CreatorEditorState>,
+    mut last_page: Local<Option<usize>>,
+) {
+    let Some(atlas_handle) = baked.0.as_ref() else {
+        return;
+    };
+    let Some(atlas) = images.get(atlas_handle).cloned() else {
+        return;
+    };
+    if *last_page == Some(page.0) {
+        return;
+    }
+    let Some(catalogue) = palette.palette.as_ref() else {
+        return;
+    };
+    if let Some(cursor) = windows.iter().find_map(Window::cursor_position) {
+        if viewport.cursor_to_ndc(cursor).is_some() {
+            return;
+        }
+    }
+    let page_start = page.0.saturating_mul(TILES_PER_PAGE);
+    let mut page_tiles = 0usize;
+    for (catalogue_index, entry) in catalogue
+        .entries
+        .iter()
+        .filter(|entry| entry.drawable)
+        .enumerate()
+    {
+        if catalogue_index < page_start {
+            continue;
+        }
+        let local_index = catalogue_index - page_start;
+        if local_index >= TILES_PER_PAGE {
+            break;
+        }
+        let Some(tile) = slice_tile(&atlas, catalogue_index) else {
+            continue;
+        };
+        if let Some((_, mut node)) = cells.iter_mut().find(|(index, _)| index.0 == local_index) {
+            node.image = images.add(tile);
+            page_tiles += 1;
+        }
+        let _ = entry;
+    }
+    state.view.page = page.0 + 1;
+    state.view.pages = NonZeroUsize::new(catalogue.drawable().max(1).div_ceil(TILES_PER_PAGE))
+        .unwrap_or(NonZeroUsize::MIN);
+    state.view.cells = page_tiles;
+    if let Ok(mut text) = readout.single_mut() {
+        text.0 = format!("{}/{}", state.view.page, state.view.pages.get());
+    }
+    *last_page = Some(page.0);
 }
 
 /// Removes the staging scene once the bake is finished with it.
@@ -675,18 +783,16 @@ pub fn cell_part(catalogue: &Palette, cell: usize) -> Option<BlockId> {
         .nth(cell)
 }
 
-/// Turns a click on a grid cell into a document edit.
+/// The part being dragged from the catalog, if any.
+#[derive(Resource, Debug, Default)]
+pub struct PendingPartDrag(pub Option<BlockId>);
+
+/// Completes a catalog gesture: drop onto a creature block to attach, or release
+/// in the catalog to retain click-to-add/replace behavior.
 ///
-/// # Replace when something is selected, add when nothing is
-///
-/// One click, two meanings, decided by whether a block is selected. That is the
-/// reference's behaviour as far as it is observable here, and it is the only rule
-/// that needs no mode switch the UI does not have.
-///
-/// The edit goes through [`crate::editor::session::CreatorSession`], so it records
-/// a history row like every other edit and therefore undoes with the same button.
-/// Writing the document directly would make parts the only edit the user cannot
-/// take back.
+/// A drag onto empty viewport space is intentionally refused. There is no
+/// recovered placement plane for an unparented part, while a hit on an existing
+/// part gives both a real parent and a world-space surface point.
 pub fn apply_cell_choice(
     state: &mut crate::editor::plugin::CreatorEditorState,
     part: BlockId,
@@ -694,8 +800,8 @@ pub fn apply_cell_choice(
     match state.session.selection() {
         Some(block) => state
             .session
-            .apply_replace(block, part)
-            .map(|()| format!("replaced block {block} with {part:?}")),
+            .apply_add(part, Some(block))
+            .map(|index| format!("added {part:?} as child block {index} of {block}")),
         None => state
             .session
             .apply_add(part, None)
@@ -713,20 +819,25 @@ pub fn apply_cell_choice(
 type PressedCells<'w, 's> =
     Query<'w, 's, (Entity, &'static Interaction), (Changed<Interaction>, With<PartCellIndex>)>;
 
-/// Reads a press on a grid cell and applies it.
+/// Records a part-cell press and completes its click-or-drop gesture on release.
 ///
-/// `Changed<Interaction>` rather than a poll, so one press is one edit: a system
-/// that runs every frame would replace the selected block sixty times a second
-/// and fill the undo history with identical rows.
-pub fn read_part_cell_click(
+/// Capturing on `Changed<Interaction>` avoids repeating edits while the pointer is
+/// held. The document is edited only once, when the mouse button is released.
+#[allow(clippy::too_many_arguments)]
+pub fn read_part_cell_gesture(
     cells: PressedCells,
     indices: Query<&PartCellIndex>,
     palette: Res<PaletteState>,
+    buttons: Res<ButtonInput<MouseButton>>,
+    windows: Query<&Window>,
+    cameras: Query<
+        (&Camera, &GlobalTransform),
+        With<crate::editor::viewport::CreatorViewportCamera>,
+    >,
+    viewport: Res<crate::editor::viewport::CreatorViewport>,
+    mut drag: ResMut<PendingPartDrag>,
     mut state: ResMut<crate::editor::plugin::CreatorEditorState>,
 ) {
-    let Some(catalogue) = palette.palette.as_ref() else {
-        return;
-    };
     for (entity, interaction) in cells.iter() {
         if *interaction != Interaction::Pressed {
             continue;
@@ -734,19 +845,139 @@ pub fn read_part_cell_click(
         let Ok(index) = indices.get(entity) else {
             continue;
         };
-        let Some(part) = cell_part(catalogue, index.0) else {
+        let Some(part) = palette
+            .palette
+            .as_ref()
+            .and_then(|catalogue| cell_part(catalogue, index.0))
+        else {
             continue;
         };
+        drag.0 = Some(part);
+    }
+
+    if !buttons.just_released(MouseButton::Left) {
+        return;
+    }
+    let Some(part) = drag.0.take() else {
+        return;
+    };
+
+    let dropped_in_viewport = windows
+        .iter()
+        .find_map(Window::cursor_position)
+        .filter(|cursor| viewport.cursor_to_ndc(*cursor).is_some());
+    if let Some(cursor) = dropped_in_viewport {
+        let Some((camera, camera_transform)) = cameras.iter().next() else {
+            return;
+        };
+        let Ok(ray) = camera.viewport_to_world(camera_transform, cursor) else {
+            return;
+        };
+        let ray = crate::editor::picking::PickRay::from(ray);
+        let Some(hit) = crate::editor::picking::pick(ray, state.session.projection()) else {
+            info!("part drop refused: cursor did not hit an existing part");
+            return;
+        };
+        let Some(parent) = state.session.projection().block(hit.block) else {
+            return;
+        };
+        let world_position = ray.origin + ray.direction.normalize() * hit.distance;
+        let root_scale = state.session.scale();
+        let parent_position = Vec3::new(
+            parent.world_position.x,
+            parent.world_position.y,
+            parent.world_position.z,
+        ) * root_scale;
+        let parent_rotation = crate::loader::orientation_to_quat(parent.world_orientation);
+        let Some(local_position) = world_to_parent_local(
+            world_position,
+            parent_position,
+            parent_rotation,
+            parent.world_scale * root_scale,
+        ) else {
+            warn!("part drop refused: hit parent has an unusable transform");
+            return;
+        };
+        let transform = spore_creator_core::document::BlockTransform {
+            position: spore_creator_core::document::Vec3 {
+                x: local_position.x,
+                y: local_position.y,
+                z: local_position.z,
+            },
+            scale: 1.0,
+            orientation: spore_creator_core::document::Matrix3::IDENTITY,
+            ..Default::default()
+        };
+        match state
+            .session
+            .apply_add_with_transform(part, Some(hit.block), transform)
+        {
+            Ok(index) => info!(
+                "part {part:?} attached to block {} as block {index}",
+                hit.block
+            ),
+            Err(error) => warn!("part drop refused: {error}"),
+        }
+    } else {
         match apply_cell_choice(&mut state, part) {
-            Ok(what) => info!("part cell {index:?}: {what}"),
-            Err(error) => warn!("part cell {index:?} refused: {error}"),
+            Ok(what) => info!("part click: {what}"),
+            Err(error) => warn!("part click refused: {error}"),
         }
     }
+}
+
+/// Converts a world-space drop point into the local coordinates stored by a child.
+fn world_to_parent_local(
+    world_position: Vec3,
+    parent_position: Vec3,
+    parent_rotation: Quat,
+    parent_scale: f32,
+) -> Option<Vec3> {
+    if !parent_scale.is_finite() || parent_scale.abs() <= f32::EPSILON {
+        return None;
+    }
+    let local = parent_rotation.inverse() * (world_position - parent_position) / parent_scale;
+    local.is_finite().then_some(local)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pager_arrows_move_one_page_and_stop_at_both_ends() {
+        assert_eq!(page_after_arrow(0, true, 12), 0);
+        assert_eq!(page_after_arrow(0, false, 12), 1);
+        assert_eq!(page_after_arrow(11, false, 12), 11);
+        assert_eq!(page_after_arrow(11, true, 12), 10);
+        assert_eq!(page_after_arrow(0, false, 0), 0);
+    }
+
+    #[test]
+    fn a_drop_point_is_stored_in_the_hit_parents_local_space() {
+        let parent_position = Vec3::new(4.0, -2.0, 8.0);
+        let parent_rotation = Quat::from_rotation_y(std::f32::consts::FRAC_PI_2);
+        let local = Vec3::new(1.0, 2.0, -3.0);
+        let world = parent_position + parent_rotation * (local * 2.0);
+
+        let got = world_to_parent_local(world, parent_position, parent_rotation, 2.0)
+            .expect("valid parent transform");
+
+        assert!(
+            got.distance(local) < 1e-5,
+            "got {got:?}, expected {local:?}"
+        );
+    }
+
+    #[test]
+    fn a_zero_or_non_finite_parent_scale_cannot_make_a_drop_transform() {
+        for scale in [0.0, f32::NAN, f32::INFINITY] {
+            assert_eq!(
+                world_to_parent_local(Vec3::ONE, Vec3::ZERO, Quat::IDENTITY, scale),
+                None
+            );
+        }
+    }
 
     /// The one test that matters for the cells: a slice must land on a part.
     ///
@@ -882,7 +1113,7 @@ mod tests {
             bevy::asset::RenderAssetUsages::default(),
         );
         assert!(
-            slice_tile(&atlas, TILES_PER_PAGE).is_none(),
+            slice_tile(&atlas, ATLAS_TILE_COUNT).is_none(),
             "a tile past the last one has nothing to copy"
         );
     }

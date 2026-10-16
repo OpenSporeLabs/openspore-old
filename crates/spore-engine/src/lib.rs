@@ -447,7 +447,7 @@ pub fn build_placeholder_app(window: WindowOptions) -> App {
         |mut commands: Commands,
          mut meshes: ResMut<Assets<Mesh>>,
          mut materials: ResMut<Assets<StandardMaterial>>| {
-            scene::spawn_placeholder(&mut commands, &mut meshes, &mut materials);
+            scene::spawn_placeholder_creature(&mut commands, &mut meshes, &mut materials);
         },
     );
     app.add_systems(Update, exit_on_escape);

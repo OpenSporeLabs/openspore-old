@@ -36,7 +36,7 @@ use bevy::prelude::{BackgroundColor, ChildOf, Color, Entity, Node, Val, World};
 
 use super::layout::{self, PanelSide, PartGrid};
 use super::spawn::{self, CreatorUiPart, CreatorUiView};
-use super::theme::{CreatorCounts, CreatorMetrics, CreatorPalette};
+use super::theme::{CreatorCounts, CreatorMetrics, CreatorPalette, CreatorText};
 
 // ---------------------------------------------------------------------------
 // Harness
@@ -350,10 +350,13 @@ fn an_active_tab_keeps_its_amber_on_hover() {
 fn tab_placeholder_labels_are_slots_not_categories() {
     assert_eq!(
         layout::tab_placeholder_label(0).as_deref(),
-        Some("TAB_1"),
-        "the strip must label slots, not categories — the corpus has no category table"
+        Some(CreatorText::TAB_GLYPHS[0]),
+        "the strip uses icon-like marks, not recovered category names"
     );
-    assert_eq!(layout::tab_placeholder_label(5).as_deref(), Some("TAB_6"));
+    assert_eq!(
+        layout::tab_placeholder_label(5).as_deref(),
+        Some(CreatorText::TAB_GLYPHS[5])
+    );
     assert_eq!(
         layout::tab_placeholder_label(6),
         None,
@@ -403,7 +406,7 @@ fn a_part_cell_is_180_wide_and_a_tenth_of_the_grid_tall() {
     );
     assert_eq!(
         cell.height,
-        Val::Px(46.0),
+        Val::Px(76.0),
         "ten rows must fit the grid without flex shrinking them"
     );
     assert_eq!(
@@ -866,6 +869,14 @@ fn the_strip_has_exactly_six_tabs_and_exactly_one_is_active() {
     let tabs = all_parts(&world, CreatorUiPart::Tab);
 
     assert_eq!(tabs.len(), 6, "the strip has six tabs");
+    for (expected, entity) in tabs.iter().enumerate() {
+        let expected_index = spawn::TabIndex(expected);
+        assert_eq!(
+            world.get::<spawn::TabIndex>(*entity),
+            Some(&expected_index),
+            "each tab retains its stable position for click routing"
+        );
+    }
     assert!(
         tabs.iter()
             .all(|tab| parent_of(&world, *tab) == Some(strip)),
@@ -1043,7 +1054,7 @@ fn the_bottom_bar_has_a_pill_a_name_pill_and_four_buttons_in_order() {
         vec![
             CreatorUiPart::DnaPill,
             CreatorUiPart::NamePill,
-            CreatorUiPart::ButtonGroup,
+            CreatorUiPart::ButtonGroup
         ],
         "left group, centre group, right group — in that order"
     );

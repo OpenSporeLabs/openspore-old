@@ -17,6 +17,8 @@ use bevy::app::Plugin;
 use bevy::pbr::StandardMaterial;
 use bevy::prelude::*;
 
+use crate::domain::assembly::{ModuleKind, Primitive};
+
 /// A soft sky colour behind everything.
 pub const BACKDROP: Color = Color::srgb(0.05, 0.06, 0.09);
 
@@ -147,30 +149,93 @@ pub fn spawn_stage(
     ));
 }
 
-/// Spawns the built-in placeholder mesh, used by `--placeholder`.
+/// Overall size of the placeholder creature, chosen so it reads well at the
+/// placeholder camera's fixed distance. This is a **presentation** choice and
+/// lives here, not in [`crate::domain::assembly`]: the assembly is authored at
+/// its natural scale and the renderer decides how big to show it.
+pub const PLACEHOLDER_SCALE: f32 = 1.8;
+
+/// The colour of a placeholder module, chosen from the module's *kind*.
 ///
-/// It exists so "the window opened and something rendered" can be established
-/// with no game install at all. If that cannot be demonstrated, every later
-/// failure is ambiguous between "the renderer is broken" and "the asset is
-/// wrong", and the vertical slice stops being debuggable.
-pub fn spawn_placeholder(
+/// The domain says what a module is for ([`ModuleKind`]); the renderer says what
+/// it looks like. That split is the boundary rule, and it is why there is no RGB
+/// in the assembly.
+fn module_color(kind: ModuleKind) -> Color {
+    match kind {
+        ModuleKind::Body | ModuleKind::Limb | ModuleKind::Tail => PLACEHOLDER_TINT,
+        ModuleKind::Head => Color::srgb(0.36, 0.72, 0.88),
+        ModuleKind::Snout => Color::srgb(0.22, 0.52, 0.68),
+        ModuleKind::Eye => Color::srgb(0.04, 0.05, 0.07),
+    }
+}
+
+/// The Bevy mesh for one placeholder primitive.
+fn primitive_mesh(primitive: Primitive) -> Mesh {
+    match primitive {
+        Primitive::Sphere { radius } => Sphere::new(radius).mesh().uv(24, 12),
+        Primitive::Capsule { radius, length } => Capsule3d::new(radius, length).mesh().build(),
+        Primitive::Cylinder { radius, height } => Cylinder::new(radius, height).mesh().build(),
+        Primitive::Cuboid { half_extents } => Cuboid::new(
+            half_extents[0] * 2.0,
+            half_extents[1] * 2.0,
+            half_extents[2] * 2.0,
+        )
+        .mesh()
+        .build(),
+    }
+}
+
+/// Spawns the built-in placeholder **assembly**, used by `--placeholder`.
+///
+/// It exists so "the window opened and a modular 3D scene rendered" can be
+/// established with no game install at all. If that cannot be demonstrated,
+/// every later failure is ambiguous between "the renderer is broken" and "the
+/// asset is wrong", and the vertical slice stops being debuggable.
+///
+/// The creature's structure and placement come from
+/// [`crate::domain::assembly::quadruped`], which is Bevy-free; this function is
+/// the whole of the conversion. Modules are spawned as children of one root so
+/// that the assembly is one hierarchy, and the root carries [`OnStage`] so
+/// [`clear_stage`] removes the creature and its parts together.
+pub fn spawn_placeholder_creature(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
 ) -> Entity {
-    commands
+    let assembly = crate::domain::assembly::quadruped();
+    let placements = assembly
+        .placements()
+        .expect("the built-in preset is well-formed by construction");
+
+    let root = commands
         .spawn((
-            Mesh3d(meshes.add(Sphere::new(2.0).mesh().uv(32, 18))),
-            MeshMaterial3d(materials.add(StandardMaterial {
-                base_color: PLACEHOLDER_TINT,
-                perceptual_roughness: 0.35,
-                metallic: 0.1,
-                ..default()
-            })),
-            Transform::from_xyz(0.0, 2.0, 0.0),
+            Transform::from_scale(Vec3::splat(PLACEHOLDER_SCALE)),
+            Visibility::default(),
             OnStage,
         ))
-        .id()
+        .id();
+
+    for (module, placement) in assembly.modules.iter().zip(placements) {
+        let child = commands
+            .spawn((
+                Mesh3d(meshes.add(primitive_mesh(module.primitive))),
+                MeshMaterial3d(materials.add(StandardMaterial {
+                    base_color: module_color(module.kind),
+                    perceptual_roughness: 0.55,
+                    metallic: 0.0,
+                    ..default()
+                })),
+                Transform {
+                    translation: Vec3::from_array(placement.translation),
+                    rotation: crate::loader::orientation_to_quat(placement.orientation),
+                    scale: Vec3::splat(placement.scale),
+                },
+            ))
+            .id();
+        commands.entity(root).add_child(child);
+    }
+
+    root
 }
 
 /// Despawns whatever was on stage, so a scene change never stacks up entities.
@@ -253,6 +318,46 @@ mod tests {
         assert!(
             linear.red > 0.2 && linear.red < 0.9,
             "and not black: {ASSET_TINT:?}"
+        );
+    }
+
+    #[test]
+    fn the_placeholder_is_a_modular_assembly_under_one_staged_root() {
+        let mut app = world_with_stage();
+        // Spawn the placeholder *in addition to* the world, as the real app does.
+        app.add_systems(
+            Startup,
+            |mut commands: Commands,
+             mut meshes: ResMut<Assets<Mesh>>,
+             mut materials: ResMut<Assets<StandardMaterial>>| {
+                spawn_placeholder_creature(&mut commands, &mut meshes, &mut materials);
+            },
+        );
+        app.update();
+
+        let expected = crate::domain::assembly::quadruped().len();
+        assert!(
+            expected > 1,
+            "the preset is meant to be more than one module"
+        );
+
+        let mut staged =
+            bevy::ecs::query::QueryState::<Entity, With<OnStage>>::new(&mut *app.world_mut());
+        assert_eq!(
+            staged.iter(app.world()).count(),
+            1,
+            "exactly one staged root, so clear_stage removes the whole assembly"
+        );
+        drop(staged);
+
+        let mut meshes_n = bevy::ecs::query::QueryState::<
+            Entity,
+            (With<Mesh3d>, Without<GroundPlane>),
+        >::new(&mut *app.world_mut());
+        assert_eq!(
+            meshes_n.iter(app.world()).count(),
+            expected,
+            "one mesh entity per module"
         );
     }
 }

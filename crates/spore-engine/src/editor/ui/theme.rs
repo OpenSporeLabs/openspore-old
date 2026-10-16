@@ -27,14 +27,14 @@
 //! file, or in [`layout`](super::layout), or in [`spawn`](super::spawn). Three
 //! separate reasons, all of which are load-bearing:
 //!
-//! 1. **The categories are genuinely UNKNOWN.** A research sweep over the
-//!    shipped corpus proved there is no category table in any package, so a
-//!    category name here would be an invention wearing a citation. The six
-//!    tabs are therefore positions, [`CreatorCounts::TAB_COUNT`] of them,
-//!    labelled `CreatorText::TAB_PLACEHOLDER_PREFIX` + `1`..=`6`. `TAB_3` is a
-//!    slot number.
-//!    It says nothing about what slot 3 does, because nothing in the corpus
-//!    says what slot 3 does.
+//! 1. **The tab-to-rigblock mapping is UNKNOWN.** `Spore_Game` contains
+//!    `prop` palette definitions with names such as "Creature Editor Palette",
+//!    but their category/page/item links have not been decoded. A research sweep
+//!    that found no flat category table was not evidence that palette data is
+//!    absent. The six tabs are therefore positions,
+//!    [`CreatorCounts::TAB_COUNT`] of them, labelled
+//!    `CreatorText::TAB_PLACEHOLDER_PREFIX` + `1`..=`6`. `TAB_3` is a slot
+//!    number, not a recovered category name.
 //! 2. **A price is a game-balance fact, not a layout fact.** Putting `250` next
 //!    to a cell size would make an unverified number look as load-bearing as a
 //!    measured one. The DNA pill renders a *count supplied by the session*; the
@@ -273,7 +273,7 @@ impl CreatorMetrics {
     /// 300 px, which put two rows on screen. A scroll container would let the rows
     /// be as tall as the reference's and is the right answer for a future revision;
     /// this is a number that fits.
-    pub const PART_CELL_ROW_PX: f32 = 46.0;
+    pub const PART_CELL_ROW_PX: f32 = 76.0;
 
     /// **OpenSpore's own choice.** Gap between part cells, in pixels.
     ///
@@ -636,12 +636,12 @@ impl CreatorPalette {
     // -- the panel -----------------------------------------------------------
 
     /// Catalog panel fill. UNRECOVERED in the reference; OpenSpore's own.
-    pub const PANEL_BACKGROUND: Color = Color::srgb(0.055, 0.063, 0.078);
+    pub const PANEL_BACKGROUND: Color = Color::srgba(0.035, 0.075, 0.105, 0.82);
 
     /// Fill of the panel's horizontal bands (tab strip, pager). OpenSpore's
     /// own; one step lighter than [`PANEL_BACKGROUND`](Self::PANEL_BACKGROUND)
     /// so the bands read as bands.
-    pub const PANEL_BAND_BACKGROUND: Color = Color::srgb(0.075, 0.086, 0.106);
+    pub const PANEL_BAND_BACKGROUND: Color = Color::srgba(0.055, 0.105, 0.14, 0.78);
 
     // -- the tab strip -------------------------------------------------------
 
@@ -671,7 +671,7 @@ impl CreatorPalette {
     /// Part cell backing plate. OpenSpore's own. This is the plate the
     /// reference's "generous spacing" lives inside; see
     /// [`PART_CELL_PADDING_PX`](CreatorMetrics::PART_CELL_PADDING_PX).
-    pub const PART_CELL_BACKGROUND: Color = Color::srgb(0.086, 0.098, 0.125);
+    pub const PART_CELL_BACKGROUND: Color = Color::srgba(0.045, 0.11, 0.15, 0.34);
 
     /// Part cell backing plate while hovered. OpenSpore's own; a still
     /// screenshot has no hover state.
@@ -806,7 +806,7 @@ impl CreatorText {
     /// Rendered as `TAB_1`..=`TAB_6`. The prefix exists so the strip is
     /// unmistakable for what it is — six undifferentiated placeholder slots —
     /// rather than mistakable for a real icon set.
-    pub const TAB_PLACEHOLDER_PREFIX: &str = "TAB_";
+    pub const TAB_PLACEHOLDER_PREFIX: &str = "";
 
     /// The previous-page arrow glyph. **OBSERVED as an arrow**; the reference's
     /// exact codepoint and typeface are UNRECOVERED, so this is OpenSpore's
@@ -835,6 +835,10 @@ impl CreatorText {
 
     /// Disclosure triangle for a collapsed section bar. OpenSpore's own.
     pub const GLYPH_SECTION_COLLAPSED: &str = "▸";
+
+    /// Neutral silhouette-style symbols used until the original icon texture
+    /// mapping is recovered. These communicate six tool slots without labels.
+    pub const TAB_GLYPHS: [&str; CreatorCounts::TAB_COUNT] = ["◉", "◎", "⌁", "∿", "◖", "✦"];
 
     /// **OBSERVED.** First section bar's label, verbatim.
     ///

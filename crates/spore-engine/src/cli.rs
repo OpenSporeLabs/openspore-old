@@ -366,10 +366,21 @@ pub const PRESET_DOCUMENTED_ASSET: (u32, u32, u32) = (0x00E6_BCE5, 0x4063_7E03, 
 /// alpha planes) and `0x40622901` is a 256² `tangent-space-normal`.
 pub const PRESET_CREATURE: (u32, u32, u32) = (0x00E6_BCE5, 0x4062_7100, 0x067C_79D2);
 
+/// A full-creature model selected from the base game's paired creature preview.
+///
+/// The `png` record `0x2f7d0004:0x40626200:0x067c69c6` depicts a long-tailed,
+/// orange biped close to the Creature Creator reference. The matching HQ model
+/// shares the same instance id under `CreatureModelsHQ` and has two fully
+/// validated meshes. It has no recovered link to a `<sporemodel>` document, so
+/// this identity is used only as a visual preview, not as a part-composition
+/// answer.
+pub const PRESET_CREATURE_PREVIEW: (u32, u32, u32) = (0x00E6_BCE5, 0x4062_7100, 0x067C_69C6);
+
 /// The named presets this build knows.
 pub const PRESETS: &[(&str, (u32, u32, u32))] = &[
     ("documented-asset", PRESET_DOCUMENTED_ASSET),
     ("creature", PRESET_CREATURE),
+    ("creature-preview", PRESET_CREATURE_PREVIEW),
 ];
 
 /// Why a command line was rejected.

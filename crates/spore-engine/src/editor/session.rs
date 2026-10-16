@@ -389,6 +389,19 @@ impl CreatorSession {
         self.scale
     }
 
+    /// Sets the viewport scale for the whole composition.
+    ///
+    /// This is presentation state, not a `<sporemodel>` field: individual block
+    /// scales remain authored in the document and are edited with `apply_scale`.
+    /// The viewport applies this directly to the projection root, without
+    /// manufacturing a document edit, reprojection or undo row.
+    pub fn set_scale(&mut self, scale: f32) {
+        if !scale.is_finite() || scale <= 0.0 || (scale - self.scale).abs() < f32::EPSILON {
+            return;
+        }
+        self.scale = scale;
+    }
+
     /// How many packages this session resolves against.
     pub fn package_count(&self) -> usize {
         self.packages
@@ -409,14 +422,32 @@ impl CreatorSession {
         part: BlockId,
         parent: Option<BlockIndex>,
     ) -> Result<BlockIndex, SessionError> {
-        self.history.record(&self.document);
-        let block = Block {
-            block_id: Some(part),
-            transform: BlockTransform {
+        self.apply_add_with_transform(
+            part,
+            parent,
+            BlockTransform {
                 scale: 1.0,
                 orientation: Matrix3::IDENTITY,
                 ..BlockTransform::default()
             },
+        )
+    }
+
+    /// Adds and selects a part with an authored local transform.
+    ///
+    /// Used by viewport drop placement: the new part and its parent relationship
+    /// are one document edit and one undo step. `snapped` stays absent because the
+    /// original editor's snap-compatibility rules have not been reconstructed.
+    pub fn apply_add_with_transform(
+        &mut self,
+        part: BlockId,
+        parent: Option<BlockIndex>,
+        transform: BlockTransform,
+    ) -> Result<BlockIndex, SessionError> {
+        self.history.record(&self.document);
+        let block = Block {
+            block_id: Some(part),
+            transform,
             ..Block::default()
         };
         let index = self.document.add_block(block, parent)?;
@@ -801,6 +832,33 @@ mod tests {
     }
 
     #[test]
+    fn an_added_block_uses_the_requested_local_transform_and_undoes_as_one_edit() {
+        let mut session = session(1);
+        let transform = BlockTransform {
+            position: Vec3 {
+                x: 0.25,
+                y: -0.5,
+                z: 1.0,
+            },
+            scale: 1.0,
+            orientation: Matrix3::IDENTITY,
+            ..BlockTransform::default()
+        };
+
+        let index = session
+            .apply_add_with_transform(id(OTHER), Some(0), transform)
+            .expect("add at the requested parent and position");
+
+        assert_eq!(
+            session.document.blocks[index].transform.position.to_array(),
+            [0.25, -0.5, 1.0]
+        );
+        assert_eq!(session.document.parent_of(index), Some(0));
+        assert!(session.undo().expect("undo add"));
+        assert_eq!(session.document.blocks.len(), 1);
+    }
+
+    #[test]
     fn a_default_orientation_is_not_a_rotation_so_the_trap_is_real() {
         // Without this, the test above could be asserting a distinction that does
         // not exist: if `Matrix3::default()` happened to be the identity,
@@ -1012,6 +1070,29 @@ mod tests {
             after.orientation.to_array(),
             before.orientation.to_array(),
             "scale must not disturb orientation: the corpus's two fields are independent"
+        );
+    }
+
+    #[test]
+    fn composition_scale_changes_without_editing_blocks_or_document_revision() {
+        let mut session = session(2);
+        let revision = session.revision();
+        let blocks = session.document().blocks.clone();
+
+        session.set_scale(1.75);
+
+        assert_eq!(session.scale(), 1.75);
+        assert_eq!(session.revision(), revision);
+        assert_eq!(session.document().blocks, blocks);
+
+        let revision = session.revision();
+        session.set_scale(f32::NAN);
+        session.set_scale(0.0);
+        assert_eq!(session.scale(), 1.75, "invalid display scales are ignored");
+        assert_eq!(
+            session.revision(),
+            revision,
+            "display scale is not a document edit"
         );
     }
 }

@@ -22,6 +22,7 @@
 //! | scene | [`scene`] | no | objects, placements, layout |
 //! | materials | [`materials`] | no | which surface feeds which material slot |
 //! | paint | [`paint`] | no | which `sporemodel` record colours a model, and with what grade |
+//! | assembly | [`assembly`] | no | a procedural, modular placeholder built from primitives |
 //! | runtime | [`crate::loader`] | yes | `Assets<Mesh>` handles, entities |
 //!
 //! # The one rule that keeps the boundary honest
@@ -31,6 +32,7 @@
 //! the material roles, the normal-map swizzle and the colour resolution — with
 //! no window open.
 
+pub mod assembly;
 pub mod creature;
 pub mod materials;
 pub mod model;

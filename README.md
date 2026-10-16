@@ -59,7 +59,7 @@ be derived and was left unmeasured instead of guessed.
 | | |
 |---|---|
 | **Rust** | 9 crates, `cargo test --workspace` → **696 passed, 0 failed, 10 ignored** (the 10 need the game installed). `cargo clippy --workspace --all-targets -- -D warnings` is clean. |
-| **The engine** | decodes and renders a real gmdl; derives normals because the record's `UBYTE4` encoding is only INFERRED; `--placeholder` proves the renderer with no game data at all. |
+| **The engine** | decodes and renders a real gmdl; derives normals because the record's `UBYTE4` encoding is only INFERRED; `--placeholder` renders a procedural modular creature with no game data at all ([`docs/VERTICAL-SLICE.md`](docs/VERTICAL-SLICE.md)). |
 | **`osptool`** | offline inspector for DBPF packages: `list`, `find`, `describe`, `extract`, `manifest`, `verify`, `types`. Byte-for-byte reproducible output. |
 | **C++** | still builds and still runs; `ctest --test-dir build -N` lists 131 tests. It is the differential reference — do not delete it. |
 | **Python** | the reverse-engineering suite: `uv run --no-project --with pytest python3 -m pytest tests/ -q`. |

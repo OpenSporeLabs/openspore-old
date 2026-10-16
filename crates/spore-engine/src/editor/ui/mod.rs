@@ -29,8 +29,8 @@
 //!   window width" survives, "the panel is `0x1a1c22`" does not exist.
 //! * **UNRECOVERED** — a thing the reference plainly shows but whose exact
 //!   value OpenSpore does not have: every colour, every font, every icon, and
-//!   every part-category name. A research sweep proved there is no category
-//!   table in any shipped package, so the six tabs are addressed by position —
+//!   every part-category name. Palette `prop` definitions exist, but their
+//!   category-to-rigblock links are not decoded, so the six tabs are addressed by position —
 //!   [`CreatorCounts::TAB_COUNT`] of them, rendered as the placeholder labels
 //!   `TAB_1`..=`TAB_6` — and never by a name.
 //! * **OpenSpore's own choice** — a dimension the reference does not pin down
